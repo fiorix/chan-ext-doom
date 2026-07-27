@@ -2,7 +2,9 @@
 
 DOOM, embeddable: a merged-lineage doom engine fork with its multiplayer netcode revived, and a Rust crate family that wires the protocol — `doom-proto` (wire codec), `doom-server` (rooms + the multiplayer server role, WebSocket and UDP), and `doom-embed` (run the engine WASM inside any Rust program via wasmtime).
 
-The spec of record is [docs/design.md](docs/design.md).
+The spec of record is [docs/design.md](docs/design.md). The host-selected
+PWAD validation set and its provenance are in
+[docs/mods.md](docs/mods.md).
 
 ## Layout
 
