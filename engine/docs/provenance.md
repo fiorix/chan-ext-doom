@@ -226,7 +226,7 @@ Three parts of that line are load-bearing:
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native build excludes `net_websockets.c` for the mirror-image reason.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
-- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1685299 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
+- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1685772 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
 `LC_ALL=C sort` is also load-bearing. Bare `find` emits readdir order, which varies by filesystem and by the order files were created, and emcc assigns wasm function indices and `EM_ASM` string addresses in command-line order. Without the sort the same source tree produces a different `doom.wasm` on every machine. With it, the build is bit-reproducible.
 
@@ -249,8 +249,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188756 | 49e1b3d50baecdcf3417d7c898af7d237afb60dea00dd458bd92f2699059ad7a |
-| doom.wasm | 1685299 | 6351255490feb73978c5053c99b1c199517f0c8ae7a101f57ac25b2f59d4cf56 |
+| doom.js | 188755 | cf5f44e6b158503328491aa524df457e1926ef2545e74d1f25f4e8554c9b7b3d |
+| doom.wasm | 1685772 | 08cbdc194fe55c533a4da7e72b4507e231c785668e35c2ca607f8d305a55aa84 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
