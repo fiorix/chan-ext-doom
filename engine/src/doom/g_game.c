@@ -74,6 +74,9 @@
 
 
 #include "d_democanary.h"
+#include "d_statecanary.h"
+
+static void G_ReportDemoCanary (const char *at);
 #include "g_game.h"
 
 #include <emscripten.h>
@@ -892,6 +895,18 @@ void G_Ticker (void)
             D_AdvanceDemo(); 
 	    break; 
 	  case ga_completed: 
+	    // The shared anchor. G_Ticker handles gameaction at the top of
+	    // the tic after the exit tic, so this observes a fully advanced
+	    // simulation, and it precedes G_DoCompleted's own mutations
+	    // (G_PlayerFinishLevel strips cards and powers). Every peer
+	    // reaches it on the same gametic because the exit is a simulation
+	    // event, and it covers the secret exit for the same reason.
+	    //
+	    // Two canaries, two separate claims: one over the recorded input
+	    // history, one over the simulation state itself.
+	    G_ReportDemoCanary ("exit");
+	    D_StateCanaryReport ("exit");
+
 	    G_DoCompleted (); 
 	    break; 
 	  case ga_victory: 
@@ -1340,7 +1355,6 @@ static void G_ReportDemoCanary (const char *at)
 
 void G_ExitLevel (void) 
 { 
-    G_ReportDemoCanary("exit");
     secretexit = false; 
     gameaction = ga_completed; 
 } 
@@ -1348,7 +1362,6 @@ void G_ExitLevel (void)
 // Here's for the german edition.
 void G_SecretExitLevel (void) 
 { 
-    G_ReportDemoCanary("secret exit");
     // IF NO WOLF3D LEVELS, NO SECRET EXIT!
     if ( (gamemode == commercial)
       && (W_CheckNumForName("map31")<0))

@@ -56,4 +56,11 @@
 boolean D_DemoCanaryDigest(const byte *demo, size_t anchor_len, char *out,
                            size_t out_len);
 
+// Hex SHA-256 over arbitrary bytes, with no normalization. The state canary
+// hashes a different stream with the same primitive rather than carrying a
+// second copy of it.
+
+boolean D_DemoCanaryRawDigest(const byte *data, size_t len, char *out,
+                              size_t out_len);
+
 #endif /* #ifndef D_DEMOCANARY_H */

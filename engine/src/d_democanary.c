@@ -164,13 +164,41 @@ static void Sha256Final(sha256_t *ctx, byte out[32])
 // and this runs at level exit, where a large transient allocation is the last
 // thing wanted.
 
+static void DigestToHex(const byte digest[32], char *out, size_t out_len)
+{
+    unsigned int i;
+
+    for (i = 0; i < 32; ++i)
+    {
+        snprintf(out + i * 2, out_len - i * 2, "%02x", digest[i]);
+    }
+}
+
+boolean D_DemoCanaryRawDigest(const byte *data, size_t len, char *out,
+                              size_t out_len)
+{
+    sha256_t ctx;
+    byte digest[32];
+
+    if (data == NULL || out == NULL || out_len < DEMO_CANARY_DIGEST_LEN)
+    {
+        return false;
+    }
+
+    Sha256Init(&ctx);
+    Sha256Update(&ctx, data, len);
+    Sha256Final(&ctx, digest);
+    DigestToHex(digest, out, out_len);
+
+    return true;
+}
+
 boolean D_DemoCanaryDigest(const byte *demo, size_t anchor_len, char *out,
                            size_t out_len)
 {
     sha256_t ctx;
     byte digest[32];
     byte normalized = 0;
-    unsigned int i;
 
     if (demo == NULL || anchor_len < DEMO_HEADER_LEN)
     {
@@ -189,10 +217,7 @@ boolean D_DemoCanaryDigest(const byte *demo, size_t anchor_len, char *out,
                  anchor_len - DEMO_CONSOLEPLAYER_OFFSET - 1);
     Sha256Final(&ctx, digest);
 
-    for (i = 0; i < sizeof(digest); ++i)
-    {
-        snprintf(out + i * 2, out_len - i * 2, "%02x", digest[i]);
-    }
+    DigestToHex(digest, out, out_len);
 
     return true;
 }

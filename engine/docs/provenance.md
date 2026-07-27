@@ -163,6 +163,24 @@ The socket lifecycle is deliberately terminal rather than self-healing. An in-pl
 
 **`src/net_gui.c` replaced, not restored.** Upstream draws a lobby with the textscreen widget library. This tree has no textscreen library, only `i_txt.c`, which is SDL text-mode emulation for ENDOOM. The surfaces that embed this engine own their lobby anyway: the loader page in the browser, the host program in a native embedding. So `NET_WaitForLaunch` is headless here. It keeps the semantics that matter, on stdout rather than in widgets: the `-nodes N` auto-launch when the controller sees enough nodes, the WAD and dehacked SHA-1 mismatch warning, and the fatal error if the connection drops while waiting.
 
+## Exit-state canary (DCS1)
+
+The demo canary proves two peers saw the same inputs. It cannot prove they reached the same state: this fork writes no consistancy bytes, so a simulation that diverged on identical inputs passes it. `src/doom/d_statecanary.c` serializes the simulation itself at the same anchor and hashes that, and the two lines stay separately labelled so neither claim absorbs the other.
+
+Both fire from the `ga_completed` branch of `G_Ticker`, before `G_DoCompleted`. `G_Ticker` handles gameaction at the top of the tic *after* the exit tic, so that point observes a fully advanced simulation rather than the partially advanced one visible inside `G_ExitLevel`, and it precedes `G_PlayerFinishLevel` stripping cards and powers. Every peer reaches it on the same gametic because the exit is a simulation event, and the secret exit routes through the same branch.
+
+The stream is `DCS1`, explicit fixed-width little-endian, in four sections after the header: players in player order, sectors in sector-index order, live mobjs in thinker-list order, then active special thinkers. `P_AddThinker` appends and removal only unlinks, so thinker order is allocation order and is lockstep-deterministic.
+
+No addresses reach the digest, which is the property that makes it comparable at all. A mobj's state becomes its `states[]` index, its player becomes the player index plus one, and `target`/`tracer` become indices into the enumerated live-mobj list. A null reference and a non-null reference that does not resolve to a live mobj get distinct reserved values, because those are different facts and collapsing them would hide the second. Special thinkers name their sector by index.
+
+The header carries `gametic`, `leveltime`, episode, map, skill, deathmatch and `prndindex`. The RNG index is the subtle one and it is not optional: two peers can hold identical visible state and still diverge on the next roll if it differs. `rndindex` is presentation-side and stays out.
+
+An absent player slot contributes its `playeringame` marker and nothing else. Its storage is stale rather than zero and its `mo` is not safe to dereference, so there is nothing there worth hashing.
+
+Excluded on purpose, because two healthy peers legitimately differ in all of it: view and camera fields, `bob`, colormaps, `extralight`, damage and bonus counts, the message and attacker pointers, psprite animation, `consoleplayer` and `displayplayer`, demo and network bookkeeping, and the per-instance PRNG. Sector `oldspecial` and mobj `validcount` are bookkeeping rather than simulation and are out too.
+
+Known residual, recorded rather than hidden: weapon psprite animation is excluded, so a divergence that lives only in mid-fire animation and never reaches `readyweapon`, `pendingweapon`, ammo or `refire` would not be caught. If one ever escapes that way, per-player psprite state index and tics become format v2.
+
 ## Wire format
 
 The room router is a dumb relay keyed on node ids, so the envelope names both endpoints. Node ids are u32 little-endian in both directions:
@@ -232,7 +250,7 @@ Three parts of that line are load-bearing:
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native build excludes `net_websockets.c` for the mirror-image reason.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
-- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1685772 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
+- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1689618 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
 `LC_ALL=C sort` is also load-bearing. Bare `find` emits readdir order, which varies by filesystem and by the order files were created, and emcc assigns wasm function indices and `EM_ASM` string addresses in command-line order. Without the sort the same source tree produces a different `doom.wasm` on every machine. With it, the build is bit-reproducible.
 
@@ -255,8 +273,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188755 | cf5f44e6b158503328491aa524df457e1926ef2545e74d1f25f4e8554c9b7b3d |
-| doom.wasm | 1685772 | 08cbdc194fe55c533a4da7e72b4507e231c785668e35c2ca607f8d305a55aa84 |
+| doom.js | 188756 | b375a1eadb9c8cb5c90c7e5231b360792e52e49c5c9d5ac1750692e1a2ae56a5 |
+| doom.wasm | 1689618 | a3b8ca1ef3e7f0a4db88096d0cd02be1534ac28cfe68da44146a58b43f66aee4 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
@@ -300,6 +318,7 @@ Builds and runs, with a plain host compiler and node, no emscripten and no WADs:
 - `test/test_net_loop.c` over `src/net_loop.c`: the loopback ring's overflow path, against a counting allocator, so a packet the transport takes ownership of and refuses is proven freed rather than leaked.
 - `test/test_mod_order.mjs` over `mod_order.js`: the canonical effective order including the `file -> merge -> file` trap, argv construction, the DEHACKED lump probe against synthesized WAD directories, the duplicate and reserved-name rules, the IWAD pin, and that the fingerprint changes when order, load kind or effective DEHACKED behaviour changes.
 - `test/test_democanary.c` over `src/d_democanary.c`: two peers differing only in the consoleplayer byte and in how much they recorded after the anchor digest equal; every byte inside the anchor changes the digest; a short anchor, an empty demo and an undersized output buffer are refused; and the digest is pinned against an independent SHA-256 implementation.
+- `test/test_statecanary.c` over `src/doom/d_statecanary.c`: a synthesized state of two players, three sectors, four mobjs with a target link and one door special. 27 simulation values each change the digest, 16 per-peer presentation values each leave it alone, two peers differing only in presentation digest identically, the same state at different allocations digests identically, and the reported byte count is the real serialized length.
 - An ownership check over the transport modules: `NET_RecvPacket` in `net_io.c` takes the single address reference that consumers release, so no transport module may reference in its own `RecvPacket`. Getting this wrong leaks one reference per received packet and the address table grows without bound, which nothing else would surface.
 
 Each guard was checked by removing it and confirming the suite fails, so the tests are known to be capable of failing rather than merely green.

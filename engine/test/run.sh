@@ -48,6 +48,16 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
     src/d_democanary.c test/test_democanary.c \
     -o "$OUT/test_democanary"
 
+# The exit-state canary must move on any simulation change and stay put on
+# any per-peer presentation change. The serializer reads engine globals, so
+# the test supplies a synthesized mini-state rather than booting the game.
+$CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
+    -Isrc -Isrc/doom \
+    src/doom/d_statecanary.c src/d_democanary.c test/test_statecanary.c \
+    -o "$OUT/test_statecanary"
+
+"$OUT/test_statecanary"
+
 "$OUT/test_democanary"
 
 # Mod ordering is loader-side, so it is tested where it lives.
