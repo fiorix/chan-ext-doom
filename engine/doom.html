@@ -192,6 +192,9 @@
         <label title="-dehlump loads every DEHACKED lump from every loaded WAD; the engine has no per-file switch">
           <input type="checkbox" id="dehlump"> Load embedded DEHACKED patches (all WADs)
         </label>
+        <label title="Records this session so the two windows can be compared at level exit; not needed for normal play">
+          <input type="checkbox" id="record"> Record a verification demo (desync canary)
+        </label>
       </fieldset>
 
       <fieldset>
@@ -217,7 +220,7 @@
       import {
         canonicalOrder, isCanonical, modArgv, fingerprint,
         hasDehackedLump, effectiveDehacked, validatePwads, validateIwad,
-        IWAD_PIN, IWAD_PATH,
+        createSelectionGuard, IWAD_PIN, IWAD_PATH,
       } from "./mod_order.js";
 
       const el = (id) => document.getElementById(id);
@@ -257,11 +260,32 @@
         };
       }
 
+      // Reading a file is asynchronous (arrayBuffer, then SHA-256), so two
+      // selections can be in flight at once and finish in either order. Each
+      // selection takes a generation, and a result whose generation is no
+      // longer current is discarded: otherwise a slow first pick can land
+      // after a second one and leave the accepted bytes describing a
+      // different file from the one the chooser is showing.
+      const iwadGuard = createSelectionGuard();
+
       el("iwad").addEventListener("change", async (e) => {
+        const generation = iwadGuard.begin();
         const file = e.target.files[0];
-        if (!file) return;
+
+        if (!file) {
+          // Clearing the chooser invalidates anything still in flight.
+          iwadGuard.invalidate();
+          state.iwad = null;
+          el("iwad-info").className = "empty";
+          el("iwad-info").textContent =
+            "None chosen. The pinned baseline is the shareware doom1.wad.";
+          refresh();
+          return;
+        }
 
         const candidate = await readFile(file);
+        if (!iwadGuard.isCurrent(generation)) return;
+
         const verdict = validateIwad(candidate);
 
         el("iwad-info").textContent = "";
@@ -290,24 +314,34 @@
         refresh();
       });
 
-      el("pwads").addEventListener("change", async (e) => {
-        for (const file of e.target.files) {
-          const entry = await readFile(file);
-          entry.load = "file";
-          // Read from the WAD directory rather than asked of the user: the
-          // engine's -dehlump switch is global, so the only honest per-entry
-          // fact is whether this file carries a patch at all.
-          entry.hasDehacked = hasDehackedLump(entry.bytes);
+      // Overlapping selections must append in the order the user picked, not
+      // the order their hashes happened to finish, because load order is part
+      // of what peers agree on. Each change reserves its slice of the list
+      // before awaiting anything.
+      let pwadSelection = Promise.resolve();
 
-          const verdict = validatePwads([...state.pwads, entry]);
-          if (!verdict.ok) {
-            log("rejected " + entry.name + ": " + verdict.reason, "warn");
-            continue;
-          }
-          state.pwads.push(entry);
-        }
+      el("pwads").addEventListener("change", (e) => {
+        const files = Array.from(e.target.files);
         e.target.value = "";
-        refresh();
+
+        pwadSelection = pwadSelection.then(async () => {
+          for (const file of files) {
+            const entry = await readFile(file);
+            entry.load = "file";
+            // Read from the WAD directory rather than asked of the user: the
+            // engine's -dehlump switch is global, so the only honest
+            // per-entry fact is whether this file carries a patch at all.
+            entry.hasDehacked = hasDehackedLump(entry.bytes);
+
+            const verdict = validatePwads([...state.pwads, entry]);
+            if (!verdict.ok) {
+              log("rejected " + entry.name + ": " + verdict.reason, "warn");
+              continue;
+            }
+            state.pwads.push(entry);
+          }
+          refresh();
+        });
       });
 
       function move(i, delta) {
@@ -393,6 +427,17 @@
         const argv = modArgv(state.pwads, el("dehlump").checked);
 
         if (el("deathmatch").checked) argv.push("-deathmatch");
+
+        // Both windows record under the same name. Each instance records
+        // every player's ticcmds in player order, so at level exit their
+        // digests must match; that comparison is the desync canary.
+        if (el("record").checked) {
+          // -maxdemo is in KiB. The default 128 KiB holds roughly eight
+          // minutes of two-player recording; a slow run would truncate one
+          // side and read as a desync that never happened, so a verification
+          // run gets 1 MiB.
+          argv.push("-record", "canary", "-maxdemo", "1024");
+        }
 
         const m = mode();
         if (m === "host") {
@@ -505,7 +550,7 @@
         refresh();
       }
 
-      for (const id of ["room", "nodes", "deathmatch", "dehlump"]) {
+      for (const id of ["room", "nodes", "deathmatch", "dehlump", "record"]) {
         el(id).addEventListener("input", refresh);
         el(id).addEventListener("change", refresh);
       }

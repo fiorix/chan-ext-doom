@@ -17,6 +17,8 @@ import {
   effectiveDehacked,
   validatePwads,
   validateIwad,
+  basenamePolicyError,
+  createSelectionGuard,
   IWAD_PIN,
 } from "../mod_order.js";
 
@@ -199,6 +201,67 @@ function buildWad(lumpNames) {
   check(fingerprint([spooky, cotecio], true) ===
         fingerprint([spooky, cotecio], false),
         "the switch does not change the fingerprint when no entry carries a patch");
+}
+
+
+// --- argv-hostile filenames ------------------------------------------------
+
+// W_ParseCommandLine ends each filename list at the first argument starting
+// with "-", and M_FindResponseFile expands anything starting with "@" before
+// WAD parsing even happens. Both would be fingerprinted and mounted while
+// behaving nothing like a loaded PWAD.
+{
+  check(basenamePolicyError("-nomonsters.wad") !== "",
+        "a name starting with - is refused");
+  check(basenamePolicyError("-nomonsters.wad").includes("option"),
+        "the - rejection explains the engine would read it as an option");
+
+  check(basenamePolicyError("@argv.wad") !== "",
+        "a name starting with @ is refused");
+  check(basenamePolicyError("@argv.wad").includes("response file"),
+        "the @ rejection explains the response-file expansion");
+
+  check(basenamePolicyError("sub/dir.wad") !== "", "a path separator is refused");
+  check(basenamePolicyError("back\\slash.wad") !== "",
+        "a backslash is refused");
+  check(basenamePolicyError("..") !== "", "a dot-dot name is refused");
+  check(basenamePolicyError("") !== "", "an empty name is refused");
+  check(basenamePolicyError("bell" + String.fromCharCode(7) + ".wad") !== "",
+        "a control character is refused");
+
+  // The selected catalog must keep working.
+  for (const name of ["PSXDoom.wad", "DoomBSMS.wad", "COSOUNDS.wad"]) {
+    check(basenamePolicyError(name) === "", name + " remains valid");
+  }
+
+  // And the whole-set validator must enforce it, not just the helper.
+  check(!validatePwads([entry("-evil.wad", "file")]).ok,
+        "validatePwads refuses an option-shaped name");
+  check(!validatePwads([entry("@evil.wad", "file")]).ok,
+        "validatePwads refuses a response-file-shaped name");
+}
+
+// --- stale asynchronous selections -----------------------------------------
+
+// Forced ordering, not timing: selection A is made, then B, then A completes.
+// A must not be able to write its result after B superseded it.
+{
+  const guard = createSelectionGuard();
+
+  const a = guard.begin();
+  const b = guard.begin();
+
+  check(!guard.isCurrent(a), "a superseded selection is not current");
+  check(guard.isCurrent(b), "the latest selection is current");
+
+  // Clearing the chooser must strand everything still in flight.
+  const c = guard.begin();
+  guard.invalidate();
+  check(!guard.isCurrent(c), "clearing invalidates an in-flight selection");
+
+  // A fresh selection after that is current again.
+  const d = guard.begin();
+  check(guard.isCurrent(d), "a new selection after a clear is current");
 }
 
 console.log(`${checks} checks, ${failures} failures`);

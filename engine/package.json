@@ -21,5 +21,6 @@
   "homepage": "https://github.com/fiorix/doomit#readme",
   "devDependencies": {
     "serve": "^11.1.0"
-  }
+  },
+  "type": "module"
 }

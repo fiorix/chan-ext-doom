@@ -26,6 +26,30 @@ export const IWAD_PIN = {
 // The path the IWAD occupies in the Emscripten FS. A PWAD may not take it.
 export const IWAD_PATH = "/doom1.wad";
 
+// Guards state that is written after an await.
+//
+// Reading a chosen file is asynchronous, so two selections can be in flight
+// at once and finish in either order. Without a guard a slow first pick can
+// land after a second one, leaving the accepted bytes describing a different
+// file from the one the chooser shows. Each selection takes a generation and
+// discards its own result if it is no longer the current one.
+export function createSelectionGuard() {
+  let current = 0;
+
+  return {
+    begin() {
+      return ++current;
+    },
+    isCurrent(generation) {
+      return generation === current;
+    },
+    // Clearing the chooser must also strand anything still in flight.
+    invalidate() {
+      ++current;
+    },
+  };
+}
+
 // Effective load order: merges first in their declared relative order, then
 // files in theirs. Stable, so equal-kind entries keep the order given.
 export function canonicalOrder(entries) {
@@ -85,6 +109,43 @@ export function effectiveDehacked(entry, dehlump) {
   return !!dehlump && !!entry.hasDehacked;
 }
 
+// A basename the engine cannot take as an argument.
+//
+// Two engine behaviours make this a correctness rule rather than hygiene.
+// W_ParseCommandLine ends each filename list at the first argument whose
+// first byte is "-", so a PWAD named that way is mounted and fingerprinted
+// but never loaded. M_FindResponseFile runs before WAD parsing and expands
+// any argument starting with "@", so such a file would have its own bytes
+// parsed as a command line. Either one breaks the promise that the
+// fingerprint describes what is actually loaded, and a local file can
+// legitimately be named either way.
+//
+// Path separators and control characters go in the same pass: the name
+// becomes an FS path as well as an argument, and neither is safe to
+// represent.
+export function basenamePolicyError(name) {
+  if (!name) return "the file has no name";
+  if (name === "." || name === "..") return JSON.stringify(name) + " is not a filename";
+  if (name.startsWith("-")) {
+    return JSON.stringify(name) +
+      " starts with \"-\", so the engine would read it as an option and never load it";
+  }
+  if (name.startsWith("@")) {
+    return JSON.stringify(name) +
+      " starts with \"@\", so the engine would expand it as a response file instead of loading it";
+  }
+  if (name.includes("/") || name.includes("\\")) {
+    return JSON.stringify(name) + " contains a path separator";
+  }
+  for (const ch of name) {
+    const code = ch.charCodeAt(0);
+    if (code < 0x20 || code === 0x7f) {
+      return JSON.stringify(name) + " contains control characters";
+    }
+  }
+  return "";
+}
+
 // Rejects a set the loader cannot honour. Every entry is written to the FS by
 // name, so a duplicate name would silently overwrite and a PWAD named
 // doom1.wad would replace the IWAD. Either way the displayed tuple would
@@ -94,6 +155,11 @@ export function validatePwads(entries) {
 
   for (const e of entries) {
     const key = e.name.toLowerCase();
+
+    const unusable = basenamePolicyError(e.name);
+    if (unusable) {
+      return { ok: false, reason: unusable };
+    }
 
     if (key === IWAD_PIN.name) {
       return { ok: false, reason: `a PWAD may not be named ${IWAD_PIN.name}: it would overwrite the IWAD` };
