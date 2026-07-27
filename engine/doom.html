@@ -167,10 +167,10 @@
 
       <fieldset>
         <legend>PWADs (ordered)</legend>
-        <input type="file" id="pwads" accept=".wad,.deh,.bex" multiple>
+        <input type="file" id="pwads" accept=".wad" multiple>
         <table id="pwad-table">
           <thead>
-            <tr><th>#</th><th>file</th><th>load</th><th>deh</th><th></th></tr>
+            <tr><th>#</th><th>file</th><th>load</th><th>deh?</th><th></th></tr>
           </thead>
           <tbody id="pwad-rows"></tbody>
         </table>
@@ -189,6 +189,9 @@
           <input type="number" id="nodes" value="2" min="2" max="8" disabled>
         </label>
         <label><input type="checkbox" id="deathmatch"> Deathmatch (otherwise co-op)</label>
+        <label title="-dehlump loads every DEHACKED lump from every loaded WAD; the engine has no per-file switch">
+          <input type="checkbox" id="dehlump"> Load embedded DEHACKED patches (all WADs)
+        </label>
       </fieldset>
 
       <fieldset>
@@ -201,6 +204,7 @@
         <div id="fingerprint" class="hash">(no mods)</div>
       </fieldset>
 
+      <div id="blocked" class="empty"></div>
       <button id="launch" disabled>Launch</button>
     </div>
 
@@ -210,8 +214,11 @@
     </div>
 
     <script type="module">
-      import { canonicalOrder, isCanonical, modArgv, fingerprint }
-        from "./mod_order.js";
+      import {
+        canonicalOrder, isCanonical, modArgv, fingerprint,
+        hasDehackedLump, effectiveDehacked, validatePwads, validateIwad,
+        IWAD_PIN, IWAD_PATH,
+      } from "./mod_order.js";
 
       const el = (id) => document.getElementById(id);
       const state = { iwad: null, pwads: [] };
@@ -224,9 +231,10 @@
         el("log").scrollTop = el("log").scrollHeight;
       }
 
-      // crypto.subtle only exists in a secure context. file:// is not one,
-      // and a silent absence would surface much later as a blank hash
-      // column, which is exactly the field peers are meant to compare.
+      // crypto.subtle only exists in a secure context. Without it there are no
+      // content hashes, and "unavailable" is not something peers can compare,
+      // so launching is blocked rather than allowed with a hole in the
+      // agreement data.
       const canHash = !!(crypto && crypto.subtle);
       if (!canHash) {
         log("crypto.subtle unavailable: serve over http://localhost, not file://", "warn");
@@ -243,6 +251,7 @@
         const bytes = await file.arrayBuffer();
         return {
           name: file.name,
+          size: file.size,
           bytes,
           hash: canHash ? await sha256(bytes) : "unavailable",
         };
@@ -251,25 +260,50 @@
       el("iwad").addEventListener("change", async (e) => {
         const file = e.target.files[0];
         if (!file) return;
-        state.iwad = await readFile(file);
-        el("iwad-info").className = "";
+
+        const candidate = await readFile(file);
+        const verdict = validateIwad(candidate);
+
         el("iwad-info").textContent = "";
-        const n = document.createElement("div");
-        n.textContent = state.iwad.name;
-        const h = document.createElement("div");
-        h.className = "hash";
-        h.textContent = "sha256 " + state.iwad.hash;
-        el("iwad-info").append(n, h);
+        el("iwad-info").className = verdict.ok ? "" : "empty";
+
+        if (!verdict.ok) {
+          state.iwad = null;
+          const w = document.createElement("div");
+          w.className = "warn";
+          w.textContent = "rejected: " + verdict.reason;
+          const want = document.createElement("div");
+          want.className = "hash";
+          want.textContent = `expected ${IWAD_PIN.size} bytes, sha256 ${IWAD_PIN.sha256}`;
+          el("iwad-info").append(w, want);
+          log("IWAD rejected: " + verdict.reason, "warn");
+        } else {
+          state.iwad = candidate;
+          const n = document.createElement("div");
+          n.textContent = candidate.name + " (pinned shareware v1.9)";
+          const h = document.createElement("div");
+          h.className = "hash";
+          h.textContent = "sha256 " + candidate.hash;
+          el("iwad-info").append(n, h);
+        }
+
         refresh();
       });
 
       el("pwads").addEventListener("change", async (e) => {
         for (const file of e.target.files) {
           const entry = await readFile(file);
-          // load kind and dehacked are policy, not properties of the bytes,
-          // so they are part of what peers have to agree on.
           entry.load = "file";
-          entry.deh = false;
+          // Read from the WAD directory rather than asked of the user: the
+          // engine's -dehlump switch is global, so the only honest per-entry
+          // fact is whether this file carries a patch at all.
+          entry.hasDehacked = hasDehackedLump(entry.bytes);
+
+          const verdict = validatePwads([...state.pwads, entry]);
+          if (!verdict.ok) {
+            log("rejected " + entry.name + ": " + verdict.reason, "warn");
+            continue;
+          }
           state.pwads.push(entry);
         }
         e.target.value = "";
@@ -288,6 +322,8 @@
         const rows = el("pwad-rows");
         rows.textContent = "";
         el("pwad-empty").style.display = state.pwads.length ? "none" : "";
+
+        const dehlump = el("dehlump").checked;
 
         state.pwads.forEach((entry, i) => {
           const tr = document.createElement("tr");
@@ -308,7 +344,7 @@
 
           const load = document.createElement("td");
           const sel = document.createElement("select");
-          for (const kind of ["file", "merge"]) {
+          for (const kind of ["merge", "file"]) {
             const opt = document.createElement("option");
             opt.value = kind;
             opt.textContent = kind;
@@ -320,20 +356,22 @@
           load.appendChild(sel);
           tr.appendChild(load);
 
+          // Reported, not chosen: whether the patch takes effect is the
+          // global switch, and this column says what this file contributes.
           const deh = document.createElement("td");
-          const box = document.createElement("input");
-          box.type = "checkbox";
-          box.checked = entry.deh;
-          box.title = "Load the DEHACKED lump embedded in this PWAD";
-          box.addEventListener("change", () => { entry.deh = box.checked; refresh(); });
-          deh.appendChild(box);
+          deh.textContent = entry.hasDehacked
+            ? (effectiveDehacked(entry, dehlump) ? "on" : "present")
+            : "-";
+          deh.title = entry.hasDehacked
+            ? "carries a DEHACKED lump; 'on' means the global switch is enabled"
+            : "no DEHACKED lump";
           tr.appendChild(deh);
 
           const actions = document.createElement("td");
           const buttons = [
-            ["↑", () => move(i, -1)],
-            ["↓", () => move(i, 1)],
-            ["✕", () => { state.pwads.splice(i, 1); refresh(); }],
+            ["\u2191", () => move(i, -1)],
+            ["\u2193", () => move(i, 1)],
+            ["\u2715", () => { state.pwads.splice(i, 1); refresh(); }],
           ];
           for (const [label, fn] of buttons) {
             const b = document.createElement("button");
@@ -352,7 +390,7 @@
       }
 
       function buildArgv() {
-        const argv = modArgv(state.pwads);
+        const argv = modArgv(state.pwads, el("dehlump").checked);
 
         if (el("deathmatch").checked) argv.push("-deathmatch");
 
@@ -371,6 +409,16 @@
         return argv;
       }
 
+      function blockedReason() {
+        if (!canHash) return "no content hashes without a secure context";
+        const iwad = validateIwad(state.iwad);
+        if (!iwad.ok) return iwad.reason;
+        const pwads = validatePwads(state.pwads);
+        if (!pwads.ok) return pwads.reason;
+        if (mode() !== "single" && !el("room").value.trim()) return "no room URL";
+        return "";
+      }
+
       function refresh() {
         // The engine loads every -merge before every -file, so an order it
         // cannot honour is normalized here rather than displayed as if it
@@ -382,29 +430,50 @@
         }
 
         renderPwads();
-        el("fingerprint").textContent =
-          state.pwads.length ? fingerprint(state.pwads) : "(no mods)";
 
-        const networked = mode() !== "single";
-        el("room").disabled = !networked;
+        const dehlump = el("dehlump").checked;
+        el("fingerprint").textContent =
+          state.pwads.length ? fingerprint(state.pwads, dehlump) : "(no mods)";
+
+        el("room").disabled = mode() === "single";
         el("nodes").disabled = mode() !== "host";
 
         const argv = buildArgv();
         el("argv").textContent = argv.length ? argv.join(" ") : "(no arguments)";
 
-        el("launch").disabled =
-          !state.iwad || (networked && !el("room").value.trim());
+        const blocked = blockedReason();
+        el("blocked").textContent = blocked ? "cannot launch: " + blocked : "";
+        el("launch").disabled = blocked !== "";
         el("launch").textContent = frame ? "Relaunch" : "Launch";
       }
 
       let frame = null;
+      // One pending launch, not one closure per click. Installing a listener
+      // per launch let the oldest one match the newest frame and replay the
+      // first configuration, which the frame's started guard then locked in.
+      let pending = null;
+
+      window.addEventListener("message", (e) => {
+        const msg = e.data;
+        if (!msg) return;
+
+        if (msg.type === "doom-frame-ready") {
+          if (!frame || e.source !== frame.contentWindow || !pending) return;
+          frame.contentWindow.postMessage(pending, "*");
+          window.__doomSent = (window.__doomSent || []).concat([pending.argv.join(" ")]);
+          pending = null;
+        } else if (msg.type === "doom-log") {
+          log(msg.text, msg.stream === "err" ? "warn" : null);
+        }
+      });
 
       function launch() {
         const argv = buildArgv();
+        const dehlump = el("dehlump").checked;
 
-        // Relaunch is a teardown. Removing the iframe takes the instance,
-        // its main loop, its audio graph and its FS with it, which is the
-        // only reliable way to apply a changed WAD set.
+        // Relaunch is a teardown. Removing the iframe takes the instance, its
+        // main loop, its audio graph and its FS with it, which is the only
+        // reliable way to apply a changed WAD set.
         if (frame) {
           frame.remove();
           frame = null;
@@ -413,7 +482,7 @@
 
         el("placeholder").style.display = "none";
 
-        const files = [{ path: "/doom1.wad", bytes: state.iwad.bytes }];
+        const files = [{ path: IWAD_PATH, bytes: state.iwad.bytes }];
         for (const p of state.pwads) {
           files.push({ path: "/" + p.name, bytes: p.bytes });
         }
@@ -423,28 +492,20 @@
         canonicalOrder(state.pwads).forEach((p, i) => {
           log("  " + (i + 1) + ". " + p.load + " " + p.name +
               " sha256=" + p.hash +
-              " dehacked=" + (p.deh ? "on" : "off"));
+              " dehacked=" + (effectiveDehacked(p, dehlump) ? "on" : "off"));
         });
-        log("  fingerprint " + (state.pwads.length ? fingerprint(state.pwads) : "(none)"));
+        log("  fingerprint " +
+            (state.pwads.length ? fingerprint(state.pwads, dehlump) : "(none)"));
+
+        pending = { type: "doom-launch", argv, files };
 
         frame = document.createElement("iframe");
         frame.src = "doom-frame.html";
         el("stage").insertBefore(frame, el("log"));
         refresh();
-
-        window.addEventListener("message", (e) => {
-          const msg = e.data;
-          if (!msg) return;
-          if (msg.type === "doom-frame-ready" && frame &&
-              e.source === frame.contentWindow) {
-            frame.contentWindow.postMessage({ type: "doom-launch", argv, files }, "*");
-          } else if (msg.type === "doom-log") {
-            log(msg.text, msg.stream === "err" ? "warn" : null);
-          }
-        });
       }
 
-      for (const id of ["room", "nodes", "deathmatch"]) {
+      for (const id of ["room", "nodes", "deathmatch", "dehlump"]) {
         el(id).addEventListener("input", refresh);
         el(id).addEventListener("change", refresh);
       }

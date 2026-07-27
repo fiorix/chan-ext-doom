@@ -100,6 +100,8 @@ Upstream's form declares a tentative global named `cr_t` in every translation un
 - `D_NonVanillaRecord` / `D_NonVanillaPlayback` take `char *feature`, not `const char *`. This tree's `d_loop.h` predates the const change.
 - `net_sdl_module` becomes `NET_TRANSPORT_MODULE` (see below).
 
+**`src/net_loop.c`, dropped packets are freed.** Both send paths hand `QueuePush` a `NET_PacketDup`, so the queue owns it, but upstream returns on a full ring without freeing, leaking one packet per overflow. This transport carries the in-WASM host talking to its own client, so it is on the browser network path and the leak is reachable there. `test/test_net_loop.c` pins the behaviour against a counting allocator.
+
 **`src/net_query.c`, `src/net_server.c`.** `#include "net_sdl.h"` becomes `#include "net_transport.h"`, and `net_query.c`'s two `net_sdl_module` uses become `NET_TRANSPORT_MODULE`. Without this the browser build fails to link, because `net_sdl.c` is not compiled there.
 
 **`src/i_timer.c`, `I_Sleep` yields under emscripten.** `SDL_Delay` busy-waits in a wasm build, which starves the browser event loop. That is fatal for the network code specifically, because Chocolate sleeps exactly when it is waiting for the network to progress: the connect loop, the wait for the host to launch, and the tic stall all call `I_Sleep`. With a busy wait the WebSocket callbacks cannot run, so a connect could only ever time out. This was observed, not theorised: before the change the client logged `Failed to connect to ws node 1: No response from server` and only then reported the socket opening. Yielding requires ASYNCIFY, which the recipe enables.
@@ -121,7 +123,10 @@ Upstream's form declares a tentative global named `cr_t` in every translation un
 | node id is `rand() % 0xfffe` seeded from `time(NULL)`, so two clients starting in the same second collide and silently steal each other's traffic | drawn from `getentropy`, with reserved ids retried |
 | `atoi` on the resolve address, so any non-numeric string silently becomes node 0 | parsed with `strtoul` and rejected if it is not a node id |
 | blocks on `emscripten_sleep` waiting for the socket | connects asynchronously; the fix for the event-loop problem is in `I_Sleep`, where it also helps the launch wait and the tic stall |
+| a send failure flips state without closing the handle, so a later send can build a second socket while the first one's callbacks still mutate the same globals | a failure closes and deletes the handle, drains the ring and is terminal for the module; callbacks carrying a discarded handle are ignored |
 | `net_websockets.h` uses the `NET_SDL_H` include guard | its own guard |
+
+The socket lifecycle is deliberately terminal rather than self-healing. An in-place reconnect would have to close the old handle, drain the ring without discarding live packets, and keep callbacks from the dead handle away from the replacement's state. That is a lot of hazard for no benefit here, because the host page's model is that a relaunch tears down the whole WASM instance: a session that loses its socket is over. Failures therefore close and delete the handle, drain the queue, and refuse further use, and events arriving from a discarded handle are ignored.
 
 **`src/net_ws_frame.c`, `src/net_ws_frame.h`.** The envelope codec and bounded receive ring, split out of `net_websockets.c` so they carry no emscripten dependency and can be tested on the host. These are the parts that must reject malformed input and must drop rather than grow, so they are the parts worth testing off-target.
 
@@ -140,9 +145,17 @@ The room host is node id 1. Ids 0 and 1 are reserved; 0 because a frame addresse
 
 ## Mod loading
 
-Mods are runtime data, and the loaded set is part of what peers must agree on. The agreement tuple is `(name, sha256, load kind, embedded-DEHACKED policy)` per entry, plus the order. Filenames and hashes alone are not sufficient: an embedded `DEHACKED` lump changes simulation behaviour only when it is enabled, so two peers holding identical bytes still desync if one enables it and the other does not.
+Mods are runtime data, and the loaded set is part of what peers must agree on. The agreement tuple is `(name, sha256, load kind, effective embedded-DEHACKED behaviour)` per entry, plus the order. Filenames and hashes alone are not sufficient: an embedded `DEHACKED` lump changes simulation behaviour only when it is enabled, so two peers holding identical bytes still desync if one enables it and the other does not.
 
-Load kinds are Chocolate's: `-file` for ordinary loading, `-merge` for the deutex-style merge of sprite, flat and patch namespaces. `-dehlump` opts in to embedded `DEHACKED` lumps and is a single global switch, not a per-file one.
+Load kinds are Chocolate's: `-file` for ordinary loading, `-merge` for the deutex-style merge of sprite, flat and patch namespaces.
+
+`-dehlump` is a single global switch. The engine loads every `DEHACKED` lump from every loaded WAD or none at all; there is no per-file form. So the honest per-entry fact is whether a file *carries* such a lump, which `mod_order.js` reads from the WAD directory rather than asking the user, and the effective behaviour is that fact combined with the global switch. Exposing a per-entry toggle would let two configurations differ in the UI and in the fingerprint while producing an identical command line and an identical simulation.
+
+Standalone `.deh` and `.bex` patches are rejected. Nothing emits `-deh`, so accepting them would put a file in the fingerprint that the engine never reads.
+
+Every file is written into the Emscripten FS by name, so the loader rejects duplicate filenames and any PWAD named `doom1.wad`. Either would silently overwrite, leaving the displayed tuple describing bytes that are not the bytes loaded.
+
+The IWAD is pinned, not merely named: 4196020 bytes and sha256 `1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771` (sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`). This fork is shareware-only by design, so the loader verifies the bytes and refuses to launch otherwise.
 
 **Effective order is not command-line order.** `W_ParseCommandLine` processes every `-merge` input before every `-file` input, regardless of how the groups appear on the command line, preserving order only within each group. Upstream says so directly: "Merged PWADs are loaded first, because they are supposed to be modified IWADs." So the canonical effective order is all merges in their declared relative order, then all files in theirs. `mod_order.js` implements that, the loader normalizes to it rather than displaying an order the engine will not honour, and the fingerprint peers compare is built from the effective order. A requested `file -> merge -> file` sequence is not achievable and is normalized, with the reason reported.
 
@@ -184,7 +197,7 @@ Three parts of that line are load-bearing:
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native build excludes `net_websockets.c` for the mirror-image reason.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
-- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1680783 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
+- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1681414 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
 `LC_ALL=C sort` is also load-bearing. Bare `find` emits readdir order, which varies by filesystem and by the order files were created, and emcc assigns wasm function indices and `EM_ASM` string addresses in command-line order. Without the sort the same source tree produces a different `doom.wasm` on every machine. With it, the build is bit-reproducible.
 
@@ -196,8 +209,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188205 | 7cfb0f4977a31849eafc4e9cc8908914ca4c1bd447181a54b8520876f23d717c |
-| doom.wasm | 1680783 | 267acadc45a34bfa9a7af3184e89cd145623f330cec8d3374cab97e8b0f01cd3 |
+| doom.js | 188756 | e4b79e8985ab3c8ac5621c209e08ef75470622b7a7bae2fb8b6da64a4984e990 |
+| doom.wasm | 1681414 | bfd423a9064017a8e771970ff74efc5de0c2b3715ab067b04574234e68f68d66 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
@@ -236,7 +249,9 @@ engine/test/run.sh
 Builds and runs, with a plain host compiler and node, no emscripten and no WADs:
 
 - `test/test_net_ws_frame.c` over `src/net_ws_frame.c`: envelope round-trip and byte order, rejection of short frames (the underflow case), rejection of oversize frames, the bare-envelope case, and the receive ring's FIFO order, overflow refusal, drop counting and freeing.
-- `test/test_mod_order.mjs` over `mod_order.js`: the canonical effective order including the `file -> merge -> file` trap, argv construction, the global `-dehlump` switch, and that the fingerprint changes when order, load kind or DEHACKED policy changes.
+- `test/test_net_loop.c` over `src/net_loop.c`: the loopback ring's overflow path, against a counting allocator, so a packet the transport takes ownership of and refuses is proven freed rather than leaked.
+- `test/test_mod_order.mjs` over `mod_order.js`: the canonical effective order including the `file -> merge -> file` trap, argv construction, the DEHACKED lump probe against synthesized WAD directories, the duplicate and reserved-name rules, the IWAD pin, and that the fingerprint changes when order, load kind or effective DEHACKED behaviour changes.
+- An ownership check over the transport modules: `NET_RecvPacket` in `net_io.c` takes the single address reference that consumers release, so no transport module may reference in its own `RecvPacket`. Getting this wrong leaks one reference per received packet and the address table grows without bound, which nothing else would surface.
 
 Each guard was checked by removing it and confirming the suite fails, so the tests are known to be capable of failing rather than merely green.
 
