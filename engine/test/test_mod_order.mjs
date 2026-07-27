@@ -19,7 +19,9 @@ import {
   validateIwad,
   basenamePolicyError,
   createSelectionGuard,
+  iwadArgv,
   IWAD_PIN,
+  IWAD_PATH,
 } from "../mod_order.js";
 
 let checks = 0;
@@ -35,6 +37,19 @@ function check(ok, what) {
 
 const entry = (name, load, hasDehacked = false, hash = "h" + name) =>
   ({ name, load, hasDehacked, hash });
+
+// The fingerprint's encoding is an implementation detail, but a few checks
+// need to look inside it. Parsing defensively means a regression to an
+// ambiguous encoding shows up as a failed check rather than an exception
+// that aborts the rest of the suite.
+function parseFingerprint(fp) {
+  try {
+    const parsed = JSON.parse(fp);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 // The host-selected validation catalog, with its real declared kinds.
 const psx = entry("PSXDoom.wad", "file", true,
@@ -178,10 +193,13 @@ function buildWad(lumpNames) {
   check(fp1 === fp2,
         "two peers who typed the set in different orders agree, because the " +
         "fingerprint is canonical");
-  check(fp1.startsWith("0:merge:DoomBSMS.wad:"),
+  const parsed1 = parseFingerprint(fp1);
+  check(parsed1 !== null && parsed1[0].name === "DoomBSMS.wad" &&
+        parsed1[0].load === "merge",
         "fingerprint starts with the effectively-first entry");
   check(fp1.includes("089e5771"), "fingerprint carries content hashes");
-  check(fp1.includes(":deh=1"), "fingerprint carries the effective dehacked policy");
+  check(parsed1 !== null && parsed1.some((e) => e.deh === 1),
+        "fingerprint carries the effective dehacked policy");
 
   check(fingerprint([spooky, psx, cotecio], true) !==
         fingerprint([spooky, psx, cotecio], false),
@@ -262,6 +280,76 @@ function buildWad(lumpNames) {
   // A fresh selection after that is current again.
   const d = guard.begin();
   check(guard.isCurrent(d), "a new selection after a clear is current");
+}
+
+
+// --- the pinned IWAD is selected explicitly --------------------------------
+
+// The engine's auto-detect table puts doom2.wad, plutonia.wad, tnt.wad and
+// doom.wad ahead of doom1.wad, in the same directory uploads are mounted
+// into. Reserving the doom1.wad name is not enough on its own: a PWAD called
+// doom2.wad would boot as the IWAD while the page showed the verified
+// doom1.wad tuple.
+{
+  check(iwadArgv().join(" ") === "-iwad " + IWAD_PATH,
+        "the mounted pin is named explicitly");
+
+  const higherPriority = ["doom2.wad", "plutonia.wad", "tnt.wad", "doom.wad"];
+
+  for (const name of higherPriority) {
+    // These are legal uploads: the policy only reserves the IWAD's own path.
+    check(validatePwads([entry(name, "file")]).ok,
+          name + " is accepted as an ordinary PWAD");
+
+    const argv = iwadArgv().concat(modArgv([entry(name, "file")], false));
+    check(argv[0] === "-iwad" && argv[1] === IWAD_PATH,
+          "with " + name + " uploaded, the IWAD is still selected explicitly");
+    check(argv.indexOf("-iwad") < argv.indexOf("-file"),
+          "the explicit IWAD precedes the PWAD list for " + name);
+  }
+}
+
+// --- the fingerprint cannot be forged by a filename ------------------------
+
+// @@server's captured collision, reproduced against the old delimiter
+// encoding. A filename may legitimately contain ":" and "|", so one entry
+// whose name embeds them produced exactly the string two ordinary entries
+// produced.
+{
+  const h1 = "a".repeat(64);
+  const h2 = "b".repeat(64);
+
+  const one = [{
+    name: "X.wad:" + h1 + ":deh=0|1:file:Y.wad",
+    hash: h2,
+    load: "file",
+    hasDehacked: false,
+  }];
+  const two = [
+    { name: "X.wad", hash: h1, load: "file", hasDehacked: false },
+    { name: "Y.wad", hash: h2, load: "file", hasDehacked: false },
+  ];
+
+  check(validatePwads(one).ok, "the crafted single-entry set is a valid set");
+  check(validatePwads(two).ok, "the ordinary two-entry set is a valid set");
+  check(fingerprint(one, false) !== fingerprint(two, false),
+        "a name embedding the old delimiters no longer collides with two entries");
+
+  // The general property, not just the captured instance.
+  const sneaky = [
+    { name: '","hash":"' + h1 + '.wad', hash: h2, load: "file", hasDehacked: false },
+  ];
+  check(validatePwads(sneaky).ok, "a name with quote characters is a valid set");
+  check(fingerprint(sneaky, false) !== fingerprint(
+          [{ name: "a.wad", hash: h1, load: "file", hasDehacked: false },
+           { name: "b.wad", hash: h2, load: "file", hasDehacked: false }], false),
+        "a name cannot forge a field boundary in the encoding");
+
+  // Equal sets must still compare equal, or the encoding is useless.
+  check(fingerprint(two, false) === fingerprint(
+          [{ name: "X.wad", hash: h1, load: "file", hasDehacked: false },
+           { name: "Y.wad", hash: h2, load: "file", hasDehacked: false }], false),
+        "identical sets still fingerprint identically");
 }
 
 console.log(`${checks} checks, ${failures} failures`);

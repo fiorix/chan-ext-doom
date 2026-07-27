@@ -55,16 +55,28 @@
         if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
       });
 
+      let run = 0;
+
       function report(stream, text) {
-        parent.postMessage({ type: "doom-log", stream, text }, "*");
+        // Tagged with the run it belongs to, so the parent can discard
+        // anything arriving from a frame it has already torn down.
+        parent.postMessage({ type: "doom-log", run, stream, text },
+                           window.location.origin);
       }
 
       let started = false;
 
       window.addEventListener("message", (e) => {
         const msg = e.data;
+        // Only the parent that created this frame may launch it. Without
+        // this any same-origin document could start the engine with an argv
+        // and WAD set of its choosing, and the page derives its canary
+        // verdict from what this frame reports.
+        if (e.source !== window.parent) return;
+        if (e.origin !== window.location.origin) return;
         if (!msg || msg.type !== "doom-launch" || started) return;
         started = true;
+        run = msg.run;
 
         Module({
           canvas,
@@ -83,14 +95,14 @@
           ],
           onRuntimeInitialized: () => {
             canvas.focus();
-            parent.postMessage({ type: "doom-started" }, "*");
+            parent.postMessage({ type: "doom-started", run }, window.location.origin);
           },
         }).catch((err) => {
           report("err", "engine failed to start: " + err);
         });
       });
 
-      parent.postMessage({ type: "doom-frame-ready" }, "*");
+      parent.postMessage({ type: "doom-frame-ready" }, window.location.origin);
     </script>
   </body>
 </html>

@@ -191,6 +191,17 @@ export function validateIwad(iwad) {
 
 // The argv fragment for a mod set. Emitted in effective order so that reading
 // the command line and reading the load order give the same answer.
+// The engine's auto-detect walks its IWAD table before reaching doom1.wad:
+// doom2.wad, plutonia.wad, tnt.wad and doom.wad all outrank it, matched
+// case-insensitively in the same directory the loader mounts uploads into. A
+// PWAD carrying one of those names would boot as the IWAD while the page
+// displayed the verified doom1.wad tuple. Naming the pin explicitly removes
+// the auto-detect from the picture entirely; D_FindWADByName resolves an
+// absolute path directly before it consults any search directory.
+export function iwadArgv() {
+  return ["-iwad", IWAD_PATH];
+}
+
 export function modArgv(entries, dehlump) {
   const ordered = canonicalOrder(entries);
   const merges = ordered.filter((e) => e.load === "merge").map((e) => e.name);
@@ -210,9 +221,21 @@ export function modArgv(entries, dehlump) {
 // The string peers compare before starting a game. It serializes the
 // effective order and the whole tuple: name, content hash, load kind, and the
 // embedded-DEHACKED behaviour that will actually take effect.
+//
+// Encoded with JSON rather than by joining fields with delimiters. A filename
+// is attacker-influenced and may legitimately contain any character the
+// basename policy permits, including ":" and "|", so delimiter concatenation
+// is ambiguous: one entry whose name embeds the separators produces the same
+// string as two ordinary entries. That is not hypothetical, it was
+// reproduced. JSON quotes and escapes every field, so no name can forge a
+// field boundary.
 export function fingerprint(entries, dehlump) {
-  return canonicalOrder(entries)
-    .map((e, i) =>
-      `${i}:${e.load}:${e.name}:${e.hash}:deh=${effectiveDehacked(e, dehlump) ? 1 : 0}`)
-    .join("|");
+  return JSON.stringify(
+    canonicalOrder(entries).map((e, i) => ({
+      i,
+      load: e.load,
+      name: e.name,
+      hash: e.hash,
+      deh: effectiveDehacked(e, dehlump) ? 1 : 0,
+    })));
 }

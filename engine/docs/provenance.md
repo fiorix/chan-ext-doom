@@ -174,6 +174,10 @@ Every file is written into the Emscripten FS by name, so the loader rejects dupl
 
 The IWAD is pinned, not merely named: 4196020 bytes and sha256 `1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771` (sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`). This fork is shareware-only by design, so the loader verifies the bytes and refuses to launch otherwise.
 
+Verifying the bytes is not sufficient on its own, because it does not settle which file the engine opens. `d_iwad.c`'s auto-detect walks its table in order, and `doom2.wad`, `plutonia.wad`, `tnt.wad` and `doom.wad` all precede `doom1.wad`, matched case-insensitively in the same directory uploads are mounted into. A PWAD carrying one of those names would boot as the IWAD while the page displayed the verified `doom1.wad` tuple. The launch argv therefore names the pin explicitly with `-iwad /doom1.wad`; `D_FindWADByName` resolves an absolute path before consulting any search directory, so auto-detect never runs.
+
+The fingerprint is JSON rather than delimiter-joined fields. A filename may legitimately contain `:` and `|`, so concatenation was ambiguous: a single entry whose name embedded the separators produced exactly the string two ordinary entries produced. That collision was captured, not theorised, and the regression test carries the exact case.
+
 **Effective order is not command-line order.** `W_ParseCommandLine` processes every `-merge` input before every `-file` input, regardless of how the groups appear on the command line, preserving order only within each group. Upstream says so directly: "Merged PWADs are loaded first, because they are supposed to be modified IWADs." So the canonical effective order is all merges in their declared relative order, then all files in theirs. `mod_order.js` implements that, the loader normalizes to it rather than displaying an order the engine will not honour, and the fingerprint peers compare is built from the effective order. A requested `file -> merge -> file` sequence is not achievable and is normalized, with the reason reported.
 
 ## Prerequisites

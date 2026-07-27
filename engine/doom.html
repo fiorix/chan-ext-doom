@@ -220,7 +220,7 @@
       import {
         canonicalOrder, isCanonical, modArgv, fingerprint,
         hasDehackedLump, effectiveDehacked, validatePwads, validateIwad,
-        createSelectionGuard, IWAD_PIN, IWAD_PATH,
+        createSelectionGuard, iwadArgv, IWAD_PIN, IWAD_PATH,
       } from "./mod_order.js";
 
       const el = (id) => document.getElementById(id);
@@ -424,7 +424,7 @@
       }
 
       function buildArgv() {
-        const argv = modArgv(state.pwads, el("dehlump").checked);
+        const argv = iwadArgv().concat(modArgv(state.pwads, el("dehlump").checked));
 
         if (el("deathmatch").checked) argv.push("-deathmatch");
 
@@ -493,28 +493,52 @@
       }
 
       let frame = null;
+      // Identifies one launch. A frame torn down mid-run keeps its own id, so
+      // anything it sends afterwards is discarded rather than attributed to
+      // the run that replaced it.
+      let currentRun = 0;
       // One pending launch, not one closure per click. Installing a listener
       // per launch let the oldest one match the newest frame and replay the
       // first configuration, which the frame's started guard then locked in.
       let pending = null;
 
+      // Every message is pinned to the current iframe and the current run.
+      // Once a canary verdict is derived from this traffic, a stale frame or
+      // any other same-origin document could otherwise inject log lines and
+      // forge acceptance evidence, so the checks are not cosmetic.
+      function fromCurrentFrame(e) {
+        return frame !== null && e.source === frame.contentWindow;
+      }
+
       window.addEventListener("message", (e) => {
         const msg = e.data;
-        if (!msg) return;
+        if (!msg || e.origin !== window.location.origin) return;
+        if (!fromCurrentFrame(e)) return;
 
         if (msg.type === "doom-frame-ready") {
-          if (!frame || e.source !== frame.contentWindow || !pending) return;
-          frame.contentWindow.postMessage(pending, "*");
+          if (!pending) return;
+          frame.contentWindow.postMessage(pending, window.location.origin);
           window.__doomSent = (window.__doomSent || []).concat([pending.argv.join(" ")]);
           pending = null;
         } else if (msg.type === "doom-log") {
+          if (msg.run !== currentRun) return;
           log(msg.text, msg.stream === "err" ? "warn" : null);
         }
       });
 
       function launch() {
+        // Fail closed. The button is disabled without an accepted IWAD, but
+        // launching is the step that mounts bytes and produces evidence, so
+        // it re-checks rather than trusting the control's state.
+        const blocked = blockedReason();
+        if (blocked) {
+          log("launch refused: " + blocked, "warn");
+          return;
+        }
+
         const argv = buildArgv();
         const dehlump = el("dehlump").checked;
+        currentRun += 1;
 
         // Relaunch is a teardown. Removing the iframe takes the instance, its
         // main loop, its audio graph and its FS with it, which is the only
@@ -542,7 +566,7 @@
         log("  fingerprint " +
             (state.pwads.length ? fingerprint(state.pwads, dehlump) : "(none)"));
 
-        pending = { type: "doom-launch", argv, files };
+        pending = { type: "doom-launch", run: currentRun, argv, files };
 
         frame = document.createElement("iframe");
         frame.src = "doom-frame.html";
