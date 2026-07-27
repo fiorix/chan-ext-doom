@@ -233,11 +233,20 @@ static void SetLocalNode(uint32_t node)
 
 static void ShutdownSocket(void)
 {
-    if (websocket > 0)
+    EMSCRIPTEN_WEBSOCKET_T dying = websocket;
+
+    // Cleared before the close, not after. Closing can dispatch this
+    // module's own close callback, and it may run from inside a callback
+    // already (an announce that fails during OnOpen). Retiring the handle
+    // first makes every such event stale by definition, so nothing can
+    // re-enter here or mutate state belonging to a later session.
+
+    websocket = 0;
+
+    if (dying > 0)
     {
-        emscripten_websocket_close(websocket, 1000, "shutting down");
-        emscripten_websocket_delete(websocket);
-        websocket = 0;
+        emscripten_websocket_close(dying, 1000, "shutting down");
+        emscripten_websocket_delete(dying);
     }
 
     // Anything queued belonged to the session that just ended. Freeing it
@@ -267,7 +276,14 @@ static void SendAnnounce(void)
     if (len == 0 ||
         emscripten_websocket_send_binary(websocket, frame, len) < 0)
     {
-        printf("NET_Websockets: failed to announce node %u\n", local_node);
+        // Terminal, for the same reason SendPacket is. A host that failed to
+        // claim the room is not a host: the router never learned its node id,
+        // so no client can reach it and it would otherwise sit in WS_OPEN
+        // retrying ordinary packets forever against a room it does not own.
+
+        printf("NET_Websockets: failed to announce node %u, ending the session\n",
+               local_node);
+        ShutdownSocket();
     }
 }
 
