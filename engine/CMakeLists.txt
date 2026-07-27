@@ -1,49 +1,91 @@
-cmake_minimum_required( VERSION 3.0.0 )
-project(wasm-doom)
+cmake_minimum_required(VERSION 3.13)
+project(doomit-engine C)
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_LIST_DIR})
+# This mirrors the single-emcc recipe in docs/provenance.md. That recipe is the
+# reference: it is what the pinned artifact hashes are reproduced from, and
+# anything that makes the two disagree is a bug in this file.
+
+set(ENGINE_ROOT ${CMAKE_CURRENT_LIST_DIR})
 
 include_directories(
-    gifenc
-    opl
-    sdl_mixer
-    src
-    src/doom
+    ${ENGINE_ROOT}/gifenc
+    ${ENGINE_ROOT}/opl
+    ${ENGINE_ROOT}/sdl_mixer
+    ${ENGINE_ROOT}/src
+    ${ENGINE_ROOT}/src/doom
     )
-file (GLOB_RECURSE SRC_FILES *.c)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Oz -Wall \
-    -Wno-\#warnings \
-    -Wno-macro-redefined \
-    -Wno-switch \
-    -s WASM=1 \
-    -s USE_SDL=2 \
-    -s USE_LIBPNG=1 \
-    -s ALLOW_MEMORY_GROWTH=1 \
-    -s NO_EXIT_RUNTIME=1 \
-    -s EXTRA_EXPORTED_RUNTIME_METHODS=['FS','UTF8ToString'] \
-    --no-heap-copy")
+# Globbed per source root rather than recursively from the project root. A
+# recursive glob also swallows test/, whose translation units carry their own
+# main(), and would link them into the engine.
 
-if (CMAKE_BUILD_TYPE MATCHES Debug)
-  add_executable(index ${SRC_FILES})
-  target_link_libraries(index)
-  set_target_properties( index PROPERTIES SUFFIX ".html" )
+file(GLOB_RECURSE ENGINE_SOURCES
+    ${ENGINE_ROOT}/gifenc/*.c
+    ${ENGINE_ROOT}/opl/*.c
+    ${ENGINE_ROOT}/sdl_mixer/*.c
+    ${ENGINE_ROOT}/src/*.c
+    )
 
-  set(CMAKE_C_FLAGS_DEBUG "-s ASSERTIONS=2 --source-map-base http://localhost:8000/ -g4 --preload-file ${CMAKE_CURRENT_LIST_DIR}/../doom1.wad@doom1.wad")
+# Sorted for the same reason the recipe pipes find through LC_ALL=C sort: emcc
+# assigns wasm function indices and EM_ASM string addresses in command-line
+# order, so an unsorted list makes the artifact depend on readdir order.
+list(SORT ENGINE_SOURCES)
 
-  #add_custom_command(TARGET index POST_BUILD
-  #  WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
-  #  COMMAND sed -i index.wasm.map 's|${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/||g' index.wasm.map
-  #  COMMENT "Fix WebAssembly source map root"
-  #)
+# The transport is selected in two places that must agree: net_transport.h
+# picks the net_module_t symbol, and the build picks the translation unit.
+# Compiling the wrong one fails at the include (SDL_net.h) or at the link
+# (undefined net_sdl_module).
 
-  em_link_js_library(index ${libraryJsFiles})
+if(EMSCRIPTEN)
+    list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_sdl.c)
 else()
-  add_executable(doom ${SRC_FILES})
-  target_link_libraries(doom)
-  set_target_properties( doom PROPERTIES SUFFIX ".js" )
+    list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_websockets.c)
+endif()
 
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -s MODULARIZE=1 -s ASSERTIONS=0")
+add_executable(doom ${ENGINE_SOURCES})
 
-  em_link_js_library(doom ${libraryJsFiles})
+target_compile_options(doom PRIVATE
+    -Oz
+    -Wno-#warnings
+    -Wno-macro-redefined
+    -Wno-switch
+    )
+
+if(EMSCRIPTEN)
+    set_target_properties(doom PROPERTIES SUFFIX ".js")
+
+    target_compile_options(doom PRIVATE -sUSE_SDL=2 -sUSE_LIBPNG=1)
+
+    # Kept in step with docs/provenance.md. ASYNCIFY is not optional: I_Sleep
+    # yields through it, and without that the browser event loop never runs
+    # while the network code is waiting, so every connect times out.
+    # -lwebsocket.js supplies the transport's emscripten_websocket_* symbols.
+
+    target_link_options(doom PRIVATE
+        -Oz
+        -sWASM=1
+        -sUSE_SDL=2
+        -sUSE_LIBPNG=1
+        -sALLOW_MEMORY_GROWTH=1
+        -sNO_EXIT_RUNTIME=1
+        -sEXPORTED_RUNTIME_METHODS=FS,UTF8ToString
+        -sMODULARIZE=1
+        -sASSERTIONS=0
+        -sASYNCIFY
+        -sASYNCIFY_STACK_SIZE=32768
+        -lwebsocket.js
+        )
+else()
+    # Native builds carry the UDP transport, so they need SDL2 and SDL2_net.
+    # These fail loudly at configure time rather than as a confusing missing
+    # include later.
+
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SDL2 REQUIRED sdl2)
+    pkg_check_modules(SDL2_NET REQUIRED SDL2_net)
+
+    target_include_directories(doom PRIVATE
+        ${SDL2_INCLUDE_DIRS} ${SDL2_NET_INCLUDE_DIRS})
+    target_link_libraries(doom PRIVATE
+        ${SDL2_LIBRARIES} ${SDL2_NET_LIBRARIES} m)
 endif()

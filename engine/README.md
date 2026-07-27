@@ -27,19 +27,55 @@ Emscripten is © 2010-2018 Emscripten authors, see [AUTHORS](https://raw.githubu
 
 # Building
 
-## Development
+`docs/provenance.md` is the reference. It carries the single `emcc`
+invocation the pinned artifact hashes are reproduced from, the upstream
+commits every file came from, and every deviation from upstream.
+
+## Browser
 
 ```sh
-emcmake cmake -DCMAKE_BUILD_TYPE=Debug
-emmake make -j12
+source ~/dev/emsdk/emsdk_env.sh
+mkdir -p out
+# the exact command lives in docs/provenance.md
 ```
 
-## Production
+The CMake route builds the same thing:
 
 ```sh
-emcmake cmake -DCMAKE_BUILD_TYPE=Release
-emmake make -j12
+emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
+
+Both exclude `src/net_sdl.c`, link `-lwebsocket.js`, and enable ASYNCIFY.
+None of those is optional: the WebSocket transport does not link without
+the library, and without ASYNCIFY `I_Sleep` cannot yield to the browser
+event loop, so every network connect times out.
+
+## Native
+
+Not built or tested on the reference host, which lacks the SDL development
+packages. The sources and the transport selection are wired; see the native
+section of `docs/provenance.md` for the exact missing prerequisite.
+
+```sh
+cmake -B build-native -DCMAKE_BUILD_TYPE=Release
+cmake --build build-native
+```
+
+Native builds carry the UDP transport (`src/net_sdl.c`) instead of the
+WebSocket one, so a native client can share a room with stock
+chocolate-doom.
+
+## Tests
+
+```sh
+npm test        # or: ./test/run.sh
+```
+
+Runs the host suite with a plain compiler and node: the router envelope
+codec and receive ring, the loopback queue's overflow path, the mod
+ordering and content rules, and the transport address-ownership contract.
+No emscripten, no SDL, no WADs.
 
 # Controls
 

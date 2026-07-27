@@ -124,6 +124,7 @@ Upstream's form declares a tentative global named `cr_t` in every translation un
 | `atoi` on the resolve address, so any non-numeric string silently becomes node 0 | parsed with `strtoul` and rejected if it is not a node id |
 | blocks on `emscripten_sleep` waiting for the socket | connects asynchronously; the fix for the event-loop problem is in `I_Sleep`, where it also helps the launch wait and the tic stall |
 | a send failure flips state without closing the handle, so a later send can build a second socket while the first one's callbacks still mutate the same globals | a failure closes and deletes the handle, drains the ring and is terminal for the module; callbacks carrying a discarded handle are ignored |
+| a failed announce only prints, leaving a host that never claimed the room live and retrying forever | an announce failure takes the same terminal path, because a host the router never learned about is unreachable |
 | `net_websockets.h` uses the `NET_SDL_H` include guard | its own guard |
 
 The socket lifecycle is deliberately terminal rather than self-healing. An in-place reconnect would have to close the old handle, drain the ring without discarding live packets, and keep callbacks from the dead handle away from the replacement's state. That is a lot of hazard for no benefit here, because the host page's model is that a relaunch tears down the whole WASM instance: a session that loses its socket is over. Failures therefore close and delete the handle, drain the queue, and refuse further use, and events arriving from a discarded handle are ignored.
@@ -197,11 +198,22 @@ Three parts of that line are load-bearing:
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native build excludes `net_websockets.c` for the mirror-image reason.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
-- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1681414 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
+- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1681456 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
 `LC_ALL=C sort` is also load-bearing. Bare `find` emits readdir order, which varies by filesystem and by the order files were created, and emcc assigns wasm function indices and `EM_ASM` string addresses in command-line order. Without the sort the same source tree produces a different `doom.wasm` on every machine. With it, the build is bit-reproducible.
 
 The flag set is otherwise upstream's `CMakeLists.txt` Release configuration, minus the two spellings emscripten has since removed (`EXTRA_EXPORTED_RUNTIME_METHODS`, `--no-heap-copy`). The single `emcc` invocation is used instead of upstream's CMake path because it needs no host `cmake` and pins the flags where they can be read.
+
+### The CMake route
+
+`CMakeLists.txt` builds the same thing and is kept in step with the recipe above. It restricts its globs to the four source roots so `test/` (whose translation units carry their own `main`) is never linked into the engine, sorts the source list for the same determinism reason, and selects the transport translation unit to match what `net_transport.h` selects: Emscripten drops `src/net_sdl.c`, native drops `src/net_websockets.c`.
+
+```sh
+emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+**Not executed on the reference host: it has no `cmake`, and no way to install one without root** (`python3 -m venv` is unavailable, there is no `pip`). The single-`emcc` recipe above remains the reference that the pinned hashes come from; the CMake route is written to match it flag for flag but its artifacts have not been compared. Treat it as unverified until someone runs it.
 
 ### Expected output
 
@@ -209,8 +221,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188756 | e4b79e8985ab3c8ac5621c209e08ef75470622b7a7bae2fb8b6da64a4984e990 |
-| doom.wasm | 1681414 | bfd423a9064017a8e771970ff74efc5de0c2b3715ab067b04574234e68f68d66 |
+| doom.js | 188756 | 67fde844b3f7460efec7826e0be8253c13b4c7fde26fc529906570fd8c1e9d6a |
+| doom.wasm | 1681456 | 8e2bdf71736f65f7abc4428eb1ee5348e916ecf965352de002fd9fff6a4f0886 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
@@ -224,6 +236,8 @@ src/net_sdl.c:36:10: fatal error: SDL_net.h: No such file or directory
 ```
 
 Exact missing prerequisite on a Debian or Ubuntu host: `libsdl2-net-dev` (candidate 2.2.0+dfsg-4 here, not installed), plus `libsdl2-dev` for the rest of the engine. The source and the transport selection are wired; only the toolchain is absent.
+
+The CMake native configuration fails earlier and more clearly, by design: it `pkg_check_modules`s `sdl2` and `SDL2_net` at configure time rather than letting the build die on a missing include. That path is also unrun here, for the same lack of `cmake`.
 
 ## Running it
 
@@ -261,4 +275,6 @@ The browser build is verified by running it. Serve `out/doom.js`, `out/doom.wasm
 
 Single player is healthy when the console carries the `DOOM Shareware` banner, `W_Init` reports ` adding doom1.wad`, startup runs through `I_Init`, `R_Init`, `P_Init`, `S_Init`, `D_CheckNetGame`, `HU_Init`, `ST_Init` with no `I_Error`, and a screenshot after roughly 15 seconds shows E1M1 rendering behind a live status bar.
 
-The network path is healthy when two instances, one launched with `-server -wss <url> -nodes 2` and one with `-connect 1 -wss <url>`, both reach `D_CheckNetGame` reporting `player 1 of 2` and `player 2 of 2`. Running them in separate browser processes avoids overloading a single software-GL renderer.
+The network path is healthy when two instances, one launched with `-privateserver -wss <url> -nodes 2` and one with `-connect 1 -wss <url>`, both reach `D_CheckNetGame` reporting `player 1 of 2` and `player 2 of 2`. Running them in separate browser processes avoids overloading a single software-GL renderer.
+
+**Start the host first and let it connect before joining.** Claiming a room is a reset: the frame the host sends to node 0 disconnects every other connection already in that room, in this engine's router and in `doomd` alike. A client that connects during the host's startup is therefore dropped, and since a closed socket is terminal here, it does not recover. Observed against `doomd`: the join reported `closed (clean=1 code=1005)` and then `Failed to connect to ws node 1`, purely because its socket opened before the host had claimed the room. With the host connected first, the same pair reaches `player 1 of 2` and `player 2 of 2`.

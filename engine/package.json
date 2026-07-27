@@ -1,25 +1,24 @@
 {
-  "name": "wasm-doom",
+  "name": "doomit-engine",
   "version": "1.0.0",
-  "description": "DOOM® is a registered trademark of ZeniMax Media Inc. in the US and/or other countries. Id Software® is a registered trademark of ZeniMax Media Inc. in the US and/or other countries. WebDOOM is in no way affiliated with ZeniMax Media Inc. or id Software LLC and is not approved by ZeniMax Media Inc. or id Software.",
-  "main": "index.js",
+  "description": "DOOM engine fork for doomit: a Crispy base with the Chocolate network layer restored. DOOM is a registered trademark of ZeniMax Media Inc.; this fork is not affiliated with or approved by ZeniMax Media Inc. or id Software.",
   "scripts": {
-    "start": "echo \"Use:\nemcmake cmake -DCMAKE_BUILD_TYPE=Debug\nemmake make -j12\" && exit 0",
+    "build": "emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build",
+    "build:native": "cmake -B build-native -DCMAKE_BUILD_TYPE=Release && cmake --build build-native",
     "serve": "serve .",
-    "build": "emmake make -j12", 
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "./test/run.sh"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lazarv/wasm-doom.git"
+    "url": "git+https://github.com/fiorix/doomit.git"
   },
   "keywords": [],
   "author": "ROJO2 <hola@rojo2.com>",
   "license": "GPL-2.0",
   "bugs": {
-    "url": "https://github.com/lazarv/wasm-doom/issues"
+    "url": "https://github.com/fiorix/doomit/issues"
   },
-  "homepage": "https://github.com/lazarv/wasm-doom#readme",
+  "homepage": "https://github.com/fiorix/doomit#readme",
   "devDependencies": {
     "serve": "^11.1.0"
   }
