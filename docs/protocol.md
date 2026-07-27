@@ -1,0 +1,353 @@
+# Chocolate Doom wire protocol — owned inventory
+
+Status: M1 evidence slice. Every statement below is labeled:
+
+- **[observed]** — seen in the committed captures under `fixtures/`
+  (see `fixtures/manifest.json`; repro via `docs/verification.md`).
+- **[reference]** — read from the pinned upstream C source
+  (chocolate-doom `410d96855b5df5410ff591a90efeafa889119224`,
+  tag `chocolate-doom-3.1.1`). Used for interoperability only; no C code
+  is ported into `crates/`.
+- **[unknown]** — not yet observed or not yet verified.
+
+Capture source of truth: `fixtures/` + `fixtures/rig/capture.py`.
+All captures are native UDP loopback, chocolate-doom 3.1.1 client
+against chocolate-server 3.1.1, shareware doom1.wad
+(sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, never committed).
+
+## 1. Transport and framing
+
+- UDP datagrams, one packet per datagram. The server listens on port
+  **2342** by default; the client always connects to port 2342 (it is not
+  configurable client-side). `[observed, reference]`
+- There is **no per-packet length, magic, or checksum** in the connected
+  phase; the datagram boundaries are the framing. `[observed]`
+- Every packet starts with a **u16 big-endian type**. Bit 15 (`0x8000`)
+  of that word is the **reliable flag**, not part of the type.
+  `[observed]`
+- **All multi-byte integers are big-endian.** `[observed]` in the SYN
+  magic (`56 ab e1 8c` = 1454104972) and every header; `[reference]`
+  `NET_WriteInt16/32` write MSB first. (Note: this contradicts an early
+  design note about little-endian — the wire says big-endian; the codec
+  in M2 must follow the wire.)
+- **Strings** are NUL-terminated, no length prefix. `[observed]`
+- **SHA-1 digests** travel as 20 raw bytes. `[observed]` The
+  `wad_sha1sum` is chocolate's composite `W_Checksum` of the loaded WAD
+  set, **not** the plain sha1 of the IWAD file. `[reference]`
+- **Reliable packets** carry a **u8 sequence number** immediately after
+  the type word. The sequence is per-connection, per-direction, starts
+  at 0, and increments mod 256 for each reliable packet sent.
+  `[observed]` (e.g. c2s `LAUNCH` seq `00`, c2s `GAMESTART` seq `01`,
+  s2c SYN accept seq `00`, s2c `LAUNCH` seq `01`.)
+- The receiver answers every reliable packet with `RELIABLE_ACK` whose
+  u8 payload is the **next expected** sequence (`received + 1 mod 256`).
+  `[observed, reference]`
+- An unacknowledged reliable packet is resent after 1 s. `[reference]`
+  (No resend of reliable packets was needed on lossless loopback;
+  `[unknown]` on the wire.)
+- **Keepalive**: when a side has sent nothing for 1 s it emits a bare
+  `KEEPALIVE`. `[observed]` both directions at ~1 Hz in the lobby.
+- **Timeout**: 30 s of receive-silence marks the connection disconnected
+  with reason "timeout" — silently, with **no** `DISCONNECT` packet to
+  the dead peer. `[observed]` (client killed at 5 s; server traffic to
+  it stops at ~34 s), `[reference]` (`CONNECTION_TIMEOUT_LEN 30`).
+
+## 2. Connection lifecycle
+
+Observed end-to-end in `gamestart-gamedata`:
+
+1. `SYN` (c2s) → `SYN` accept (s2c, reliable) → `WAITING_DATA` (s2c)
+   → `RELIABLE_ACK` (c2s).
+2. Lobby: server re-sends `WAITING_DATA` every 1 s; both sides keepalive.
+3. Controller client sends `LAUNCH` (c2s, reliable) → server broadcasts
+   `LAUNCH` (s2c, reliable, u8 player count).
+4. Controller sends `GAMESTART` (c2s, reliable, settings) → server marks
+   it ready and, when all nodes are ready, broadcasts `GAMESTART`
+   (s2c, reliable, authoritative settings).
+5. In game: `GAMEDATA` both ways, `GAMEDATA_ACK` (c2s),
+   `GAMEDATA_RESEND` both ways on gaps.
+6. Teardown paths `[observed]`:
+   - Client process killed: nothing on the wire; server drops it after
+     the 30 s timeout (and broadcasts a `CONSOLE_MESSAGE` to the
+     remaining clients).
+   - Last player gone: server sends `DISCONNECT` to remaining clients
+     (drones), which reply `DISCONNECT_ACK`.
+
+Signal behavior: chocolate installs **no** signal handlers and sets
+`SDL_HINT_NO_SIGNAL_HANDLERS=1`; SIGTERM/SIGINT kill both binaries
+silently. `[observed, reference]` Consequence for fixtures: a clean
+client-initiated `DISCONNECT` is only reachable through the in-game UI;
+headless captures observe the server-initiated path instead.
+
+## 3. Packet inventory
+
+Type is the low 15 bits of the header word. `[observed]` marks sessions
+where the type appears in committed fixtures.
+
+| type | name | dir | reliable | status |
+|---:|---|---|---|---|
+| 0 | SYN | c2s / s2c | s2c only | [observed] handshake-keepalive, gamestart-gamedata, drone-disconnect |
+| 1 | ACK | — | — | deprecated, unused in 3.x `[reference]` |
+| 2 | REJECTED | s2c | no | `[unknown]` (needs a mismatch scenario; layout in §4) |
+| 3 | KEEPALIVE | both | no | [observed] all sessions |
+| 4 | WAITING_DATA | s2c | no | [observed] all lobby sessions |
+| 5 | GAMESTART | both | yes | [observed] gamestart-gamedata |
+| 6 | GAMEDATA | both | no | [observed] gamestart-gamedata |
+| 7 | GAMEDATA_ACK | c2s | no | [observed] gamestart-gamedata |
+| 8 | DISCONNECT | s2c (any) | no | [observed] drone-disconnect (s2c) |
+| 9 | DISCONNECT_ACK | c2s (any) | no | [observed] drone-disconnect (c2s) |
+| 10 | RELIABLE_ACK | both | no | [observed] all sessions |
+| 11 | GAMEDATA_RESEND | both | no | [observed] gamestart-gamedata (both directions, organic) |
+| 12 | CONSOLE_MESSAGE | s2c | yes | [observed] console-message |
+| 13 | QUERY | c2s (any) | no | [observed] query |
+| 14 | QUERY_RESPONSE | s2c | no | [observed] query |
+| 15 | LAUNCH | both | yes | [observed] gamestart-gamedata |
+| 16 | NAT_HOLE_PUNCH | both | no | `[unknown]` (NAT traversal; out of loopback scope) |
+
+The pre-3.0 protocol (magic `3436803284`, per-packet magic+seq header)
+is rejected by 3.1.1 servers and out of scope. `[reference]`
+
+## 4. Packet layouts
+
+Offsets are decimal bytes from packet start. `u8/u16/u32` are
+big-endian; `s8/s16` two's complement; `str` = NUL-terminated;
+`sha1` = 20 raw bytes; `…` = volatile content (see §5).
+
+### SYN (0) c2s — connect request
+
+Observed `handshake-keepalive/000-c2s-client1-syn.bin` (107 B):
+
+```
+ 0  u16  type = 0
+ 2  u32  magic = 0x56abe18c (1454104972)
+ 6  str  client version      "Chocolate Doom 3.1.1"
+27  u8   num_protocols = 1
+28  str  protocol[0]         "CHOCOLATE_DOOM_0"
+45  u8   gamemode = 0 (shareware)
+46  u8   gamemission = 0 (doom)
+47  u8   lowres_turn = 0
+48  u8   drone = 0
+49  u8   max_players = 4 (engine MAXPLAYERS, not the net layer's 8)
+50  u8   is_freedoom = 0
+51  sha1 wad_sha1sum = 485fd232c51d1f9cc85815b7f717dbefee77211c …
+71  sha1 deh_sha1sum = 4fbed9ba4ae5ebea957aa149b51a119aaf03160d …
+91  u8   player_class = 104 … (uninitialized in doom; see §5)
+92  str  player name         "Ecstatic Ettin" …
+```
+
+### SYN (0) s2c — accept (reliable)
+
+Observed `handshake-keepalive/001-s2c-client1-syn.bin` (41 B):
+
+```
+ 0  u16  0x8000 (SYN | reliable)
+ 2  u8   rel_seq = 0
+ 3  str  server version      "Chocolate Doom 3.1.1"
+24  str  negotiated protocol "CHOCOLATE_DOOM_0"
+```
+
+A rejection instead sends REJECTED (2): `u16 type` then `str reason`.
+`[reference]` only — no rejection scenario captured yet.
+
+### WAITING_DATA (4) s2c — lobby state, re-sent every 1 s
+
+Observed `handshake-keepalive/002-s2c-client1-waiting_data.bin` (80 B):
+
+```
+ 0  u16  type = 4
+ 2  u8   num_players = 1
+ 3  u8   num_drones = 0
+ 4  u8   ready_players = 0
+ 5  u8   max_players = 4
+ 6  u8   is_controller = 1
+ 7  s8   consoleplayer = 0
+ 8  str  player[0].name = "Ecstatic Ettin" …
+23  str  player[0].addr = "127.0.0.1:40485" …
+39  sha1 wad_sha1sum …   59  sha1 deh_sha1sum …   79  u8 is_freedoom = 0
+```
+
+Per-player name/addr pairs repeat `num_players` times. The 3-node lobby
+sample (115 B) is in `console-message/269-…-waiting_data.bin`; the
+post-timeout 1-player sample (82 B) is `console-message/279-…`.
+
+### LAUNCH (15)
+
+- c2s, reliable, empty body: `80 0f 00` (seq 0).
+  `[observed]` `gamestart-gamedata/004-…`.
+- s2c, reliable, `u8 num_players`: `80 0f 01 01`.
+  `[observed]` `gamestart-gamedata/006-…`. Only the controller may
+  launch. `[reference]`
+
+### GAMESTART (5), reliable — game settings
+
+Observed `gamestart-gamedata/008-c2s-client1-gamestart.bin` (24 B);
+the s2c broadcast (`011-…`) is byte-identical except rel_seq (`02`):
+
+```
+ 0  u16  0x8005 (GAMESTART | reliable)
+ 2  u8   rel_seq
+ 3  u8   ticdup = 1          4  u8  extratics = 1
+ 5  u8   deathmatch = 0      6  u8  nomonsters = 0
+ 7  u8   fast_monsters = 0   8  u8  respawn_monsters = 0
+ 9  u8   episode = 1        10  u8  map = 1
+11  u8   skill = 2 (medium) 12  u8  gameversion = 5 (exe_doom_1_9)
+13  u8   lowres_turn = 0    14  u8  new_sync = 1
+15  u32  timelimit = 0
+19  s8   loadgame = -1     20  u8  random = 64 … (strife-only; see §5)
+21  u8   num_players = 1   22  s8  consoleplayer = 0
+23  u8   player_classes[0] = 120 … (uninitialized in doom; see §5)
+```
+
+The client proposes; the server validates and broadcasts the
+authoritative copy with `num_players`, `consoleplayer` (per recipient),
+and `player_classes` filled in. `[reference]`
+
+### GAMEDATA (6) c2s — client ticcmds
+
+Observed `gamestart-gamedata/029-c2s-client1-gamedata.bin` (9 B):
+
+```
+ 0  u16  type = 6
+ 2  u8   ack = recvwindow_start low byte (piggybacked GAMEDATA_ACK)
+ 3  u8   start tic low byte
+ 4  u8   num tics
+ 5  …    per tic: s16 latency, then ticcmd diff (below)
+```
+
+### GAMEDATA (6) s2c — server fan-out
+
+Observed `gamestart-gamedata/013-s2c-client1-gamedata.bin` (10 B):
+
+```
+ 0  u16  type = 6
+ 2  u8   start tic low byte
+ 3  u8   num tics
+ 4  …    per tic: s16 latency, u8 playeringame bitmask (bit i = player i),
+         then ticcmd diff per active player
+```
+
+### ticcmd diff (inside GAMEDATA) `[reference]` + partial `[observed]`
+
+u8 bitmask selecting which fields follow (1=forward, 2=side, 4=turn,
+8=buttons, 16=consistancy, 32=chatchar, 64=raven lookfly/arti,
+128=strife). Fields are u8/s8 in that order, except turn which is s16
+(s8 × 256 when lowres_turn). The zero diff `00` (no change vs previous
+tic) dominates the idle captures; richer diffs are `[unknown]` until
+input-driven captures.
+
+### GAMEDATA_ACK (7) c2s
+
+`u16 type`, `u8 ack = recvwindow_start low byte`.
+`[observed]` `gamestart-gamedata/028-…`.
+
+### GAMEDATA_RESEND (11)
+
+`u16 type`, `u32 start tic`, `u8 num tics`.
+`[observed]` s2c `gamestart-gamedata/024-…` (`00 0b 00000000 06` —
+requesting tics 0..5) and c2s `027-…`. Emitted by both sides when the
+peer's window stalls; seen organically because the headless client
+needed ~1.2 s to start sending tics.
+
+### KEEPALIVE (3) / DISCONNECT (8) / DISCONNECT_ACK (9)
+
+Bare `u16 type`, no body. `[observed]` (DISCONNECT s2c
+`drone-disconnect/178-…`, DISCONNECT_ACK c2s `…/179-…`).
+A local, orderly disconnect sends DISCONNECT retried at 1 s up to
+5 times until DISCONNECT_ACK. `[reference]`
+
+### RELIABLE_ACK (10)
+
+`u16 type`, `u8 next_expected_seq`. `[observed]` both directions
+(e.g. `gamestart-gamedata/003-…` = `00 0a 01`).
+
+### CONSOLE_MESSAGE (12) s2c, reliable
+
+`u16 0x800c`, `u8 rel_seq`, `str message`.
+`[observed]` `console-message/275-…` and `276-…` (56 B):
+"Client 'Aggressive Demon' timed out and disconnected", broadcast to
+every still-connected client. Note: a client that is itself being
+force-disconnected in the same tick never sees it — the disconnect
+pre-empts the reliable queue. `[observed]` (drone-disconnect has no
+CONSOLE_MESSAGE for exactly this reason).
+
+### QUERY (13) / QUERY_RESPONSE (14)
+
+`chocolate-doom -query 127.0.0.1` → bare `u16 13`; response
+`[observed]` `query/001-…` (61 B):
+
+```
+ 0  u16  type = 14
+ 2  str  version            "Chocolate Doom 3.1.1"
+23  u8   server_state = 0 (waiting for launch)
+24  u8   num_players = 0
+25  u8   max_players = 8 (NET_MAXPLAYERS before any client caps it)
+26  u8   gamemode = 4 (indetermined; no client has connected)
+27  u8   gamemission = 0 (doom)
+28  str  description        "Unnamed server"
+44  u8   num_protocols = 1
+45  str  protocol[0]        "CHOCOLATE_DOOM_0"
+```
+
+## 5. Volatile fields — do not assert on these
+
+- **player name**: when the config has none, the client invents a random
+  pet name ("Ecstatic Ettin", "Baby Demon", …). SYN and WAITING_DATA
+  lengths vary with it. `[observed]`
+- **player_class (SYN) and player_classes (GAMESTART)**: doom never
+  initializes them (hexen-only code); observed values `104` and `120`
+  are stack garbage. The server echoes them. `[observed, reference]`
+- **random (GAMESTART)**: strife-only; not set by doom. `[reference]`
+- **rel_seq, ack bytes, tic numbers**: depend on session timing.
+- **addr strings in WAITING_DATA**: ephemeral ports.
+- **wad/deh sha1**: stable for a fixed IWAD + deh set, but it is
+  chocolate's composite checksum, not a file hash. `[reference]`
+- **latency (s16) in GAMEDATA**: measured ping.
+
+The fixture tests therefore assert structure (header, length, hash of
+the committed bytes), never re-generated equality: re-running the rig
+produces equivalent sessions with different volatile bytes.
+
+## 6. WebSocket transport envelope (browser path) — `[reference]` only
+
+Not observable in these native UDP captures; documented from
+cloudflare/doom-wasm `src/net_websockets.c` (the module the merged
+engine will carry, per the design doc):
+
+- Each outbound binary WebSocket frame = `u32 to` + `u32 from`
+  (the instanceUID) + the raw chocolate packet from §4. The u32s are
+  host-order memcpy on wasm32, i.e. **little-endian** — unlike the
+  big-endian packet payload they wrap.
+- The inbound handler strips only one u32 (`from`) — the Durable Object
+  rewrites frames server-side, so the envelope is **asymmetric**:
+  8 bytes c2s, 4 bytes s2c as seen by the client.
+- `[unknown]`: exact on-wire shape on the server side of the DO; to be
+  verified with the engine/browser milestone.
+
+## 7. Timing and reliability parameters
+
+| parameter | value | status |
+|---|---|---|
+| keepalive period | 1 s of send-idle | [observed] ~1 Hz; [reference] `KEEPALIVE_PERIOD 1` |
+| connection timeout | 30 s of receive-silence | [observed] ~33→34 s drop after kill at ~3–5 s; [reference] |
+| lobby WAITING_DATA | every 1 s | [observed] |
+| reliable resend | after 1 s unacked | [reference] |
+| reliable seq | u8, per direction, mod 256 | [observed] |
+| DISCONNECT retries | 1 s × 5 | [reference] |
+| receive window | BACKUPTICS = 128 tics | [reference] |
+| NET_MAXPLAYERS | 8 (net layer); doom engine caps at 4 on the wire (`max_players = 4` in SYN) | [observed, reference] |
+
+## 8. Unknowns / next steps
+
+- REJECTED: needs a mismatch scenario (wrong mission, full server, or
+  protocol mismatch); none is producible with a single shareware IWAD
+  and unmodified binaries. Layout recorded in §4 from reference.
+- Clean client-initiated DISCONNECT (menu quit): requires UI input;
+  unreachable headless. Same for NAT_HOLE_PUNCH (needs real NAT).
+- Rich ticcmd diffs (movement/buttons), ticdup > 1, extratics on,
+  deathmatch flags in GAMESTART: need input-driven or scripted captures.
+  Candidate: a doom-embed bot client in M3.
+- Multi-player GAMESTART (`num_players > 1`, per-client `consoleplayer`):
+  single-player GAMESTART only so far.
+- RESEND-under-real-loss and reliable-resend on the wire: need a
+  loss-injecting relay run (rig extension, deliberate scenario).
+- The WS envelope (§6) on the wire: engine/browser milestone.
