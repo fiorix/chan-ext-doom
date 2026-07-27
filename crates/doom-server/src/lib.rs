@@ -1,7 +1,9 @@
 //! Sans-I/O room and server-role state machines for DOOM multiplayer.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {}
-}
+mod core;
+pub mod websocket;
+
+pub use core::{
+    DEFAULT_OUTBOX_CAPACITY, Envelope, JoinError, MAX_PAYLOAD_LEN, MAX_PLAYERS, MAX_ROOM_NAME_LEN,
+    OutboundPacket, PlayerId, Registry, RelayError, RelayOutcome, RoomName, RoomNameError, RouteId,
+};
