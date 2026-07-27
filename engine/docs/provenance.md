@@ -108,6 +108,18 @@ Upstream's form declares a tentative global named `cr_t` in every translation un
 
 ### New files
 
+**`src/doom/g_game.c`, the demo writer restored.** `G_WriteDemoTiccmd` was an empty stub, so `-record` produced a header and no ticcmds. Restored from crispy-doom-5.6.2 (`src/doom/g_game.c`, blob `efcba42943083ac684d71773ded164a1cd5f705d`), dropping only the `crispy->fliplevels` prologue, the same exclusion class as the `d_loop.c` restoration. The write, rewind, re-read round trip is kept deliberately: the re-read canonicalises the recording peer's own turn to the demo format's resolution, and without it that peer simulates a full-precision turn while every other peer simulates the quantised one, which desyncs a recorded netgame by construction.
+
+Overflow keeps upstream's vanilla stop rather than porting `IncreaseDemoBuffer`. A verification run raises `-maxdemo` instead, which the loader does: a buffer that grows on one side only would truncate the other and read as a desync that never happened.
+
+**`src/doom/d_main.c`, `G_BeginRecording` given a call site, and not upstream's.** The function existed with no caller at all. Upstream begins recording in `D_DoomLoop` immediately before the loop starts, but that site does not work here: this fork registers its emscripten main loop at the top of `D_DoomMain`, so tics can run before `D_DoomLoop` is reached. With `demo_p` still null at that point, `G_WriteDemoTiccmd`'s re-read walks uninitialised memory, finds a stray `0x80` DEMOMARKER and calls `G_CheckDemoStatus`, which clears `demorecording` again with no diagnostic. Recording therefore begins immediately after the buffer is allocated, which is also after `D_CheckNetGame` has settled skill, episode, map and deathmatch, so the header is identical to upstream's.
+
+**`src/m_controls.c`, `key_demo_quit` moved off `q`.** `'q'` is the inherited upstream default in both lineages, but this fork rebound `key_fire` from right-control to `'q'` for browser friendliness, and `G_WriteDemoTiccmd` polls the quit key on every recorded tic. Together they ended a recording on the player's first shot. It is `KEY_F10` here, Doom's other traditional demo key, bound to nothing else in this build.
+
+**`src/d_democanary.c`, `src/d_democanary.h`.** The desync canary. SHA-256 over the 13-byte header with the `consoleplayer` byte zeroed, plus the ticcmd stream bounded at the exit anchor. Every peer records every in-game player's ticcmd in player order from the same fanned-out `netcmds`, so equal digests mean the peers saw the same inputs. Two differences are legitimate and must not trip it: byte 8 is each peer's own player index, and the recording keeps growing after the level ends while the two humans quit at different moments.
+
+It proves input history, not simulation state. This fork writes no consistancy bytes, so a simulation bug fed identical inputs passes this check. SHA-256 is implemented in that file rather than reusing `sha1.c`, which is both a stronger digest for something whose job is to be believed and free of the SDL headers `sha1.c` pulls in.
+
 **`src/net_transport.h`.** Selects the `net_module_t` that carries packets off the machine: WebSockets under `__EMSCRIPTEN__`, SDL_net UDP otherwise. Everything above it is transport-agnostic, so this is the only place the choice is made.
 
 **`src/net_websockets.c`, `src/net_websockets.h`.** The browser transport, carrying the Chocolate protocol to a room router. Modelled on `net_sdl.c` and on cloudflare/doom-wasm's module at commit `65e0d3ae2ffa604155eebd96ed40da6567bd08f4`, whose wire format it preserves exactly. It is a reimplementation rather than a copy, because the reference carries defects that are not safe to inherit:
@@ -198,7 +210,7 @@ Three parts of that line are load-bearing:
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native build excludes `net_websockets.c` for the mirror-image reason.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
-- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1681456 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
+- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1685299 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
 `LC_ALL=C sort` is also load-bearing. Bare `find` emits readdir order, which varies by filesystem and by the order files were created, and emcc assigns wasm function indices and `EM_ASM` string addresses in command-line order. Without the sort the same source tree produces a different `doom.wasm` on every machine. With it, the build is bit-reproducible.
 
@@ -221,8 +233,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188756 | 67fde844b3f7460efec7826e0be8253c13b4c7fde26fc529906570fd8c1e9d6a |
-| doom.wasm | 1681456 | 8e2bdf71736f65f7abc4428eb1ee5348e916ecf965352de002fd9fff6a4f0886 |
+| doom.js | 188756 | 49e1b3d50baecdcf3417d7c898af7d237afb60dea00dd458bd92f2699059ad7a |
+| doom.wasm | 1685299 | 6351255490feb73978c5053c99b1c199517f0c8ae7a101f57ac25b2f59d4cf56 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
@@ -265,6 +277,7 @@ Builds and runs, with a plain host compiler and node, no emscripten and no WADs:
 - `test/test_net_ws_frame.c` over `src/net_ws_frame.c`: envelope round-trip and byte order, rejection of short frames (the underflow case), rejection of oversize frames, the bare-envelope case, and the receive ring's FIFO order, overflow refusal, drop counting and freeing.
 - `test/test_net_loop.c` over `src/net_loop.c`: the loopback ring's overflow path, against a counting allocator, so a packet the transport takes ownership of and refuses is proven freed rather than leaked.
 - `test/test_mod_order.mjs` over `mod_order.js`: the canonical effective order including the `file -> merge -> file` trap, argv construction, the DEHACKED lump probe against synthesized WAD directories, the duplicate and reserved-name rules, the IWAD pin, and that the fingerprint changes when order, load kind or effective DEHACKED behaviour changes.
+- `test/test_democanary.c` over `src/d_democanary.c`: two peers differing only in the consoleplayer byte and in how much they recorded after the anchor digest equal; every byte inside the anchor changes the digest; a short anchor, an empty demo and an undersized output buffer are refused; and the digest is pinned against an independent SHA-256 implementation.
 - An ownership check over the transport modules: `NET_RecvPacket` in `net_io.c` takes the single address reference that consumers release, so no transport module may reference in its own `RecvPacket`. Getting this wrong leaks one reference per received packet and the address table grows without bound, which nothing else would surface.
 
 Each guard was checked by removing it and confirming the suite fails, so the tests are known to be capable of failing rather than merely green.
