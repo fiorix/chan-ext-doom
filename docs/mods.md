@@ -45,7 +45,10 @@ within a load-kind group is significant.
 
 The source page's Public Domain label has no SPDX identifier. Preserve the
 source URL, archive README, and upstream credits in any download-on-demand
-provenance. Reassess redistribution separately from technical validation.
+provenance. The archive README contains no license text; the page-side
+declaration is captured in
+[`provenance/moddb-public-domain-2026-07-27.md`](provenance/moddb-public-domain-2026-07-27.md).
+Reassess redistribution separately from technical validation.
 
 ### Doom But Slightly More Spooky v1.5
 
@@ -83,7 +86,10 @@ preserve the README, and do not invent a CC identifier.
 - Classification: cosmetic.
 
 The Public Domain declaration is source metadata rather than an SPDX license
-identifier. Preserve the source URL and author declaration in provenance.
+identifier, and the zip contains only the WAD with no license text. Preserve
+the source URL and author declaration in provenance; the dated offline record
+is
+[`provenance/moddb-public-domain-2026-07-27.md`](provenance/moddb-public-domain-2026-07-27.md).
 
 ## Compatibility audit
 
