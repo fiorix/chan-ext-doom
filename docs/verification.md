@@ -124,9 +124,11 @@ Notes:
 
 ### 3.5 Run the captures
 
-The rig binds UDP 127.0.0.1:2342 (chocolate's client-side port, not
-configurable) and forwards to `chocolate-server -port 2343
--privateserver`; run scenarios sequentially. Raw output lands in
+The rig binds UDP 127.0.0.1:2342 and forwards to `chocolate-server
+-port 2343 -privateserver`; run scenarios sequentially. 2342 is
+chocolate's `DEFAULT_PORT` — a rig choice, not a client limitation
+(clients can override with `-port` or a `host:port` connect address;
+the rig does not need either). Raw output lands in
 `/tmp/doom-capture/captures/<name>/` (`packets.jsonl`, `session.json`,
 per-client logs and chocolate's own `-netlog` dumps for cross-checking).
 
@@ -170,6 +172,27 @@ console-message ≈ 315, query = 2.
 
 ### 3.6 Curate fixtures and regenerate the manifest
 
+The `--range` indices below select windows from **the committed
+capture**; packet indices drift between runs (packet counts are
+timing-dependent, §3.5). After a fresh capture, inspect its
+`packets.jsonl` and adjust the late-session windows before exporting:
+
+```sh
+# one line per datagram: index, time, direction, peer, type
+python3 - <<'EOF'
+import json
+T={0:"SYN",3:"KEEPALIVE",4:"WAITING_DATA",5:"GAMESTART",6:"GAMEDATA",
+   7:"GAMEDATA_ACK",8:"DISCONNECT",9:"DISCONNECT_ACK",10:"RELIABLE_ACK",
+   11:"GAMEDATA_RESEND",12:"CONSOLE_MESSAGE",13:"QUERY",
+   14:"QUERY_RESPONSE",15:"LAUNCH"}
+for line in open("/tmp/doom-capture/captures/drone-disconnect/packets.jsonl"):
+    p = json.loads(line)
+    b = bytes.fromhex(p["hex"])
+    t = ((b[0] << 8) | b[1]) & 0x7FFF
+    print(p["i"], p["t_ms"], p["dir"], p["peer"], T.get(t, t))
+EOF
+```
+
 ```sh
 python3 fixtures/rig/capture.py export --session $O/handshake-keepalive --fixtures-dir fixtures
 python3 fixtures/rig/capture.py export --session $O/gamestart-gamedata --fixtures-dir fixtures --range 0:45
@@ -177,6 +200,11 @@ python3 fixtures/rig/capture.py export --session $O/drone-disconnect  --fixtures
 python3 fixtures/rig/capture.py export --session $O/console-message   --fixtures-dir fixtures --range 269:281
 python3 fixtures/rig/capture.py export --session $O/query             --fixtures-dir fixtures
 ```
+
+`--range` accepts comma-separated `START:END` windows. For
+`drone-disconnect`, pick the two handshakes plus the last keepalives
+through the DISCONNECT_ACK; for `console-message`, the window around
+the CONSOLE_MESSAGE broadcast.
 
 Then re-run the checks from section 2.
 

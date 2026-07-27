@@ -18,8 +18,10 @@ against chocolate-server 3.1.1, shareware doom1.wad
 ## 1. Transport and framing
 
 - UDP datagrams, one packet per datagram. The server listens on port
-  **2342** by default; the client always connects to port 2342 (it is not
-  configurable client-side). `[observed, reference]`
+  **2342** by default (`DEFAULT_PORT`). 2342 is also the client's default
+  destination, but it **is** configurable client-side: `-port <n>`
+  changes the default and `-connect host:port` targets an explicit port
+  (`net_sdl.c`). The captures use the default. `[observed, reference]`
 - There is **no per-packet length, magic, or checksum** in the connected
   phase; the datagram boundaries are the framing. `[observed]`
 - Every packet starts with a **u16 big-endian type**. Bit 15 (`0x8000`)
@@ -82,26 +84,29 @@ headless captures observe the server-initiated path instead.
 ## 3. Packet inventory
 
 Type is the low 15 bits of the header word. `[observed]` marks sessions
-where the type appears in committed fixtures.
+where the type appears in committed fixtures. "Protocol dir" is the
+direction the packet is defined for (from the pinned source); where the
+captures cover only one direction, the observed direction is noted in
+the status column.
 
-| type | name | dir | reliable | status |
+| type | name | protocol dir | reliable | status |
 |---:|---|---|---|---|
-| 0 | SYN | c2s / s2c | s2c only | [observed] handshake-keepalive, gamestart-gamedata, drone-disconnect |
+| 0 | SYN | c2s request, s2c accept | s2c only | [observed] handshake-keepalive, gamestart-gamedata, drone-disconnect |
 | 1 | ACK | — | — | deprecated, unused in 3.x `[reference]` |
 | 2 | REJECTED | s2c | no | `[unknown]` (needs a mismatch scenario; layout in §4) |
-| 3 | KEEPALIVE | both | no | [observed] all sessions |
+| 3 | KEEPALIVE | both | no | [observed] all sessions, both directions |
 | 4 | WAITING_DATA | s2c | no | [observed] all lobby sessions |
-| 5 | GAMESTART | both | yes | [observed] gamestart-gamedata |
-| 6 | GAMEDATA | both | no | [observed] gamestart-gamedata |
+| 5 | GAMESTART | both | yes | [observed] gamestart-gamedata, both directions |
+| 6 | GAMEDATA | both | no | [observed] gamestart-gamedata, both directions |
 | 7 | GAMEDATA_ACK | c2s | no | [observed] gamestart-gamedata |
-| 8 | DISCONNECT | s2c (any) | no | [observed] drone-disconnect (s2c) |
-| 9 | DISCONNECT_ACK | c2s (any) | no | [observed] drone-disconnect (c2s) |
-| 10 | RELIABLE_ACK | both | no | [observed] all sessions |
-| 11 | GAMEDATA_RESEND | both | no | [observed] gamestart-gamedata (both directions, organic) |
+| 8 | DISCONNECT | both (either end) | no | [observed] drone-disconnect, s2c only |
+| 9 | DISCONNECT_ACK | both (reply) | no | [observed] drone-disconnect, c2s only |
+| 10 | RELIABLE_ACK | both | no | [observed] all sessions, both directions |
+| 11 | GAMEDATA_RESEND | both | no | [observed] gamestart-gamedata, both directions (organic) |
 | 12 | CONSOLE_MESSAGE | s2c | yes | [observed] console-message |
-| 13 | QUERY | c2s (any) | no | [observed] query |
+| 13 | QUERY | c2s (any sender) | no | [observed] query |
 | 14 | QUERY_RESPONSE | s2c | no | [observed] query |
-| 15 | LAUNCH | both | yes | [observed] gamestart-gamedata |
+| 15 | LAUNCH | both | yes | [observed] gamestart-gamedata, both directions |
 | 16 | NAT_HOLE_PUNCH | both | no | `[unknown]` (NAT traversal; out of loopback scope) |
 
 The pre-3.0 protocol (magic `3436803284`, per-packet magic+seq header)
@@ -204,7 +209,8 @@ and `player_classes` filled in. `[reference]`
 
 ### GAMEDATA (6) c2s — client ticcmds
 
-Observed `gamestart-gamedata/029-c2s-client1-gamedata.bin` (9 B):
+Observed `gamestart-gamedata/029-c2s-client1-gamedata.bin` (8 B:
+`00 06 0b 00 01 00 00 00` — one tic, zero diff):
 
 ```
  0  u16  type = 6
