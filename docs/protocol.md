@@ -307,21 +307,48 @@ The fixture tests therefore assert structure (header, length, hash of
 the committed bytes), never re-generated equality: re-running the rig
 produces equivalent sessions with different volatile bytes.
 
-## 6. WebSocket transport envelope (browser path) — `[reference]` only
+## 6. WebSocket transport envelope (browser path)
 
-Not observable in these native UDP captures; documented from
-cloudflare/doom-wasm `src/net_websockets.c` (the module the merged
-engine will carry, per the design doc):
+This envelope is **not** part of the Chocolate packet format — it is a
+transport wrapper added and removed around the packets of §4; the
+wrapped bytes are unchanged. It is not observable in these native UDP
+captures. What follows was verified against both pinned upstream
+sources (engine module and router), so it is `[reference]` at source
+level; on-the-wire verification against a live router is
+`[unknown]` and belongs to the engine/browser milestone.
 
-- Each outbound binary WebSocket frame = `u32 to` + `u32 from`
-  (the instanceUID) + the raw chocolate packet from §4. The u32s are
-  host-order memcpy on wasm32, i.e. **little-endian** — unlike the
-  big-endian packet payload they wrap.
-- The inbound handler strips only one u32 (`from`) — the Durable Object
-  rewrites frames server-side, so the envelope is **asymmetric**:
-  8 bytes c2s, 4 bytes s2c as seen by the client.
-- `[unknown]`: exact on-wire shape on the server side of the DO; to be
-  verified with the engine/browser milestone.
+Pins for this evidence:
+
+- `cloudflare/doom-wasm` `main` @ `65e0d3ae2ffa604155eebd96ed40da6567bd08f4`,
+  `src/net_websockets.c`
+- `cloudflare/doom-workers` `main` @ `22d8665f75017c4e1971d7e93567237645916ba1`,
+  `router/index.mjs`
+
+Frame shapes (each binary WebSocket message):
+
+- **Engine → router**: `[to: u32 LE][from: u32 LE][Chocolate packet…]`,
+  minimum 8 bytes. The router reads `to = u32(data[0..4])`,
+  `from = u32(data[4..8])` and routes by the `to` id.
+- **Router → engine**: `[from: u32 LE][Chocolate packet…]`, minimum
+  4 bytes — the router forwards `data.slice(4)`, i.e. it strips only
+  the `to` field. The engine's receive callback strips that `from`
+  prefix (`numBytes - 4`, payload at offset 4) before handing the
+  Chocolate packet to the net layer. Hence the asymmetry: 8-byte
+  header c2s, 4-byte header s2c.
+- The u32 ids are host-order values on little-endian infrastructure
+  (engine: `memcpy` on wasm32; router: `Uint32Array` over the frame) —
+  **little-endian**, unlike the big-endian packet payload they wrap.
+  Ids are per-instance (`instanceUID`), assigned by the hosting side.
+- **Registration/reset**: an in-WASM server role announces itself with
+  an 8-byte frame `to = 0`, `from = instanceUID` and an empty payload
+  (sent by the engine's server-init). The pinned router special-cases
+  `from == 1 && to == 0` as a server restart: it closes every session
+  and clears its client table. So instance id 1 is the server role by
+  router convention.
+
+Open for the engine milestone: how ids are allocated to joining
+clients, and whether the reference router's reset semantics need a
+doomit-owned equivalent in doom-server.
 
 ## 7. Timing and reliability parameters
 
