@@ -1,0 +1,89 @@
+{
+  "name": "drone-disconnect",
+  "description": "player client SIGKILLed mid-lobby at 5s; after 30s timeout the server broadcasts CONSOLE_MESSAGE to the drone, then DISCONNECT, and the drone replies DISCONNECT_ACK",
+  "captured_at": "2026-07-27T21:24:21.154384+00:00",
+  "source": {
+    "project": "chocolate-doom",
+    "url": "https://github.com/chocolate-doom/chocolate-doom.git",
+    "tag": "chocolate-doom-3.1.1",
+    "commit": "410d96855b5df5410ff591a90efeafa889119224"
+  },
+  "toolchain": {
+    "platform": "linux x86_64 (Ubuntu 26.04)",
+    "sdl2": "2.32.10 (built from source, scratch prefix)",
+    "sdl2_net": "2.2.0 (built from source, scratch prefix)",
+    "configure_flags": "--disable-sdl2mixer --without-libsamplerate --disable-doc"
+  },
+  "iwad": {
+    "file": "doom1.wad",
+    "sha1": "5b2e249b9c5133ec987b3ea77596381dc0d6bc1d",
+    "note": "shareware doom1.wad; used at capture time, never committed"
+  },
+  "server_argv": [
+    "/tmp/doom-capture/build/choc/src/chocolate-server",
+    "-port",
+    "2343",
+    "-privateserver",
+    "-netlog",
+    "/tmp/doom-capture/captures/drone-disconnect/server.netlog"
+  ],
+  "clients": [
+    {
+      "name": "client1",
+      "argv": [
+        "/tmp/doom-capture/build/choc/src/chocolate-doom",
+        "-iwad",
+        "/tmp/doom-capture/doom1.wad",
+        "-connect",
+        "127.0.0.1",
+        "-config",
+        "/tmp/doom-rig-client1-ysz1mhrm/default.cfg",
+        "-extraconfig",
+        "/tmp/doom-rig-client1-ysz1mhrm/chocolate-doom.cfg",
+        "-savedir",
+        "/tmp/doom-rig-client1-ysz1mhrm",
+        "-netlog",
+        "/tmp/doom-capture/captures/drone-disconnect/client1.netlog"
+      ],
+      "env": {
+        "SDL_VIDEODRIVER": "dummy",
+        "SDL_AUDIODRIVER": "dummy"
+      },
+      "start_delay_s": 0.0,
+      "signal": "kill",
+      "signal_at_s": 5.0,
+      "exit_code": -9
+    },
+    {
+      "name": "client2",
+      "argv": [
+        "/tmp/doom-capture/build/choc/src/chocolate-doom",
+        "-iwad",
+        "/tmp/doom-capture/doom1.wad",
+        "-connect",
+        "127.0.0.1",
+        "-config",
+        "/tmp/doom-rig-client2-z09_7rc_/default.cfg",
+        "-extraconfig",
+        "/tmp/doom-rig-client2-z09_7rc_/chocolate-doom.cfg",
+        "-savedir",
+        "/tmp/doom-rig-client2-z09_7rc_",
+        "-netlog",
+        "/tmp/doom-capture/captures/drone-disconnect/client2.netlog",
+        "-drone"
+      ],
+      "env": {
+        "SDL_VIDEODRIVER": "dummy",
+        "SDL_AUDIODRIVER": "dummy"
+      },
+      "start_delay_s": 1.5,
+      "signal": "none",
+      "signal_at_s": 1000000000.0,
+      "exit_code": 255
+    }
+  ],
+  "duration_s": 44.0,
+  "packet_count": 180,
+  "server_exit_code": -15,
+  "exported_range": "0:12,174:180"
+}
