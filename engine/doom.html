@@ -1,0 +1,262 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:site" content="@azazeln28">
+    <meta name="twitter:creator" content="@azazeln28">
+    <!-- Facebook Open Graph -->
+    <meta property="og:url" content="https://azazeln28.neocities.org/games/doom" />
+    <meta property="og:title" content="DOOM" />
+    <meta property="og:description" content="DOOM® is a registered trademark of ZeniMax Media Inc. in the US and/or other countries. Id Software® is a registered trademark of ZeniMax Media Inc. in the US and/or other countries. WebDOOM is in no way affiliated with ZeniMax Media Inc. or id Software LLC and is not approved by ZeniMax Media Inc. or id Software." />
+    <meta property="og:image" content="https://azazeln28.neocities.org/games/doom/cover.png" />
+    <link href="https://fonts.googleapis.com/css?family=Teko&display=swap" rel="stylesheet">
+    <title>DOOM</title>
+    <style>
+      html, body {
+        font-family: 'Teko', sans-serif;
+        font-size: 200%;
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        background: black;
+        color: white;
+      }
+
+      /* the canvas *must not* have any border or padding, or mouse coords will be wrong */
+      canvas { 
+        border: 0px none;
+        image-rendering: pixelated;
+        width: 160vh;
+        height: 100vh;
+      }
+
+      #container {
+        position: fixed;
+        display: flex;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        height: 100%;
+        justify-content: center;
+        align-items: center;
+      }
+
+      #spinner-container {
+        display: flex;
+        justify-content: center;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      #spinner {
+        height: 30px;
+        width: 30px;
+        margin: 0;
+        display: inline-block;
+
+        -webkit-animation: rotation .8s linear infinite;
+        -moz-animation: rotation .8s linear infinite;
+        -o-animation: rotation .8s linear infinite;
+        animation: rotation 0.8s linear infinite;
+
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+        border-top: 5px solid hsl(0,50%,50%);
+        
+        border-radius: 100%;
+        background-color:transparent; 
+      }
+
+      #status {
+        display: inline-block;
+        vertical-align: top;
+        margin-top: 30px;
+        margin-left: 20px;
+        font-weight: bold;
+        color: hsl(0,50%,50%);
+      }
+
+      #progress {
+        height: 20px;
+        width: 300px;
+      }
+
+      progress::-moz-progress-bar,
+      progress::-webkit-progress-value { 
+        background: hsl(0, 50%, 50%);
+      }
+
+      progress {
+        color: hsl(0, 50%, 50%);
+      }
+
+      @-webkit-keyframes rotation {
+        from {-webkit-transform: rotate(0deg);}
+        to {-webkit-transform: rotate(360deg);}
+      }
+      @-moz-keyframes rotation {
+        from {-moz-transform: rotate(0deg);}
+        to {-moz-transform: rotate(360deg);}
+      }
+      @-o-keyframes rotation {
+        from {-o-transform: rotate(0deg);}
+        to {-o-transform: rotate(360deg);}
+      }
+      @keyframes rotation {
+        from {transform: rotate(0deg);}
+        to {transform: rotate(360deg);}
+      }
+
+    </style>
+  </head>
+  <body>
+    <!-- Aquí antes estaba el logo de Emscripten -->
+    <div id="container">
+      <div id="spinner-container">
+        <div id="spinner"></div>
+        <div id="status">Downloading...</div>
+        <progress value="0" max="100" id="progress" hidden="1"></progress>
+      </div>
+    </div>
+
+    <!-- 
+    <span id="controls">
+      <span>
+        <input type="checkbox" id="resize">
+        Resize canvas
+      </span>
+      <span>
+        <input type="checkbox" id="pointerLock" checked>
+        Lock/hide mouse pointer &nbsp;&nbsp;&nbsp;
+      </span>
+      <span>
+        <input type="button" value="Fullscreen" onclick="Module.requestFullscreen(document.getElementById('pointerLock').checked, document.getElementById('resize').checked)">
+      </span>
+    </span>
+    -->
+    
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex=-1></canvas>
+    
+    <script type="text/javascript">
+      const statusElement = document.getElementById('status');
+      const progressElement = document.getElementById('progress');
+      const spinnerElement = document.getElementById('spinner');
+
+      document.addEventListener('G_LoadGame', (e) => {
+        console.log(e.detail)
+      })
+      document.addEventListener('G_SaveGame', (e) => {
+        console.log(e.detail)
+      })
+
+      var Module = {
+        preRun: [],
+        postRun: [],
+        onRuntimeInitialized: function() {
+          console.log('hola')
+        },
+        print: (function() {
+          const element = document.getElementById('output');
+          if (element) element.value = ''; // clear browser cache
+          return function(text) {
+            if (arguments.length > 1) {
+              text = Array.prototype.slice.call(arguments).join(' ');
+            }
+            // These replacements are necessary if you render to raw HTML
+            //text = text.replace(/&/g, "&amp;");
+            //text = text.replace(/</g, "&lt;");
+            //text = text.replace(/>/g, "&gt;");
+            //text = text.replace('\n', '<br>', 'g');
+            console.log(text);
+            if (element) {
+              element.value += text + "\n";
+              element.scrollTop = element.scrollHeight; // focus on bottom
+            }
+          };
+        })(),
+        printErr: function(text) {
+          if (arguments.length > 1) {
+            text = Array.prototype.slice.call(arguments).join(' ');
+          }
+          console.error(text);
+        },
+        canvas: (function() {
+          const canvas = document.getElementById('canvas');
+          // As a default initial behavior, pop up an alert when webgl context is lost. To make your
+          // application robust, you may want to override this behavior before shipping!
+          // See http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15.2
+          canvas.addEventListener("webglcontextlost", function(e) { 
+            alert('WebGL context lost. You will need to reload the page.'); 
+            e.preventDefault(); 
+          }, false);
+          return canvas;
+        })(),
+        setStatus: function(text) {
+          if (!Module.setStatus.last) {
+            Module.setStatus.last = { time: Date.now(), text: '' };
+          }
+
+          if (text === Module.setStatus.last.text) {
+            return;
+          }
+
+          var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
+          var now = Date.now();
+          if (m && now - Module.setStatus.last.time < 30) {
+            return; // if this is a progress update, skip it if too soon
+          }
+
+          Module.setStatus.last.time = now;
+          Module.setStatus.last.text = text;
+          
+          if (m) {
+            text = m[1];
+            progressElement.value = parseInt(m[2])*100;
+            progressElement.max = parseInt(m[4])*100;
+            progressElement.hidden = false;
+            spinnerElement.hidden = false;
+          } else {
+            progressElement.value = null;
+            progressElement.max = null;
+            progressElement.hidden = true;
+            if (!text) {
+              spinnerElement.style.display = 'none';
+            }
+          }
+          statusElement.innerHTML = text;
+        },
+        totalDependencies: 0,
+        monitorRunDependencies: function(left) {
+          this.totalDependencies = Math.max(this.totalDependencies, left);
+          Module.setStatus(left ? 'Preparing... (' + (this.totalDependencies-left) + '/' + this.totalDependencies + ')' : 'All downloads complete.');
+        }
+      };
+
+      Module.setStatus('Downloading...');
+
+      window.onerror = function(event) {
+        // TODO: do not warn on ok events like simulating an infinite loop or exitStatus
+        Module.setStatus('Exception thrown, see JavaScript console');
+        spinnerElement.style.display = 'none';
+        Module.setStatus = function(text) {
+          if (text) {
+            Module.printErr('[post-exception status] ' + text);
+          }
+        };
+      };
+    </script>
+    <script async type="text/javascript" src="index.js"></script>
+  </body>
+</html>
+
+
