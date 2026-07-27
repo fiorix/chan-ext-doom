@@ -71,6 +71,10 @@
 #include "statdump.h"
 
 
+#include "net_client.h"
+#include "net_io.h"
+#include "net_query.h"
+
 #include "d_main.h"
 #include "i_gif.h"
 
@@ -117,19 +121,6 @@ boolean		autostart;
 int             startloadgame;
 
 boolean		advancedemo;
-ticcmd_t *netcmds;
-static void RunTic(ticcmd_t *cmds, boolean *ingame)
-{
-    netcmds = cmds;
-
-    // check that there are players in the game.  if not, we cannot
-    // run a tic.
-
-    if (advancedemo)
-        D_DoAdvanceDemo ();
-
-    G_Ticker ();
-}
 
 // Store demo, do not accept any inputs
 boolean         storedemo;
@@ -154,69 +145,6 @@ void D_ProcessEvents (void)
     }
 }
 
-// Doom loop interface
-static loop_interface_t doom_loop_interface = {
-    D_ProcessEvents,
-    G_BuildTiccmd,
-    RunTic,
-    M_Ticker
-};
-
-// Load game settings from the specified structure and
-// set global variables.
-
-static void LoadGameSettings(net_gamesettings_t *settings)
-{
-    unsigned int i;
-
-    deathmatch = settings->deathmatch;
-    startepisode = settings->episode;
-    startmap = settings->map;
-    startskill = settings->skill;
-    startloadgame = settings->loadgame;
-    lowres_turn = settings->lowres_turn;
-    nomonsters = settings->nomonsters;
-    fastparm = settings->fast_monsters;
-    respawnparm = settings->respawn_monsters;
-    timelimit = settings->timelimit;
-    consoleplayer = settings->consoleplayer;
-
-    if (lowres_turn)
-    {
-        printf("NOTE: Turning resolution is reduced; this is probably "
-               "because there is a client recording a Vanilla demo.\n");
-    }
-
-    for (i = 0; i < MAXPLAYERS; ++i)
-    {
-        playeringame[i] = i < settings->num_players;
-    }
-}
-
-// Save the game settings from global variables to the specified
-// game settings structure.
-
-static void SaveGameSettings(net_gamesettings_t *settings)
-{
-    // Fill in game settings structure with appropriate parameters
-    // for the new game
-
-    settings->deathmatch = deathmatch;
-    settings->episode = startepisode;
-    settings->map = startmap;
-    settings->skill = startskill;
-    settings->loadgame = startloadgame;
-    settings->gameversion = gameversion;
-    settings->nomonsters = nomonsters;
-    settings->fast_monsters = fastparm;
-    settings->respawn_monsters = respawnparm;
-    settings->timelimit = timelimit;
-
-    settings->lowres_turn = (M_ParmExists("-record")
-                         && !M_ParmExists("-longtics"))
-                          || M_ParmExists("-shorttics");
-}
-
 // If true, the main game loop has started.
 boolean         main_loop_started = false;
 
@@ -227,6 +155,9 @@ int             show_endoom = 1;
 int             show_diskicon = 1;
 
 char            *nervewadfile = NULL;
+
+void D_ConnectNetGame(void);
+void D_CheckNetGame(void);
 
 //
 // D_Display
@@ -1772,10 +1703,12 @@ void D_DoomMain (void)
 	    "dphoof","bfgga0","heada1","cybra1","spida1d1"
 	};
 	int i;
-	
-	if ( gamemode == shareware)
-	    I_Error(DEH_String("\nYou cannot -file with the shareware "
-			       "version. Register!"));
+
+	// id's shareware build refused -file outright. This fork allows PWADs
+	// on the shareware IWAD instead: mods are first-class runtime data
+	// here, and the ordered PWAD set is what peers agree on before a net
+	// game starts. gamemode stays shareware, so nothing pretends to own
+	// the registered episodes.
 
 	// Check for fake IWAD with right name,
 	// but w/o all the lumps of the registered version. 
@@ -1833,6 +1766,10 @@ void D_DoomMain (void)
     }
 
     printf ("NET_Init: Init network subsystem.\n");
+    NET_Init ();
+
+    // Initial netgame startup. Connect to server etc.
+    D_ConnectNetGame();
 
     // get skill / episode / map from parms
     startskill = sk_medium;
@@ -1987,14 +1924,7 @@ void D_DoomMain (void)
     S_Init (sfxVolume * 8, musicVolume * 8);
 
     DEH_printf("D_CheckNetGame: Checking network game status.\n");
-
-    // D_StartNetGame
-    D_RegisterLoopCallbacks(&doom_loop_interface);
-
-    net_gamesettings_t settings;
-    SaveGameSettings(&settings);
-    D_StartNetGame(&settings, NULL);
-    LoadGameSettings(&settings);
+    D_CheckNetGame ();
 
     PrintGameVersion();
 

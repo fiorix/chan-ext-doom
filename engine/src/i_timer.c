@@ -18,6 +18,10 @@
 
 #include "SDL.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include "i_timer.h"
 #include "doomtype.h"
 
@@ -62,7 +66,17 @@ int I_GetTimeMS(void)
 
 void I_Sleep(int ms)
 {
+#ifdef __EMSCRIPTEN__
+    // SDL_Delay busy-waits in a wasm build, which starves the browser event
+    // loop. That matters because the network code sleeps precisely when it
+    // is waiting for the network to progress: the connect loop, the wait for
+    // the host to launch the game, and the tic stall all call this. Without a
+    // yield the WebSocket callbacks cannot run, so those waits could only
+    // ever time out. Yielding here needs ASYNCIFY, which the build enables.
+    emscripten_sleep(ms);
+#else
     SDL_Delay(ms);
+#endif
 }
 
 void I_WaitVBL(int count)
