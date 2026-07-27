@@ -1,11 +1,25 @@
 cmake_minimum_required(VERSION 3.13)
 project(doomit-engine C)
 
-# This mirrors the single-emcc recipe in docs/provenance.md. That recipe is the
-# reference: it is what the pinned artifact hashes are reproduced from, and
-# anything that makes the two disagree is a bug in this file.
+# This mirrors the single-emcc recipe in docs/provenance.md, which is the
+# reference: the pinned artifact hashes come from that recipe.
+#
+# It does not promise byte-identical output. CMake compiles to separate
+# objects and links them, while the recipe hands every source to one emcc
+# invocation, and the two order internal wasm functions differently. The
+# flags and the source set match; the wasm bytes do not have to.
 
 set(ENGINE_ROOT ${CMAKE_CURRENT_LIST_DIR})
+
+# CMake's own Release defaults would add -O3 -DNDEBUG on top of the -Oz the
+# reference recipe uses, and NDEBUG would additionally strip assertions the
+# reference keeps. Cleared so the compilation semantics match.
+
+set(CMAKE_C_FLAGS_RELEASE "" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_MINSIZEREL "" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_DEBUG "" CACHE STRING "" FORCE)
+
 
 include_directories(
     ${ENGINE_ROOT}/gifenc
@@ -44,11 +58,19 @@ endif()
 
 add_executable(doom ${ENGINE_SOURCES})
 
+# -Wno-#warnings must be quoted: CMake would otherwise treat the # as the
+# start of a comment and pass the invalid flag -Wno- to the compiler.
+#
+# -ffile-prefix-map keeps absolute build paths out of the artifact. CMake
+# compiles with absolute source paths and this tree uses __FILE__, so without
+# it the wasm embeds wherever the build happened to run.
+
 target_compile_options(doom PRIVATE
     -Oz
-    -Wno-#warnings
+    "-Wno-#warnings"
     -Wno-macro-redefined
     -Wno-switch
+    -ffile-prefix-map=${ENGINE_ROOT}/=
     )
 
 if(EMSCRIPTEN)
