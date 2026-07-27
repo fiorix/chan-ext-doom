@@ -9,6 +9,11 @@ Status: M1 evidence slice. Every statement below is labeled:
   tag `chocolate-doom-3.1.1`). Used for interoperability only; no C code
   is ported into `crates/`.
 - **[unknown]** — not yet observed or not yet verified.
+- **capture-time note** — seen in the raw capture logs (scratch
+  `packets.jsonl` with `t_ms`), not in the committed curated evidence:
+  the committed fixtures retain packet order, direction, and bytes, but
+  no timestamps. Rates and intervals quoted this way are not
+  independently reproducible from the committed evidence alone.
 
 Capture source of truth: `fixtures/` + `fixtures/rig/capture.py`.
 All captures are native UDP loopback, chocolate-doom 3.1.1 client
@@ -38,21 +43,28 @@ against chocolate-server 3.1.1, shareware doom1.wad
   set, **not** the plain sha1 of the IWAD file. `[reference]`
 - **Reliable packets** carry a **u8 sequence number** immediately after
   the type word. The sequence is per-connection, per-direction, starts
-  at 0, and increments mod 256 for each reliable packet sent.
-  `[observed]` (e.g. c2s `LAUNCH` seq `00`, c2s `GAMESTART` seq `01`,
-  s2c SYN accept seq `00`, s2c `LAUNCH` seq `01`.)
+  at 0, and increments for each reliable packet sent. `[observed]` —
+  committed fixtures cover seqs 0–2 (e.g. c2s `LAUNCH` seq `00`, c2s
+  `GAMESTART` seq `01`, s2c SYN accept seq `00`, s2c `LAUNCH` seq `01`).
+  The mod-256 wrap itself is `[reference]` (`& 0xff` in the pinned
+  source); it is not covered by committed evidence.
 - The receiver answers every reliable packet with `RELIABLE_ACK` whose
-  u8 payload is the **next expected** sequence (`received + 1 mod 256`).
-  `[observed, reference]`
+  u8 payload is the **next expected** sequence (`received + 1`).
+  `[observed]` for the seqs above; the mod-256 arithmetic is
+  `[reference]`.
 - An unacknowledged reliable packet is resent after 1 s. `[reference]`
   (No resend of reliable packets was needed on lossless loopback;
   `[unknown]` on the wire.)
-- **Keepalive**: when a side has sent nothing for 1 s it emits a bare
-  `KEEPALIVE`. `[observed]` both directions at ~1 Hz in the lobby.
-- **Timeout**: 30 s of receive-silence marks the connection disconnected
-  with reason "timeout" — silently, with **no** `DISCONNECT` packet to
-  the dead peer. `[observed]` (client killed at 5 s; server traffic to
-  it stops at ~34 s), `[reference]` (`CONNECTION_TIMEOUT_LEN 30`).
+- **Keepalive**: a side that has sent nothing for 1 s emits a bare
+  `KEEPALIVE`. Interval is `[reference]` (`KEEPALIVE_PERIOD 1`); the
+  ~1 Hz rate in the lobby is a capture-time note. Bare keepalives in
+  both directions are in the committed fixtures. `[observed]`
+- **Timeout**: after 30 s of receive-silence (`[reference]`
+  `CONNECTION_TIMEOUT_LEN 30`) a connection is marked disconnected with
+  reason "timeout" — silently, with **no** `DISCONNECT` packet to the
+  dead peer. `[observed]` in the committed fixtures only as ordering
+  (traffic to the killed client stops before the drone's DISCONNECT);
+  the ~34 s interval is a capture-time note.
 
 ## 2. Connection lifecycle
 
@@ -60,7 +72,8 @@ Observed end-to-end in `gamestart-gamedata`:
 
 1. `SYN` (c2s) → `SYN` accept (s2c, reliable) → `WAITING_DATA` (s2c)
    → `RELIABLE_ACK` (c2s).
-2. Lobby: server re-sends `WAITING_DATA` every 1 s; both sides keepalive.
+2. Lobby: server re-sends `WAITING_DATA` on a 1 s cadence (§7); both
+   sides keepalive.
 3. Controller client sends `LAUNCH` (c2s, reliable) → server broadcasts
    `LAUNCH` (s2c, reliable, u8 player count).
 4. Controller sends `GAMESTART` (c2s, reliable, settings) → server marks
@@ -69,9 +82,10 @@ Observed end-to-end in `gamestart-gamedata`:
 5. In game: `GAMEDATA` both ways, `GAMEDATA_ACK` (c2s),
    `GAMEDATA_RESEND` both ways on gaps.
 6. Teardown paths `[observed]`:
-   - Client process killed: nothing on the wire; server drops it after
-     the 30 s timeout (and broadcasts a `CONSOLE_MESSAGE` to the
-     remaining clients).
+   - Client process killed: nothing on the wire; the server drops it
+     after the receive timeout (30 s `[reference]`; ~34 s in the raw
+     log is a capture-time note) and broadcasts a `CONSOLE_MESSAGE` to
+     the remaining clients.
    - Last player gone: server sends `DISCONNECT` to remaining clients
      (drones), which reply `DISCONNECT_ACK`.
 
@@ -251,8 +265,9 @@ input-driven captures.
 `u16 type`, `u32 start tic`, `u8 num tics`.
 `[observed]` s2c `gamestart-gamedata/024-…` (`00 0b 00000000 06` —
 requesting tics 0..5) and c2s `027-…`. Emitted by both sides when the
-peer's window stalls; seen organically because the headless client
-needed ~1.2 s to start sending tics.
+peer's window stalls; seen organically. Capture-time note: the headless
+client stalled ~1.2 s before its first GAMEDATA, which triggered the
+s2c resend.
 
 ### KEEPALIVE (3) / DISCONNECT (8) / DISCONNECT_ACK (9)
 
@@ -360,11 +375,11 @@ doomit-owned equivalent in doom-server.
 
 | parameter | value | status |
 |---|---|---|
-| keepalive period | 1 s of send-idle | [observed] ~1 Hz; [reference] `KEEPALIVE_PERIOD 1` |
-| connection timeout | 30 s of receive-silence | [observed] ~33→34 s drop after kill at ~3–5 s; [reference] |
-| lobby WAITING_DATA | every 1 s | [observed] |
+| keepalive period | 1 s of send-idle | value [reference] (`KEEPALIVE_PERIOD 1`); presence both directions [observed]; ~1 Hz rate is a capture-time note |
+| connection timeout | 30 s of receive-silence | value [reference] (`CONNECTION_TIMEOUT_LEN 30`); stop-then-drop ordering [observed]; ~33→34 s interval is a capture-time note |
+| lobby WAITING_DATA | every 1 s | value [reference] (server's 1000 ms resend); one-per-block ordering [observed]; ~1 Hz rate is a capture-time note |
 | reliable resend | after 1 s unacked | [reference] |
-| reliable seq | u8, per direction, mod 256 | [observed] |
+| reliable seq | u8, per direction | [observed] seqs 0–2 in committed fixtures; mod-256 wrap [reference] |
 | DISCONNECT retries | 1 s × 5 | [reference] |
 | receive window | BACKUPTICS = 128 tics | [reference] |
 | NET_MAXPLAYERS | 8 (net layer); doom engine caps at 4 on the wire (`max_players = 4` in SYN) | [observed, reference] |

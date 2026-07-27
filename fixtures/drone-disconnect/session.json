@@ -1,6 +1,6 @@
 {
   "name": "drone-disconnect",
-  "description": "player client SIGKILLed mid-lobby at 5s; after 30s timeout the server broadcasts CONSOLE_MESSAGE to the drone, then DISCONNECT, and the drone replies DISCONNECT_ACK",
+  "description": "player client SIGKILLed mid-lobby at 5s; after the 30s receive-timeout the server silently drops it and sends DISCONNECT to the remaining drone, which replies DISCONNECT_ACK; no CONSOLE_MESSAGE is observed in this session (the timeout broadcast never reaches the drone \u2014 disconnect pre-empts the reliable queue, see docs/protocol.md section 4)",
   "captured_at": "2026-07-27T21:24:21.154384+00:00",
   "source": {
     "project": "chocolate-doom",
