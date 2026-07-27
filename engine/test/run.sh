@@ -1,7 +1,8 @@
 #!/bin/sh
 #
-# Host tests for the parts of the WebSocket transport that must reject bad
-# input. Runs with a plain host compiler: no emscripten, no SDL, no WADs.
+# Host tests for the parts that must reject bad input or preserve an exact
+# order. Runs with a plain host compiler and node: no emscripten, no SDL,
+# no WADs.
 #
 # Usage: engine/test/run.sh
 
@@ -19,3 +20,6 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
     -o "$OUT/test_net_ws_frame"
 
 "$OUT/test_net_ws_frame"
+
+# Mod ordering is loader-side, so it is tested where it lives.
+node test/test_mod_order.mjs

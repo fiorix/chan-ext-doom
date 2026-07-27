@@ -1,0 +1,96 @@
+<!doctype html>
+<!--
+  Engine host frame. The loader page (doom.html) owns the lobby and creates
+  one of these per launch.
+
+  The frame exists so that a relaunch is a real teardown: removing the iframe
+  drops the WASM instance, its main loop, its audio graph and its Emscripten
+  FS with no cooperation from the running game. Doom has no supported way to
+  unload a PWAD from a live session, so changing the mod set restarts the
+  instance rather than pretending to hot-swap it.
+
+  Everything arrives in one postMessage: the argv to run and the WAD bytes to
+  place in the FS before D_DoomMain looks for them.
+-->
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>DOOM engine frame</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* No border or padding: SDL derives mouse coordinates from the element
+         box, and any inset shifts them. */
+      canvas {
+        border: 0;
+        padding: 0;
+        outline: none;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        image-rendering: pixelated;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas" tabindex="1" oncontextmenu="event.preventDefault()"></canvas>
+    <script src="doom.js"></script>
+    <script>
+      const canvas = document.getElementById("canvas");
+
+      // Arrows and space would scroll the frame out from under the player.
+      // Every other key passes through to SDL untouched.
+      window.addEventListener("keydown", (e) => {
+        if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+      });
+
+      function report(stream, text) {
+        parent.postMessage({ type: "doom-log", stream, text }, "*");
+      }
+
+      let started = false;
+
+      window.addEventListener("message", (e) => {
+        const msg = e.data;
+        if (!msg || msg.type !== "doom-launch" || started) return;
+        started = true;
+
+        Module({
+          canvas,
+          arguments: msg.argv,
+          print: (t) => report("out", t),
+          printErr: (t) => report("err", t),
+          preRun: [
+            (M) => {
+              // Module["FS"] is attached at factory-eval time and run()
+              // awaits run dependencies before callMain, so anything written
+              // here is on disk before the WAD scan.
+              for (const f of msg.files) {
+                M.FS.writeFile(f.path, new Uint8Array(f.bytes));
+              }
+            },
+          ],
+          onRuntimeInitialized: () => {
+            canvas.focus();
+            parent.postMessage({ type: "doom-started" }, "*");
+          },
+        }).catch((err) => {
+          report("err", "engine failed to start: " + err);
+        });
+      });
+
+      parent.postMessage({ type: "doom-frame-ready" }, "*");
+    </script>
+  </body>
+</html>
