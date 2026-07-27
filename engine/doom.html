@@ -222,6 +222,7 @@
         hasDehackedLump, effectiveDehacked, validatePwads, validateIwad,
         createSelectionGuard, iwadArgv, IWAD_PIN, IWAD_PATH,
       } from "./mod_order.js";
+      import { classifyMessage, GATE } from "./message_gate.js";
 
       const el = (id) => document.getElementById(id);
       const state = { iwad: null, pwads: [] };
@@ -502,28 +503,32 @@
       // first configuration, which the frame's started guard then locked in.
       let pending = null;
 
-      // Every message is pinned to the current iframe and the current run.
-      // Once a canary verdict is derived from this traffic, a stale frame or
-      // any other same-origin document could otherwise inject log lines and
-      // forge acceptance evidence, so the checks are not cosmetic.
-      function fromCurrentFrame(e) {
-        return frame !== null && e.source === frame.contentWindow;
-      }
-
+      // The decision lives in message_gate.js so it can be tested without a
+      // browser. Once a canary verdict is derived from this traffic, a stale
+      // frame or any other same-origin document could inject log lines and
+      // forge acceptance evidence, so these checks carry real weight.
       window.addEventListener("message", (e) => {
         const msg = e.data;
-        if (!msg || e.origin !== window.location.origin) return;
-        if (!fromCurrentFrame(e)) return;
+        const verdict = classifyMessage(msg, {
+          expectedOrigin: window.location.origin,
+          origin: e.origin,
+          source: e.source,
+          frameWindow: frame ? frame.contentWindow : null,
+          currentRun,
+          hasPending: pending !== null,
+        });
 
-        if (msg.type === "doom-frame-ready") {
-          if (!pending) return;
+        if (verdict === GATE.SEND_LAUNCH) {
           frame.contentWindow.postMessage(pending, window.location.origin);
           window.__doomSent = (window.__doomSent || []).concat([pending.argv.join(" ")]);
           pending = null;
-        } else if (msg.type === "doom-log") {
-          if (msg.run !== currentRun) return;
+        } else if (verdict === GATE.ACCEPT_LOG) {
           log(msg.text, msg.stream === "err" ? "warn" : null);
         }
+
+        // Everything else is ignored, and the reason is available for the
+        // browser assertions rather than being lost as silence.
+        window.__doomGate = (window.__doomGate || []).concat([verdict]);
       });
 
       function launch() {

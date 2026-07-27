@@ -63,6 +63,11 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
 # Mod ordering is loader-side, so it is tested where it lives.
 node test/test_mod_order.mjs
 
+# The loader's postMessage boundary. Extracted from the page so it is
+# testable off-browser: a verdict derived from this traffic means anything
+# able to inject a log line could forge acceptance evidence.
+node test/test_message_gate.mjs
+
 # Address ownership contract, guarded mechanically because getting it wrong
 # is silent: NET_RecvPacket in net_io.c takes the one reference consumers
 # release, so a transport module that also references leaks one refcount per
