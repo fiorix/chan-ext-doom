@@ -30,6 +30,16 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
 
 "$OUT/test_net_loop"
 
+# The desync canary must call two peers equal when only their consoleplayer
+# byte differs or they stopped recording at different moments, and unequal on
+# any difference inside the anchored span.
+$CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
+    -Isrc -Isrc/doom \
+    src/d_democanary.c test/test_democanary.c \
+    -o "$OUT/test_democanary"
+
+"$OUT/test_democanary"
+
 # Mod ordering is loader-side, so it is tested where it lives.
 node test/test_mod_order.mjs
 

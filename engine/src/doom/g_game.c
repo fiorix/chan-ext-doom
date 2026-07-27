@@ -73,6 +73,7 @@
 
 
 
+#include "d_democanary.h"
 #include "g_game.h"
 
 #include <emscripten.h>
@@ -1305,8 +1306,41 @@ static int npars[9] =
 boolean		secretexit; 
 extern char*	pagename; 
  
+// Reports a digest of the recording so far, so two clients can be compared
+// without extracting anything from WASM memory. Both record every player's
+// ticcmds in player order, so agreeing peers hold identical bytes once the
+// per-client consoleplayer header byte is normalized away.
+
+static void G_ReportDemoCanary (const char *at)
+{
+    char digest[DEMO_CANARY_DIGEST_LEN];
+    size_t len;
+
+    if (!demorecording || demobuffer == NULL || demo_p < demobuffer)
+    {
+        return;
+    }
+
+    // Bounded at the anchor, not at the current write position. The
+    // recording keeps growing after the level ends and the two players quit
+    // at different real moments, so hashing to demo_p would report a
+    // difference that is not a desync.
+
+    len = (size_t)(demo_p - demobuffer);
+
+    if (!D_DemoCanaryDigest(demobuffer, len, digest, sizeof(digest)))
+    {
+        printf("DEMO CANARY: %s: recording too short to compare\n", at);
+        return;
+    }
+
+    printf("DEMO CANARY: %s bytes=%u sha256=%s\n", at,
+           (unsigned int) len, digest);
+}
+
 void G_ExitLevel (void) 
 { 
+    G_ReportDemoCanary("exit");
     secretexit = false; 
     gameaction = ga_completed; 
 } 
@@ -1314,6 +1348,7 @@ void G_ExitLevel (void)
 // Here's for the german edition.
 void G_SecretExitLevel (void) 
 { 
+    G_ReportDemoCanary("secret exit");
     // IF NO WOLF3D LEVELS, NO SECRET EXIT!
     if ( (gamemode == commercial)
       && (W_CheckNumForName("map31")<0))
@@ -1323,6 +1358,7 @@ void G_SecretExitLevel (void)
     gameaction = ga_completed; 
 } 
  
+
 void G_DoCompleted (void) 
 { 
     int             i; 
@@ -2067,8 +2103,48 @@ void G_ReadDemoTiccmd (ticcmd_t* cmd)
 } 
 
 void G_WriteDemoTiccmd (ticcmd_t* cmd) 
-{ 
-} 
+{
+    byte *demo_start;
+
+    if (gamekeydown[key_demo_quit])           // press the demo quit key to end recording
+	G_CheckDemoStatus ();
+
+    demo_start = demo_p;
+
+    *demo_p++ = cmd->forwardmove;
+    *demo_p++ = cmd->sidemove;
+
+    // If this is a longtics demo, record in higher resolution
+
+    if (longtics)
+    {
+        *demo_p++ = (cmd->angleturn & 0xff);
+        *demo_p++ = (cmd->angleturn >> 8) & 0xff;
+    }
+    else
+    {
+        *demo_p++ = cmd->angleturn >> 8;
+    }
+
+    *demo_p++ = cmd->buttons;
+
+    // reset demo pointer back
+    demo_p = demo_start;
+
+    if (demo_p > demoend - 16)
+    {
+        // Out of room. Upstream's vanilla behaviour, kept deliberately: the
+        // buffer does not grow, so a verification run raises -maxdemo rather
+        // than relying on a reallocation this fork would otherwise carry
+        // alone. A truncated recording on one side only would read as a
+        // desync that never happened.
+
+        G_CheckDemoStatus ();
+        return;
+    }
+
+    G_ReadDemoTiccmd (cmd);         // make SURE it is exactly the same
+}
  
 //
 // G_RecordDemo
@@ -2160,6 +2236,13 @@ void G_BeginRecording (void)
 	 
     for (i=0 ; i<MAXPLAYERS ; i++) 
 	*demo_p++ = playeringame[i]; 		 
+
+    // Says plainly that the canary is armed. Without this the only evidence
+    // recording started is a digest that does not appear until the level
+    // ends, which is far too late to notice a mistyped -record.
+
+    printf("DEMO CANARY: armed, recording as player %d of %d\n",
+           consoleplayer + 1, MAXPLAYERS);
 } 
  
 

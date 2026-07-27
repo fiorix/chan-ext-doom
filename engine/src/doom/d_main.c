@@ -1960,6 +1960,23 @@ void D_DoomMain (void)
     if (p)
     {
 	G_RecordDemo (myargv[p+1]);
+
+	// Upstream begins recording in D_DoomLoop, just before the loop
+	// starts. That site is too late here: this fork registers its
+	// emscripten main loop at the top of D_DoomMain, so tics can run
+	// before D_DoomLoop is reached. G_WriteDemoTiccmd ends by re-reading
+	// what it just wrote, and with demo_p still null that read walks
+	// uninitialised memory, finds a stray 0x80 DEMOMARKER and calls
+	// G_CheckDemoStatus, which silently clears demorecording again.
+	// Beginning here, immediately after the buffer exists and after
+	// D_CheckNetGame has settled skill, episode, map and deathmatch,
+	// gives the same header with none of that exposure.
+
+	if (gameaction != ga_playdemo)
+	{
+	    G_BeginRecording ();
+	}
+
 	autostart = true;
     }
 
