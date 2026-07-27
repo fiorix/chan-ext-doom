@@ -33,12 +33,34 @@ size_t AbiA_SizeofPlayer(void);
 size_t AbiA_OffsetKillcount(void);
 size_t AbiA_OffsetCards(void);
 size_t AbiA_OffsetDidsecret(void);
+size_t AbiA_SizeofWbPlayer(void);
+size_t AbiA_SizeofWbStart(void);
+size_t AbiA_OffsetWbDidsecret(void);
+size_t AbiA_SizeofVertex(void);
+size_t AbiA_SizeofAnim(void);
+size_t AbiA_SizeofCeiling(void);
+size_t AbiA_OffsetCeilingCrush(void);
+size_t AbiA_SizeofFloorMove(void);
+size_t AbiA_SizeofFullTiccmd(void);
+size_t AbiA_OffsetTiccmdIngame(void);
+size_t AbiA_SizeofDehMapping(void);
 
 size_t AbiB_SizeofBoolean(void);
 size_t AbiB_SizeofPlayer(void);
 size_t AbiB_OffsetKillcount(void);
 size_t AbiB_OffsetCards(void);
 size_t AbiB_OffsetDidsecret(void);
+size_t AbiB_SizeofWbPlayer(void);
+size_t AbiB_SizeofWbStart(void);
+size_t AbiB_OffsetWbDidsecret(void);
+size_t AbiB_SizeofVertex(void);
+size_t AbiB_SizeofAnim(void);
+size_t AbiB_SizeofCeiling(void);
+size_t AbiB_OffsetCeilingCrush(void);
+size_t AbiB_SizeofFloorMove(void);
+size_t AbiB_SizeofFullTiccmd(void);
+size_t AbiB_OffsetTiccmdIngame(void);
+size_t AbiB_SizeofDehMapping(void);
 
 static int checks;
 static int failures;
@@ -80,6 +102,37 @@ int main(void)
                "offsetof(player_t, didsecret) agrees");
     CheckEqual(AbiA_OffsetKillcount(), AbiB_OffsetKillcount(),
                "offsetof(player_t, killcount) agrees");
+
+    // The rest of the audited set. player_t is what actually stomped memory;
+    // these carry boolean fields across the same translation-unit boundary
+    // and would have been the next symptom rather than a different bug.
+    CheckEqual(AbiA_SizeofWbPlayer(), AbiB_SizeofWbPlayer(),
+               "sizeof(wbplayerstruct_t) agrees");
+    CheckEqual(AbiA_SizeofWbStart(), AbiB_SizeofWbStart(),
+               "sizeof(wbstartstruct_t) agrees");
+    CheckEqual(AbiA_OffsetWbDidsecret(), AbiB_OffsetWbDidsecret(),
+               "offsetof(wbstartstruct_t, didsecret) agrees");
+    CheckEqual(AbiA_SizeofVertex(), AbiB_SizeofVertex(),
+               "sizeof(vertex_t) agrees");
+    CheckEqual(AbiA_SizeofAnim(), AbiB_SizeofAnim(),
+               "sizeof(anim_t) agrees");
+    CheckEqual(AbiA_SizeofCeiling(), AbiB_SizeofCeiling(),
+               "sizeof(ceiling_t) agrees");
+    CheckEqual(AbiA_OffsetCeilingCrush(), AbiB_OffsetCeilingCrush(),
+               "offsetof(ceiling_t, crush) agrees");
+    CheckEqual(AbiA_SizeofFloorMove(), AbiB_SizeofFloorMove(),
+               "sizeof(floormove_t) agrees");
+    CheckEqual(AbiA_SizeofDehMapping(), AbiB_SizeofDehMapping(),
+               "sizeof(deh_mapping_entry_t) agrees");
+
+    // net_full_ticcmd_t is the one with wire consequences: it crosses
+    // net_client, net_server and d_loop, and its playeringame[8] would have
+    // shifted the whole GAMEDATA fan-out had any of those taken the other
+    // include path.
+    CheckEqual(AbiA_SizeofFullTiccmd(), AbiB_SizeofFullTiccmd(),
+               "sizeof(net_full_ticcmd_t) agrees");
+    CheckEqual(AbiA_OffsetTiccmdIngame(), AbiB_OffsetTiccmdIngame(),
+               "offsetof(net_full_ticcmd_t, playeringame) agrees");
 
     printf("%d checks, %d failures\n", checks, failures);
 
