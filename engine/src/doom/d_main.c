@@ -156,6 +156,10 @@ int             show_diskicon = 1;
 
 char            *nervewadfile = NULL;
 
+// Set by -record, consumed once the game globals the demo header records
+// have been initialised.
+static char *record_demo_name = NULL;
+
 void D_ConnectNetGame(void);
 void D_CheckNetGame(void);
 
@@ -1959,25 +1963,35 @@ void D_DoomMain (void)
 
     if (p)
     {
-	G_RecordDemo (myargv[p+1]);
+	// Only remembered here. The demo header records gameskill,
+	// gameepisode and gamemap, and those globals are assigned by
+	// G_InitNew further down; D_CheckNetGame settles only the start*
+	// values they are derived from. Recording anything before that point
+	// writes a header describing map 0 of episode 0 at skill 0, which
+	// both peers would write identically and no digest comparison could
+	// ever catch.
 
-	// Upstream begins recording in D_DoomLoop, just before the loop
-	// starts. That site is too late here: this fork registers its
-	// emscripten main loop at the top of D_DoomMain, so tics can run
-	// before D_DoomLoop is reached. G_WriteDemoTiccmd ends by re-reading
-	// what it just wrote, and with demo_p still null that read walks
-	// uninitialised memory, finds a stray 0x80 DEMOMARKER and calls
-	// G_CheckDemoStatus, which silently clears demorecording again.
-	// Beginning here, immediately after the buffer exists and after
-	// D_CheckNetGame has settled skill, episode, map and deathmatch,
-	// gives the same header with none of that exposure.
-
-	if (gameaction != ga_playdemo)
-	{
-	    G_BeginRecording ();
-	}
-
+	record_demo_name = myargv[p+1];
 	autostart = true;
+    }
+
+    //!
+    // @category demo
+    //
+    // Record for verification: unbind the demo-quit key so ordinary play
+    // cannot end the recording.
+    //
+
+    if (M_ParmExists("-verifydemo"))
+    {
+	// The canary must survive whatever the player does, and this fork
+	// rebound fire to 'q', which is also the inherited demo-quit default.
+	// Unbinding on the verification path only leaves ordinary demo
+	// recording exactly as upstream behaves, and also protects the canary
+	// from a persistent config that bound the quit key to anything else.
+
+	key_demo_quit = 0;
+	printf("DEMO CANARY: verification mode, demo-quit key unbound\n");
     }
 
     p = M_CheckParmWithArgs("-playdemo", 1);
@@ -2007,6 +2021,17 @@ void D_DoomMain (void)
 	    G_InitNew (startskill, startepisode, startmap);
 	else
 	    D_StartTitle ();                // start up intro loop
+    }
+
+    // Now that the effective game globals exist, allocate the buffer and
+    // write the header. Nothing has ticked yet: this fork registers its
+    // emscripten main loop at the top of D_DoomMain, but it does not iterate
+    // until control returns to the browser, which is after D_DoomLoop.
+
+    if (record_demo_name != NULL && gameaction != ga_playdemo)
+    {
+	G_RecordDemo (record_demo_name);
+	G_BeginRecording ();
     }
 
     D_DoomLoop ();  // never returns

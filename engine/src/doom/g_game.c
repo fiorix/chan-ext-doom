@@ -2106,6 +2106,19 @@ void G_WriteDemoTiccmd (ticcmd_t* cmd)
 {
     byte *demo_start;
 
+    // Fail closed. This runs from G_Ticker for every in-game player, so if
+    // recording were ever observable before G_BeginRecording had set demo_p
+    // this would write, and then re-read, through an uninitialised pointer.
+    // The re-read is what makes it dangerous: it would find whatever byte
+    // happened to be there, and a stray 0x80 reads as DEMOMARKER and quietly
+    // ends the recording.
+
+    if (demobuffer == NULL || demo_p == NULL || demo_p < demobuffer
+     || demo_p > demoend)
+    {
+	return;
+    }
+
     if (gamekeydown[key_demo_quit])           // press the demo quit key to end recording
 	G_CheckDemoStatus ();
 
@@ -2237,12 +2250,18 @@ void G_BeginRecording (void)
     for (i=0 ; i<MAXPLAYERS ; i++) 
 	*demo_p++ = playeringame[i]; 		 
 
-    // Says plainly that the canary is armed. Without this the only evidence
-    // recording started is a digest that does not appear until the level
-    // ends, which is far too late to notice a mistyped -record.
+    // Names the header that was actually written, not just the fact that
+    // something was. A header recording skill 0 of map 0 hashes equal on
+    // both peers, so only reading the values back catches it.
 
-    printf("DEMO CANARY: armed, recording as player %d of %d\n",
-           consoleplayer + 1, MAXPLAYERS);
+    printf("DEMO CANARY: armed version=%d skill=%d episode=%d map=%d "
+           "deathmatch=%d respawn=%d fast=%d nomonsters=%d consoleplayer=%d "
+           "playeringame=%d%d%d%d\n",
+           (int) demobuffer[0], (int) gameskill, (int) gameepisode,
+           (int) gamemap, (int) deathmatch, (int) respawnparm,
+           (int) fastparm, (int) nomonsters, consoleplayer,
+           playeringame[0], playeringame[1], playeringame[2],
+           playeringame[3]);
 } 
  
 

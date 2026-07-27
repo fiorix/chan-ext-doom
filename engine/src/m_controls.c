@@ -110,11 +110,7 @@ int mousebnextweapon = -1;
 
 int key_message_refresh = KEY_ENTER;
 int key_pause = KEY_PAUSE;
-// Upstream binds this to 'q', but this fork rebinds fire to 'q' for
-// browser friendliness (see README), so leaving both here would end a
-// recording on the player's first shot. F10 is Doom's other traditional
-// demo key and is bound to nothing else in this build.
-int key_demo_quit = KEY_F10;
+int key_demo_quit = 'q';
 int key_spy = KEY_F12;
 
 // Multiplayer chat keys:

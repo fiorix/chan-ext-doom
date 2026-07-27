@@ -436,7 +436,7 @@
           // minutes of two-player recording; a slow run would truncate one
           // side and read as a desync that never happened, so a verification
           // run gets 1 MiB.
-          argv.push("-record", "canary", "-maxdemo", "1024");
+          argv.push("-record", "canary", "-verifydemo", "-maxdemo", "1024");
         }
 
         const m = mode();
