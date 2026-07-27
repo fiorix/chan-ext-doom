@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -100,51 +100,19 @@ impl PlayerId {
     }
 }
 
-/// A nonzero address advertised by an engine transport.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RouteId(NonZeroU32);
-
-impl RouteId {
-    /// Constructs an address, rejecting zero because it means "no destination".
-    pub const fn new(value: u32) -> Option<Self> {
-        match NonZeroU32::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    /// Returns the integer representation.
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-/// A transport-independent packet routing request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Envelope<'a> {
-    to: Option<RouteId>,
-    from: RouteId,
-    payload: &'a [u8],
-}
-
-impl<'a> Envelope<'a> {
-    /// Constructs an envelope. A missing destination registers the sender route.
-    pub const fn new(to: Option<RouteId>, from: RouteId, payload: &'a [u8]) -> Self {
-        Self { to, from, payload }
-    }
-}
-
 /// A packet waiting for delivery to one player.
+///
+/// Metadata is supplied by the transport binding and remains opaque to the room core.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OutboundPacket {
-    from: RouteId,
+pub struct OutboundPacket<Metadata> {
+    metadata: Metadata,
     payload: Vec<u8>,
 }
 
-impl OutboundPacket {
-    /// Returns the source address advertised to the recipient.
-    pub const fn from(&self) -> RouteId {
-        self.from
+impl<Metadata> OutboundPacket<Metadata> {
+    /// Returns the transport-owned metadata.
+    pub const fn metadata(&self) -> &Metadata {
+        &self.metadata
     }
 
     /// Returns the opaque packet bytes.
@@ -164,18 +132,12 @@ pub enum JoinError {
     PlayerIdsExhausted,
 }
 
-/// Why an envelope could not be relayed.
+/// Why a packet could not be relayed.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum RelayError {
     /// The sender is no longer joined.
     #[error("player is not joined")]
     UnknownPlayer,
-    /// The sender tried to change its advertised address.
-    #[error("player changed its route address")]
-    SourceChanged,
-    /// Another connection already owns the advertised address in this room.
-    #[error("route address is already in use")]
-    SourceInUse,
     /// The opaque payload exceeded the memory-bound limit.
     #[error("payload is {len} bytes; maximum is {max}")]
     PayloadTooLarge {
@@ -186,10 +148,10 @@ pub enum RelayError {
     },
 }
 
-/// Observable result of handling one valid envelope.
+/// Observable result of handling one valid relay request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelayOutcome {
-    /// No joined player owns the destination.
+    /// The recipient is absent or belongs to another room.
     Unroutable,
     /// The packet entered the recipient's FIFO outbox.
     Queued(PlayerId),
@@ -199,14 +161,14 @@ pub enum RelayOutcome {
 
 /// A registry of named, protocol-agnostic relay rooms.
 #[derive(Debug)]
-pub struct Registry {
-    rooms: HashMap<RoomName, Room>,
+pub struct Registry<Metadata = ()> {
+    rooms: HashMap<RoomName, Room<Metadata>>,
     memberships: HashMap<PlayerId, RoomName>,
     next_player_id: Option<NonZeroU64>,
     outbox_capacity: NonZeroUsize,
 }
 
-impl Registry {
+impl<Metadata> Registry<Metadata> {
     /// Constructs a registry with the given per-player packet limit.
     pub fn new(outbox_capacity: NonZeroUsize) -> Self {
         Self {
@@ -263,66 +225,53 @@ impl Registry {
     pub fn relay(
         &mut self,
         sender: PlayerId,
-        envelope: Envelope<'_>,
+        recipient: PlayerId,
+        metadata: Metadata,
+        payload: &[u8],
     ) -> Result<RelayOutcome, RelayError> {
-        if envelope.payload.len() > MAX_PAYLOAD_LEN {
+        if payload.len() > MAX_PAYLOAD_LEN {
             return Err(RelayError::PayloadTooLarge {
-                len: envelope.payload.len(),
+                len: payload.len(),
                 max: MAX_PAYLOAD_LEN,
             });
+        }
+
+        {
+            let sender_room = self
+                .memberships
+                .get(&sender)
+                .ok_or(RelayError::UnknownPlayer)?;
+            if self.memberships.get(&recipient) != Some(sender_room) {
+                return Ok(RelayOutcome::Unroutable);
+            }
+
+            let recipient_player = self
+                .rooms
+                .get_mut(sender_room)
+                .expect("a membership always points to an existing room")
+                .players
+                .get_mut(&recipient)
+                .expect("a membership always points to an existing player");
+            if recipient_player.outbox.len() < self.outbox_capacity.get() {
+                recipient_player.outbox.push_back(OutboundPacket {
+                    metadata,
+                    payload: payload.to_vec(),
+                });
+                return Ok(RelayOutcome::Queued(recipient));
+            }
         }
 
         let room_name = self
             .memberships
             .get(&sender)
             .cloned()
-            .ok_or(RelayError::UnknownPlayer)?;
-        let room = self
-            .rooms
-            .get_mut(&room_name)
-            .expect("a membership always points to an existing room");
-        let player = room
-            .players
-            .get_mut(&sender)
-            .expect("a membership always points to an existing player");
-
-        match player.route {
-            Some(route) if route != envelope.from => return Err(RelayError::SourceChanged),
-            Some(_) => {}
-            None => {
-                if room.routes.contains_key(&envelope.from) {
-                    return Err(RelayError::SourceInUse);
-                }
-                player.route = Some(envelope.from);
-                room.routes.insert(envelope.from, sender);
-            }
-        }
-
-        let Some(destination) = envelope.to else {
-            return Ok(RelayOutcome::Unroutable);
-        };
-        let Some(&recipient) = room.routes.get(&destination) else {
-            return Ok(RelayOutcome::Unroutable);
-        };
-        let recipient_player = room
-            .players
-            .get_mut(&recipient)
-            .expect("a route always points to an existing player");
-
-        if recipient_player.outbox.len() >= self.outbox_capacity.get() {
-            self.remove_player(&room_name, recipient);
-            return Ok(RelayOutcome::SlowConsumerDisconnected(recipient));
-        }
-
-        recipient_player.outbox.push_back(OutboundPacket {
-            from: envelope.from,
-            payload: envelope.payload.to_vec(),
-        });
-        Ok(RelayOutcome::Queued(recipient))
+            .expect("the sender membership was checked above");
+        self.remove_player(&room_name, recipient);
+        Ok(RelayOutcome::SlowConsumerDisconnected(recipient))
     }
 
     /// Removes and returns the oldest pending packet for a player.
-    pub fn pop_outbound(&mut self, player_id: PlayerId) -> Option<OutboundPacket> {
+    pub fn pop_outbound(&mut self, player_id: PlayerId) -> Option<OutboundPacket<Metadata>> {
         let room_name = self.memberships.get(&player_id)?;
         self.rooms
             .get_mut(room_name)?
@@ -334,16 +283,10 @@ impl Registry {
 
     fn remove_player(&mut self, room_name: &RoomName, player_id: PlayerId) {
         self.memberships.remove(&player_id);
-        let remove_room = if let Some(room) = self.rooms.get_mut(room_name) {
-            if let Some(player) = room.players.remove(&player_id)
-                && let Some(route) = player.route
-            {
-                room.routes.remove(&route);
-            }
+        let remove_room = self.rooms.get_mut(room_name).is_some_and(|room| {
+            room.players.remove(&player_id);
             room.players.is_empty()
-        } else {
-            false
-        };
+        });
 
         if remove_room {
             self.rooms.remove(room_name);
@@ -351,7 +294,7 @@ impl Registry {
     }
 }
 
-impl Default for Registry {
+impl<Metadata> Default for Registry<Metadata> {
     fn default() -> Self {
         Self::new(
             NonZeroUsize::new(DEFAULT_OUTBOX_CAPACITY).expect("default outbox capacity is nonzero"),
@@ -359,16 +302,30 @@ impl Default for Registry {
     }
 }
 
-#[derive(Debug, Default)]
-struct Room {
-    players: HashMap<PlayerId, Player>,
-    routes: HashMap<RouteId, PlayerId>,
+#[derive(Debug)]
+struct Room<Metadata> {
+    players: HashMap<PlayerId, Player<Metadata>>,
 }
 
-#[derive(Debug, Default)]
-struct Player {
-    route: Option<RouteId>,
-    outbox: VecDeque<OutboundPacket>,
+impl<Metadata> Default for Room<Metadata> {
+    fn default() -> Self {
+        Self {
+            players: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Player<Metadata> {
+    outbox: VecDeque<OutboundPacket<Metadata>>,
+}
+
+impl<Metadata> Default for Player<Metadata> {
+    fn default() -> Self {
+        Self {
+            outbox: VecDeque::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,24 +336,13 @@ mod tests {
         RoomName::try_from("e1m1").expect("test room name is valid")
     }
 
-    fn route(value: u32) -> RouteId {
-        RouteId::new(value).expect("test route is nonzero")
-    }
-
-    fn registry_with_capacity(capacity: usize) -> Registry {
+    fn registry_with_capacity(capacity: usize) -> Registry<u32> {
         Registry::new(NonZeroUsize::new(capacity).expect("test capacity is nonzero"))
-    }
-
-    fn register(registry: &mut Registry, player: PlayerId, address: RouteId) {
-        let outcome = registry
-            .relay(player, Envelope::new(None, address, &[]))
-            .expect("registration succeeds");
-        assert_eq!(outcome, RelayOutcome::Unroutable);
     }
 
     #[test]
     fn join_and_leave_use_stable_player_ids() {
-        let mut registry = Registry::default();
+        let mut registry = Registry::<u32>::default();
         let first = registry.join(room()).expect("first player joins");
         let second = registry.join(room()).expect("second player joins");
 
@@ -413,7 +359,7 @@ mod tests {
 
     #[test]
     fn room_capacity_is_eight() {
-        let mut registry = Registry::default();
+        let mut registry = Registry::<u32>::default();
         for _ in 0..MAX_PLAYERS {
             registry.join(room()).expect("room has a free slot");
         }
@@ -428,21 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn relay_preserves_fifo_order() {
-        let mut registry = Registry::default();
+    fn relay_preserves_fifo_order_and_transport_metadata() {
+        let mut registry = Registry::<u32>::default();
         let sender = registry.join(room()).expect("sender joins");
         let recipient = registry.join(room()).expect("recipient joins");
-        let sender_route = route(11);
-        let recipient_route = route(22);
-        register(&mut registry, recipient, recipient_route);
 
-        for payload in [b"first".as_slice(), b"second".as_slice()] {
+        for (metadata, payload) in [(11, b"first".as_slice()), (12, b"second".as_slice())] {
             assert_eq!(
                 registry
-                    .relay(
-                        sender,
-                        Envelope::new(Some(recipient_route), sender_route, payload),
-                    )
+                    .relay(sender, recipient, metadata, payload)
                     .expect("relay succeeds"),
                 RelayOutcome::Queued(recipient)
             );
@@ -454,27 +394,21 @@ mod tests {
         let second = registry
             .pop_outbound(recipient)
             .expect("second packet is queued");
-        assert_eq!(first.from(), sender_route);
+        assert_eq!(*first.metadata(), 11);
         assert_eq!(first.payload(), b"first");
+        assert_eq!(*second.metadata(), 12);
         assert_eq!(second.payload(), b"second");
         assert!(registry.pop_outbound(recipient).is_none());
     }
 
     #[test]
     fn relay_does_not_echo_unless_sender_is_addressed() {
-        let mut registry = Registry::default();
+        let mut registry = Registry::<u32>::default();
         let sender = registry.join(room()).expect("sender joins");
         let recipient = registry.join(room()).expect("recipient joins");
-        let sender_route = route(11);
-        let recipient_route = route(22);
-        register(&mut registry, sender, sender_route);
-        register(&mut registry, recipient, recipient_route);
 
         registry
-            .relay(
-                sender,
-                Envelope::new(Some(recipient_route), sender_route, b"peer"),
-            )
+            .relay(sender, recipient, 11, b"peer")
             .expect("peer relay succeeds");
         assert!(registry.pop_outbound(sender).is_none());
         assert_eq!(
@@ -486,10 +420,7 @@ mod tests {
         );
 
         registry
-            .relay(
-                sender,
-                Envelope::new(Some(sender_route), sender_route, b"self"),
-            )
+            .relay(sender, sender, 11, b"self")
             .expect("self relay succeeds");
         assert_eq!(
             registry
@@ -505,17 +436,11 @@ mod tests {
         let mut registry = registry_with_capacity(2);
         let sender = registry.join(room()).expect("sender joins");
         let slow = registry.join(room()).expect("slow consumer joins");
-        let sender_route = route(11);
-        let slow_route = route(22);
-        register(&mut registry, slow, slow_route);
 
         for payload in [b"one".as_slice(), b"two".as_slice()] {
             assert_eq!(
                 registry
-                    .relay(
-                        sender,
-                        Envelope::new(Some(slow_route), sender_route, payload),
-                    )
+                    .relay(sender, slow, 11, payload)
                     .expect("relay fits in the bounded outbox"),
                 RelayOutcome::Queued(slow)
             );
@@ -529,10 +454,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .relay(
-                    sender,
-                    Envelope::new(Some(slow_route), sender_route, b"overflow"),
-                )
+                .relay(sender, slow, 11, b"overflow")
                 .expect("overflow applies the disconnect policy"),
             RelayOutcome::SlowConsumerDisconnected(slow)
         );
@@ -545,36 +467,17 @@ mod tests {
     }
 
     #[test]
-    fn route_address_cannot_be_spoofed_or_reused() {
-        let mut registry = Registry::default();
-        let first = registry.join(room()).expect("first player joins");
-        let second = registry.join(room()).expect("second player joins");
-        register(&mut registry, first, route(11));
-
-        assert_eq!(
-            registry.relay(second, Envelope::new(None, route(11), &[])),
-            Err(RelayError::SourceInUse)
-        );
-        assert_eq!(
-            registry.relay(first, Envelope::new(None, route(12), &[])),
-            Err(RelayError::SourceChanged)
-        );
-    }
-
-    #[test]
     fn rooms_are_isolated() {
-        let mut registry = Registry::default();
+        let mut registry = Registry::<u32>::default();
         let first = registry.join(room()).expect("first player joins");
         let other_room = RoomName::try_from("e1m2").expect("test room name is valid");
         let second = registry
             .join(other_room)
             .expect("second player joins another room");
-        register(&mut registry, first, route(11));
-        register(&mut registry, second, route(22));
 
         assert_eq!(
             registry
-                .relay(first, Envelope::new(Some(route(22)), route(11), b"nope"))
+                .relay(first, second, 11, b"nope")
                 .expect("unknown destination is not an error"),
             RelayOutcome::Unroutable
         );
@@ -582,24 +485,20 @@ mod tests {
     }
 
     #[test]
-    fn oversized_payload_is_rejected_without_binding_the_source() {
-        let mut registry = Registry::default();
-        let player = registry.join(room()).expect("player joins");
+    fn oversized_payload_is_rejected_before_outbox_mutation() {
+        let mut registry = Registry::<u32>::default();
+        let sender = registry.join(room()).expect("sender joins");
+        let recipient = registry.join(room()).expect("recipient joins");
         let oversized = vec![0; MAX_PAYLOAD_LEN + 1];
 
         assert_eq!(
-            registry.relay(player, Envelope::new(None, route(11), &oversized)),
+            registry.relay(sender, recipient, 11, &oversized),
             Err(RelayError::PayloadTooLarge {
                 len: MAX_PAYLOAD_LEN + 1,
                 max: MAX_PAYLOAD_LEN,
             })
         );
-        assert_eq!(
-            registry
-                .relay(player, Envelope::new(None, route(12), &[]))
-                .expect("rejected payload did not bind the first source"),
-            RelayOutcome::Unroutable
-        );
+        assert!(registry.pop_outbound(recipient).is_none());
     }
 
     #[test]

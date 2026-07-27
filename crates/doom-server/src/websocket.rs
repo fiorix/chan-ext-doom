@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use axum::Router;
@@ -16,11 +16,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 
 use crate::{
-    Envelope, MAX_PAYLOAD_LEN, OutboundPacket, PlayerId, Registry, RelayOutcome, RoomName, RouteId,
+    MAX_PAYLOAD_LEN, OutboundPacket, PlayerId, Registry, RelayError, RelayOutcome, RoomName,
 };
 
 const INBOUND_HEADER_LEN: usize = 8;
 const OUTBOUND_HEADER_LEN: usize = 4;
+const RESET_ROUTE: u32 = 1;
 
 /// Maximum accepted WebSocket binary-frame size.
 pub const MAX_INBOUND_FRAME_LEN: usize = INBOUND_HEADER_LEN + MAX_PAYLOAD_LEN;
@@ -29,7 +30,8 @@ pub const MAX_INBOUND_FRAME_LEN: usize = INBOUND_HEADER_LEN + MAX_PAYLOAD_LEN;
 pub async fn serve(listener: TcpListener, outbox_capacity: NonZeroUsize) -> io::Result<()> {
     let state = ServerState(Arc::new(Mutex::new(Runtime {
         registry: Registry::new(outbox_capacity),
-        waiters: HashMap::new(),
+        connections: HashMap::new(),
+        routes: HashMap::new(),
     })));
     let router = Router::new()
         .route("/ws/{room}", get(upgrade))
@@ -42,8 +44,192 @@ pub async fn serve(listener: TcpListener, outbox_capacity: NonZeroUsize) -> io::
 struct ServerState(Arc<Mutex<Runtime>>);
 
 struct Runtime {
-    registry: Registry,
-    waiters: HashMap<PlayerId, Arc<Notify>>,
+    registry: Registry<RouteId>,
+    connections: HashMap<PlayerId, Connection>,
+    routes: HashMap<RoomName, HashMap<RouteId, PlayerId>>,
+}
+
+struct Connection {
+    room_name: RoomName,
+    route: Option<RouteId>,
+    waiter: Arc<Notify>,
+}
+
+impl Runtime {
+    fn join(
+        &mut self,
+        room_name: RoomName,
+        waiter: Arc<Notify>,
+    ) -> Result<PlayerId, crate::JoinError> {
+        let player_id = self.registry.join(room_name.clone())?;
+        self.connections.insert(
+            player_id,
+            Connection {
+                room_name,
+                route: None,
+                waiter,
+            },
+        );
+        Ok(player_id)
+    }
+
+    fn handle_envelope(
+        &mut self,
+        player_id: PlayerId,
+        envelope: WireEnvelope<'_>,
+    ) -> Result<FrameEffect, BindingError> {
+        let mut effect = FrameEffect::default();
+        if envelope.is_reset() {
+            effect.waiters = self.reset_room(player_id);
+        }
+
+        self.bind_source(player_id, envelope.from)?;
+        let Some(destination) = envelope.to else {
+            return Ok(effect);
+        };
+        let Some(recipient) = self.recipient(player_id, destination) else {
+            return Ok(effect);
+        };
+
+        match self
+            .registry
+            .relay(player_id, recipient, envelope.from, envelope.payload)?
+        {
+            RelayOutcome::Unroutable => {}
+            RelayOutcome::Queued(recipient) => {
+                if let Some(connection) = self.connections.get(&recipient) {
+                    effect.waiters.push(Arc::clone(&connection.waiter));
+                }
+            }
+            RelayOutcome::SlowConsumerDisconnected(recipient) => {
+                if let Some(waiter) = self.disconnect(recipient) {
+                    effect.waiters.push(waiter);
+                }
+                effect.sender_connected = recipient != player_id;
+            }
+        }
+
+        Ok(effect)
+    }
+
+    fn bind_source(&mut self, player_id: PlayerId, source: RouteId) -> Result<(), BindingError> {
+        let connection = self
+            .connections
+            .get(&player_id)
+            .ok_or(BindingError::UnknownPlayer)?;
+        match connection.route {
+            Some(route) if route != source => return Err(BindingError::SourceChanged),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        let room_name = connection.room_name.clone();
+        if self
+            .routes
+            .get(&room_name)
+            .is_some_and(|routes| routes.contains_key(&source))
+        {
+            return Err(BindingError::SourceInUse);
+        }
+
+        self.connections
+            .get_mut(&player_id)
+            .expect("the connection was checked above")
+            .route = Some(source);
+        self.routes
+            .entry(room_name)
+            .or_default()
+            .insert(source, player_id);
+        Ok(())
+    }
+
+    fn recipient(&self, player_id: PlayerId, destination: RouteId) -> Option<PlayerId> {
+        let room_name = &self.connections.get(&player_id)?.room_name;
+        self.routes.get(room_name)?.get(&destination).copied()
+    }
+
+    fn reset_room(&mut self, player_id: PlayerId) -> Vec<Arc<Notify>> {
+        let Some(room_name) = self
+            .connections
+            .get(&player_id)
+            .map(|connection| connection.room_name.clone())
+        else {
+            return Vec::new();
+        };
+        let victims: Vec<_> = self
+            .connections
+            .iter()
+            .filter_map(|(&candidate, connection)| {
+                (candidate != player_id && connection.room_name == room_name).then_some(candidate)
+            })
+            .collect();
+        let waiters = victims
+            .into_iter()
+            .filter_map(|victim| self.disconnect(victim))
+            .collect();
+        self.unbind(player_id);
+        waiters
+    }
+
+    fn disconnect(&mut self, player_id: PlayerId) -> Option<Arc<Notify>> {
+        self.registry.leave(player_id);
+        let connection = self.connections.remove(&player_id)?;
+        if let Some(route) = connection.route {
+            self.remove_route(&connection.room_name, route);
+        }
+        Some(connection.waiter)
+    }
+
+    fn unbind(&mut self, player_id: PlayerId) {
+        let Some((room_name, route)) =
+            self.connections.get_mut(&player_id).and_then(|connection| {
+                connection
+                    .route
+                    .take()
+                    .map(|route| (connection.room_name.clone(), route))
+            })
+        else {
+            return;
+        };
+        self.remove_route(&room_name, route);
+    }
+
+    fn remove_route(&mut self, room_name: &RoomName, route: RouteId) {
+        let remove_room = self.routes.get_mut(room_name).is_some_and(|routes| {
+            routes.remove(&route);
+            routes.is_empty()
+        });
+        if remove_room {
+            self.routes.remove(room_name);
+        }
+    }
+}
+
+struct FrameEffect {
+    waiters: Vec<Arc<Notify>>,
+    sender_connected: bool,
+}
+
+impl Default for FrameEffect {
+    fn default() -> Self {
+        Self {
+            waiters: Vec::new(),
+            sender_connected: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BindingError {
+    UnknownPlayer,
+    SourceChanged,
+    SourceInUse,
+    Relay(RelayError),
+}
+
+impl From<RelayError> for BindingError {
+    fn from(error: RelayError) -> Self {
+        Self::Relay(error)
+    }
 }
 
 async fn upgrade(
@@ -62,10 +248,9 @@ async fn session(socket: WebSocket, state: ServerState, room_name: RoomName) {
     let waiter = Arc::new(Notify::new());
     let player_id = {
         let mut runtime = state.0.lock().await;
-        let Ok(player_id) = runtime.registry.join(room_name) else {
+        let Ok(player_id) = runtime.join(room_name, Arc::clone(&waiter)) else {
             return;
         };
-        runtime.waiters.insert(player_id, Arc::clone(&waiter));
         player_id
     };
 
@@ -79,7 +264,7 @@ async fn session(socket: WebSocket, state: ServerState, room_name: RoomName) {
     let writer_finished;
 
     tokio::select! {
-        () = read_loop(stream, state.clone(), player_id) => {
+        () = read_loop(stream, state.clone(), player_id, Arc::clone(&waiter)) => {
             writer_finished = false;
         }
         _ = &mut writer => {
@@ -89,19 +274,21 @@ async fn session(socket: WebSocket, state: ServerState, room_name: RoomName) {
 
     let removed_waiter = {
         let mut runtime = state.0.lock().await;
-        runtime.registry.leave(player_id);
-        runtime.waiters.remove(&player_id)
+        runtime.disconnect(player_id)
     };
-    if let Some(waiter) = removed_waiter {
-        waiter.notify_one();
-    }
+    removed_waiter.unwrap_or(waiter).notify_one();
 
     if !writer_finished {
         let _ = writer.await;
     }
 }
 
-async fn read_loop(mut stream: SplitStream<WebSocket>, state: ServerState, player_id: PlayerId) {
+async fn read_loop(
+    mut stream: SplitStream<WebSocket>,
+    state: ServerState,
+    player_id: PlayerId,
+    waiter: Arc<Notify>,
+) {
     while let Some(message) = stream.next().await {
         let Ok(message) = message else {
             return;
@@ -112,38 +299,21 @@ async fn read_loop(mut stream: SplitStream<WebSocket>, state: ServerState, playe
                 let Ok(envelope) = decode_inbound(&frame) else {
                     return;
                 };
-                let (waiter, sender_connected) = {
+                let effect = {
                     let mut runtime = state.0.lock().await;
-                    let Ok(outcome) = runtime.registry.relay(player_id, envelope) else {
+                    let Ok(effect) = runtime.handle_envelope(player_id, envelope) else {
                         return;
                     };
-                    match outcome {
-                        RelayOutcome::Unroutable => (None, true),
-                        RelayOutcome::Queued(recipient) => {
-                            (runtime.waiters.get(&recipient).cloned(), true)
-                        }
-                        RelayOutcome::SlowConsumerDisconnected(recipient) => (
-                            runtime.waiters.get(&recipient).cloned(),
-                            recipient != player_id,
-                        ),
-                    }
+                    effect
                 };
-                if let Some(waiter) = waiter {
+                for waiter in effect.waiters {
                     waiter.notify_one();
                 }
-                if !sender_connected {
+                if !effect.sender_connected {
                     return;
                 }
             }
-            Message::Ping(_) => {
-                let waiter = {
-                    let runtime = state.0.lock().await;
-                    runtime.waiters.get(&player_id).cloned()
-                };
-                if let Some(waiter) = waiter {
-                    waiter.notify_one();
-                }
-            }
+            Message::Ping(_) => waiter.notify_one(),
             Message::Pong(_) => {}
             Message::Close(_) | Message::Text(_) => return,
         }
@@ -185,6 +355,35 @@ async fn write_loop(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RouteId(NonZeroU32);
+
+impl RouteId {
+    const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WireEnvelope<'a> {
+    to: Option<RouteId>,
+    from: RouteId,
+    payload: &'a [u8],
+}
+
+impl WireEnvelope<'_> {
+    fn is_reset(self) -> bool {
+        self.to.is_none() && self.from.get() == RESET_ROUTE && self.payload.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DecodeError {
     TooShort,
@@ -192,7 +391,7 @@ enum DecodeError {
     ZeroSource,
 }
 
-fn decode_inbound(frame: &[u8]) -> Result<Envelope<'_>, DecodeError> {
+fn decode_inbound(frame: &[u8]) -> Result<WireEnvelope<'_>, DecodeError> {
     if frame.len() > MAX_INBOUND_FRAME_LEN {
         return Err(DecodeError::TooLarge);
     }
@@ -211,40 +410,32 @@ fn decode_inbound(frame: &[u8]) -> Result<Envelope<'_>, DecodeError> {
     );
     let from = RouteId::new(from).ok_or(DecodeError::ZeroSource)?;
 
-    Ok(Envelope::new(
-        RouteId::new(to),
+    Ok(WireEnvelope {
+        to: RouteId::new(to),
         from,
-        &frame[INBOUND_HEADER_LEN..],
-    ))
+        payload: &frame[INBOUND_HEADER_LEN..],
+    })
 }
 
-fn encode_outbound(packet: OutboundPacket) -> Vec<u8> {
+fn encode_outbound(packet: OutboundPacket<RouteId>) -> Vec<u8> {
     let mut frame = Vec::with_capacity(OUTBOUND_HEADER_LEN + packet.payload().len());
-    frame.extend_from_slice(&packet.from().get().to_le_bytes());
+    frame.extend_from_slice(&packet.metadata().get().to_le_bytes());
     frame.extend_from_slice(packet.payload());
     frame
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
     #[tokio::test]
     async fn websocket_binding_relays_between_named_room_members() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("loopback listener binds");
-        let address = listener.local_addr().expect("listener has an address");
-        let server = tokio::spawn(async move {
-            serve(
-                listener,
-                NonZeroUsize::new(4).expect("test capacity is nonzero"),
-            )
-            .await
-        });
-
+        let (address, server) = spawn_server().await;
         let room_url = format!("ws://{address}/ws/coop");
         let (mut first, _) = connect_async(&room_url)
             .await
@@ -261,7 +452,7 @@ mod tests {
             .send(ClientMessage::Binary(client_frame(11, 22, b"ready").into()))
             .await
             .expect("second route registers and sends");
-        assert_eq!(next_binary(&mut first).await, server_frame(22, b"ready"),);
+        assert_eq!(next_binary(&mut first).await, server_frame(22, b"ready"));
 
         first
             .send(ClientMessage::Binary(
@@ -269,12 +460,88 @@ mod tests {
             ))
             .await
             .expect("first client sends");
-        assert_eq!(next_binary(&mut second).await, server_frame(11, b"packet"),);
+        assert_eq!(next_binary(&mut second).await, server_frame(11, b"packet"));
 
         first.close(None).await.expect("first client closes");
         second.close(None).await.expect("second client closes");
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn exact_server_registration_resets_the_room() {
+        let (address, server) = spawn_server().await;
+        let room_url = format!("ws://{address}/ws/reset");
+        let (mut existing, _) = connect_async(&room_url)
+            .await
+            .expect("existing client connects");
+
+        existing
+            .send(ClientMessage::Binary(client_frame(22, 22, b"ready").into()))
+            .await
+            .expect("existing route registers");
+        assert_eq!(next_binary(&mut existing).await, server_frame(22, b"ready"));
+
+        let (mut resetter, _) = connect_async(&room_url).await.expect("resetter connects");
+        resetter
+            .send(ClientMessage::Binary(client_frame(0, 1, &[]).into()))
+            .await
+            .expect("reset frame sends");
+        assert!(matches!(
+            next_message(&mut existing).await,
+            Some(Ok(ClientMessage::Close(_)))
+        ));
+
+        resetter
+            .send(ClientMessage::Binary(client_frame(1, 1, b"alive").into()))
+            .await
+            .expect("resetter remains joined");
+        assert_eq!(next_binary(&mut resetter).await, server_frame(1, b"alive"));
+
+        resetter.close(None).await.expect("resetter closes");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn source_binding_rejects_changes_and_duplicate_ownership() {
+        let mut runtime = test_runtime();
+        let waiter = Arc::new(Notify::new());
+        let first = runtime
+            .join(room(), Arc::clone(&waiter))
+            .expect("first player joins");
+        let second = runtime
+            .join(room(), Arc::new(Notify::new()))
+            .expect("second player joins");
+
+        assert_eq!(runtime.bind_source(first, route(11)), Ok(()));
+        assert_eq!(
+            runtime.bind_source(first, route(12)),
+            Err(BindingError::SourceChanged)
+        );
+        assert_eq!(
+            runtime.bind_source(second, route(11)),
+            Err(BindingError::SourceInUse)
+        );
+    }
+
+    #[test]
+    fn reset_marker_must_be_exactly_eight_bytes() {
+        assert!(
+            decode_inbound(&client_frame(0, 1, &[]))
+                .expect("exact reset decodes")
+                .is_reset()
+        );
+        assert!(
+            !decode_inbound(&client_frame(0, 1, b"x"))
+                .expect("payload frame decodes")
+                .is_reset()
+        );
+        assert!(
+            !decode_inbound(&client_frame(2, 1, &[]))
+                .expect("addressed frame decodes")
+                .is_reset()
+        );
     }
 
     #[test]
@@ -284,7 +551,11 @@ mod tests {
 
         assert_eq!(
             envelope,
-            Envelope::new(RouteId::new(2), route(1), &[0xaa, 0xbb])
+            WireEnvelope {
+                to: RouteId::new(2),
+                from: route(1),
+                payload: &[0xaa, 0xbb],
+            }
         );
     }
 
@@ -293,7 +564,14 @@ mod tests {
         let frame = [0, 0, 0, 0, 7, 0, 0, 0];
         let envelope = decode_inbound(&frame).expect("registration frame decodes");
 
-        assert_eq!(envelope, Envelope::new(None, route(7), &[]));
+        assert_eq!(
+            envelope,
+            WireEnvelope {
+                to: None,
+                from: route(7),
+                payload: &[],
+            }
+        );
     }
 
     #[test]
@@ -309,6 +587,18 @@ mod tests {
 
         let oversized = vec![0; MAX_INBOUND_FRAME_LEN + 1];
         assert_eq!(decode_inbound(&oversized), Err(DecodeError::TooLarge));
+    }
+
+    fn test_runtime() -> Runtime {
+        Runtime {
+            registry: Registry::new(NonZeroUsize::new(4).expect("test capacity is nonzero")),
+            connections: HashMap::new(),
+            routes: HashMap::new(),
+        }
+    }
+
+    fn room() -> RoomName {
+        RoomName::try_from("e1m1").expect("test room name is valid")
     }
 
     fn route(value: u32) -> RouteId {
@@ -330,11 +620,40 @@ mod tests {
         frame
     }
 
+    async fn spawn_server() -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let server = tokio::spawn(async move {
+            serve(
+                listener,
+                NonZeroUsize::new(4).expect("test capacity is nonzero"),
+            )
+            .await
+        });
+        (address, server)
+    }
+
+    async fn next_message<S>(
+        socket: &mut S,
+    ) -> Option<Result<ClientMessage, tokio_tungstenite::tungstenite::Error>>
+    where
+        S: StreamExt<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("server responds within one second")
+    }
+
     async fn next_binary<S>(socket: &mut S) -> Vec<u8>
     where
         S: StreamExt<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
     {
-        match socket.next().await {
+        match next_message(socket).await {
             Some(Ok(ClientMessage::Binary(frame))) => frame.to_vec(),
             other => panic!("expected binary frame, got {other:?}"),
         }
