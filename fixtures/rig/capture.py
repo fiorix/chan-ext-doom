@@ -2,10 +2,12 @@
 """Loopback packet-capture rig for the Chocolate Doom wire protocol.
 
 Spins up a real ``chocolate-server`` and ``chocolate-doom`` client on
-127.0.0.1 with a small UDP relay in between. The client always targets
-port 2342 (chocolate's DEFAULT_PORT, not configurable on the client), so
-the relay binds that port and forwards to the server on a scratch port.
-Every datagram is logged in arrival order with direction and payload.
+127.0.0.1 with a small UDP relay in between. The rig relies on
+chocolate's default UDP port (2342, ``DEFAULT_PORT``); the relay binds
+that port and forwards to the server on a scratch port. (Clients can
+override the default with ``-port`` or a ``host:port`` connect address;
+the rig simply does not need it.) Every datagram is logged in arrival
+order with direction and payload.
 
 Subcommands:
 
@@ -25,6 +27,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import selectors
 import shlex
 import shutil
@@ -82,6 +85,41 @@ TOOLCHAIN = {
 }
 
 SHAREWARE_IWAD_SHA1 = "5b2e249b9c5133ec987b3ea77596381dc0d6bc1d"
+
+# Session names become directory names under the fixtures root. Keep them
+# on a narrow portable alphabet so a crafted or accidental name can never
+# escape the fixtures tree (no separators, no dots, no leading dash).
+SESSION_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def check_session_name(name):
+    """Return the name if valid, else raise ValueError."""
+    if not SESSION_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"invalid session name {name!r}: must match [a-z0-9][a-z0-9-]*"
+        )
+    return name
+
+
+def session_name_arg(name):
+    """argparse type for --name: reject bad names before anything runs."""
+    try:
+        return check_session_name(name)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def export_destination(fixtures_dir, name):
+    """Resolve the per-session export dir and prove it stays inside the
+    fixtures root. Raises ValueError otherwise; nothing is mutated."""
+    check_session_name(name)
+    root = os.path.realpath(fixtures_dir)
+    dest = os.path.realpath(os.path.join(root, name))
+    if os.path.dirname(dest) != root:
+        raise ValueError(
+            f"export destination {dest!r} escapes fixtures root {root!r}"
+        )
+    return dest
 
 
 def sha256_file(path):
@@ -359,7 +397,11 @@ def cmd_export(args):
         return 1
 
     name = session["name"]
-    dest = os.path.join(fixtures_dir, name)
+    try:
+        dest = export_destination(fixtures_dir, name)
+    except ValueError as e:
+        print(f"rig: refusing to export: {e}", file=sys.stderr)
+        return 1
     if os.path.isdir(dest):
         shutil.rmtree(dest)
     os.makedirs(dest)
@@ -494,7 +536,12 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="capture one session into scratch")
-    pr.add_argument("--name", required=True, help="session name (fixture dir)")
+    pr.add_argument(
+        "--name",
+        required=True,
+        type=session_name_arg,
+        help="session name / fixture dir ([a-z0-9][a-z0-9-]*)",
+    )
     pr.add_argument("--description", default="", help="one-line session summary")
     pr.add_argument("--server-bin", required=True)
     pr.add_argument("--client-bin", required=True)
@@ -543,8 +590,10 @@ def main(argv=None):
     pe.add_argument(
         "--range",
         default=None,
-        metavar="START:END",
-        help="packet index range to export (default: all)",
+        metavar="START:END[,START:END...]",
+        help="packet index range(s) to export, comma-separated "
+        "(default: all). Indices come from the capture's packets.jsonl "
+        "and drift between runs — inspect before exporting.",
     )
     pe.set_defaults(func=cmd_export)
 
