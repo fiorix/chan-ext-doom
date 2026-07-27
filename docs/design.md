@@ -56,7 +56,7 @@ Nothing in `crates/` may depend on chan. chan is the first consumer, not a depen
 
 ## Crate shape
 
-**`doom-proto`** — encode/decode for the chocolate wire format: packet header and `NET_PACKET_TYPE_*` family, connect/accept handshake, GAMESTART settings, full-ticcmd fan-out, keepalive/disconnect. Explicit little-endian reads/writes, no transmute, no C-layout structs. No I/O, no async. This is the piece that must be byte-exact, so it is the piece that is easiest to test: golden packets captured from real chocolate-doom ↔ chocolate-server sessions, plus fuzzing. (Small: the packet zoo is a few dozen variants; a ticcmd is ~8 bytes.)
+**`doom-proto`** — encode/decode for the chocolate wire format: packet header and `NET_PACKET_TYPE_*` family, connect/accept handshake, GAMESTART settings, full-ticcmd fan-out, keepalive/disconnect. Explicit big-endian reads/writes for Chocolate packet fields, no transmute, no C-layout structs. (The separate Cloudflare WebSocket route envelope is little-endian.) No I/O, no async. This is the piece that must be byte-exact, so it is the piece that is easiest to test: golden packets captured from real chocolate-doom ↔ chocolate-server sessions, plus fuzzing. (Small: the packet zoo is a few dozen variants; a ticcmd is ~8 bytes.)
 
 **`doom-server`** — the core deliverable. Two layers:
 
