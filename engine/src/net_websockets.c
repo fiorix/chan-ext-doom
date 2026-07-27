@@ -50,6 +50,9 @@ typedef struct
     uint32_t node;
 } addrpair_t;
 
+// WS_CLOSED means "not created yet" and is never re-entered. Any failure
+// after that is terminal for this module instance: see ShutdownSocket.
+
 typedef enum
 {
     WS_CLOSED,
@@ -219,6 +222,40 @@ static void SetLocalNode(uint32_t node)
 // WebSocket callbacks
 //
 
+// Failure is terminal for this module instance, and deliberately so.
+//
+// An in-place reconnect would have to close the old handle, drain the ring
+// without discarding live packets, and keep callbacks from the dead handle
+// away from the state the replacement uses. That is a lot of hazard for no
+// benefit here: the host page's model is that a relaunch tears down the
+// whole WASM instance, so a session that loses its socket is over. Making
+// that explicit beats a reconnect that half works.
+
+static void ShutdownSocket(void)
+{
+    if (websocket > 0)
+    {
+        emscripten_websocket_close(websocket, 1000, "shutting down");
+        emscripten_websocket_delete(websocket);
+        websocket = 0;
+    }
+
+    // Anything queued belonged to the session that just ended. Freeing it
+    // here is why InitWebSockets never re-initialises a live ring.
+
+    NET_WS_QueueDrain(&recv_queue);
+
+    ws_state = WS_FAILED;
+}
+
+// Events from a handle we have already discarded must not touch the state
+// the module is using now.
+
+static boolean StaleEvent(EMSCRIPTEN_WEBSOCKET_T socket)
+{
+    return websocket <= 0 || socket != websocket;
+}
+
 static void SendAnnounce(void)
 {
     byte frame[NET_WS_SEND_HEADER];
@@ -237,6 +274,11 @@ static void SendAnnounce(void)
 static EM_BOOL OnOpen(int eventType, const EmscriptenWebSocketOpenEvent *e,
                       void *userData)
 {
+    if (StaleEvent(e->socket))
+    {
+        return EM_TRUE;
+    }
+
     ws_state = WS_OPEN;
     printf("NET_Websockets: connected as node %u\n", local_node);
 
@@ -252,14 +294,15 @@ static EM_BOOL OnOpen(int eventType, const EmscriptenWebSocketOpenEvent *e,
 static EM_BOOL OnClose(int eventType, const EmscriptenWebSocketCloseEvent *e,
                        void *userData)
 {
+    if (StaleEvent(e->socket))
+    {
+        return EM_TRUE;
+    }
+
     printf("NET_Websockets: closed (clean=%d code=%d reason=%s)\n",
            e->wasClean, e->code, e->reason);
 
-    ws_state = WS_CLOSED;
-
-    // Anything still queued belongs to the session that just ended.
-
-    NET_WS_QueueDrain(&recv_queue);
+    ShutdownSocket();
 
     return EM_TRUE;
 }
@@ -267,8 +310,13 @@ static EM_BOOL OnClose(int eventType, const EmscriptenWebSocketCloseEvent *e,
 static EM_BOOL OnError(int eventType, const EmscriptenWebSocketErrorEvent *e,
                        void *userData)
 {
+    if (StaleEvent(e->socket))
+    {
+        return EM_TRUE;
+    }
+
     printf("NET_Websockets: socket error\n");
-    ws_state = WS_FAILED;
+    ShutdownSocket();
     return EM_TRUE;
 }
 
@@ -279,6 +327,11 @@ static EM_BOOL OnMessage(int eventType, const EmscriptenWebSocketMessageEvent *e
     const byte *payload;
     size_t payload_len;
     uint32_t from;
+
+    if (StaleEvent(e->socket))
+    {
+        return EM_TRUE;
+    }
 
     if (e->isText)
     {
@@ -428,6 +481,17 @@ static void NET_Websockets_SendPacket(net_addr_t *addr, net_packet_t *packet)
         return;
     }
 
+    // Checked before the addition and before the allocation. Deferring this
+    // to NET_WS_BuildFrame would mean sizing and allocating a buffer for a
+    // packet already known to be unsendable, which is what the frame bound
+    // exists to prevent.
+
+    if (packet->len > NET_WS_MAX_FRAME - NET_WS_SEND_HEADER)
+    {
+        ++drops_bad_frame;
+        return;
+    }
+
     to = *((uint32_t *)addr->handle);
     capacity = packet->len + NET_WS_SEND_HEADER;
     frame = Z_Malloc(capacity, PU_STATIC, 0);
@@ -437,8 +501,8 @@ static void NET_Websockets_SendPacket(net_addr_t *addr, net_packet_t *packet)
 
     if (frame_len == 0)
     {
-        // Only reachable if the packet exceeds the frame bound, which means
-        // a caller bug rather than anything the peer did.
+        // Unreachable given the check above; kept so a future change to
+        // either bound cannot turn into a silent truncation.
 
         ++drops_bad_frame;
         Z_Free(frame);
@@ -447,11 +511,8 @@ static void NET_Websockets_SendPacket(net_addr_t *addr, net_packet_t *packet)
 
     if (emscripten_websocket_send_binary(websocket, frame, frame_len) < 0)
     {
-        // The socket is gone. Mark it closed so the next call reconnects
-        // instead of sending into a dead handle forever.
-
-        printf("NET_Websockets: send failed, dropping connection\n");
-        ws_state = WS_CLOSED;
+        printf("NET_Websockets: send failed, ending the session\n");
+        ShutdownSocket();
     }
 
     Z_Free(frame);
@@ -470,7 +531,13 @@ static boolean NET_Websockets_RecvPacket(net_addr_t **addr,
 
     *packet = (net_packet_t *)item;
     *addr = FindAddress(from);
-    NET_ReferenceAddress(*addr);
+
+    // Deliberately not referencing here. NET_RecvPacket in net_io.c takes
+    // the single reference that consumers release, and net_sdl and net_loop
+    // both leave it to the wrapper. Referencing here as well would leave one
+    // permanent reference per received packet, so an address could never
+    // return to the table and the table would grow without bound as node ids
+    // change. test/run.sh guards this.
 
     return true;
 }

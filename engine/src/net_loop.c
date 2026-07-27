@@ -52,7 +52,14 @@ static void QueuePush(packet_queue_t *queue, net_packet_t *packet)
     if (new_tail == queue->head)
     {
         // queue is full
-        
+
+        // Both call sites hand us a NET_PacketDup, so the packet is ours and
+        // dropping it means freeing it. Upstream returns here without doing
+        // so, leaking one packet per overflow. This transport carries the
+        // in-WASM host talking to its own client, so it is on the browser
+        // network path and the leak is reachable there.
+
+        NET_FreePacket(packet);
         return;
     }
 

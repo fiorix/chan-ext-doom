@@ -21,5 +21,29 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
 
 "$OUT/test_net_ws_frame"
 
+# The loopback transport owns the packets its callers dup into it, so its
+# overflow path is checked against a counting allocator.
+$CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
+    -Isrc -Isrc/doom \
+    src/net_loop.c src/net_packet.c test/test_net_loop.c \
+    -o "$OUT/test_net_loop"
+
+"$OUT/test_net_loop"
+
 # Mod ordering is loader-side, so it is tested where it lives.
 node test/test_mod_order.mjs
+
+# Address ownership contract, guarded mechanically because getting it wrong
+# is silent: NET_RecvPacket in net_io.c takes the one reference consumers
+# release, so a transport module that also references leaks one refcount per
+# received packet and its address table grows without bound. No transport
+# module may reference in its own RecvPacket.
+for mod in src/net_websockets.c src/net_sdl.c src/net_loop.c; do
+    if sed -n '/RecvPacket(net_addr_t \*\*addr/,/^}/p' "$mod" \
+        | grep -q NET_ReferenceAddress; then
+        echo "FAIL: $mod references the address in its own RecvPacket" >&2
+        echo "      net_io.c NET_RecvPacket already does; see net_sdl.c" >&2
+        exit 1
+    fi
+done
+echo "address ownership contract: 3 transport modules checked, 0 violations"
