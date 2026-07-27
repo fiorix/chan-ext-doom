@@ -102,19 +102,32 @@
 
 #include <inttypes.h>
 
-#if defined(__cplusplus) || defined(__bool_true_false_are_defined)
+// One fixed width, in every translation unit, whatever the include order.
+//
+// Upstream picks builtin bool whenever <stdbool.h> has already been seen and
+// a four-byte enum otherwise, which makes this type's ABI depend on what a
+// file happened to include first. That is not survivable here: g_game.c
+// reaches <emscripten.h>, and so stdbool.h, before these headers, while
+// p_setup.c reaches these headers first. player_t carries boolean members
+// (cards[], backpack, didsecret), so sizeof(player_t) differed between those
+// two objects, and a write to players[i] used one stride against an
+// allocation made with the other. That overruns into neighbouring globals:
+// it corrupted gameepisode and deathmatch, which surfaced far away as a demo
+// header recording the wrong level.
+//
+// int rather than bool keeps this lineage's historical four-byte layout, and
+// matches the enum branch's semantics exactly: neither normalises an
+// assignment to 0 or 1, so no existing code changes behaviour.
 
-// Use builtin bool type with C++.
+typedef int boolean;
 
-typedef bool boolean;
+#if !defined(__cplusplus) && !defined(__bool_true_false_are_defined)
 
-#else
+// stdbool.h defines these identically, so a later include of it is a legal
+// repeat definition rather than a conflict.
 
-typedef enum 
-{
-    false, 
-    true
-} boolean;
+#define false 0
+#define true 1
 
 #endif
 

@@ -19,6 +19,16 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
     src/net_ws_frame.c test/test_net_ws_frame.c \
     -o "$OUT/test_net_ws_frame"
 
+# boolean must have one ABI whatever the include order. Two objects reach
+# <stdbool.h> and the Doom headers in opposite orders and are linked together;
+# a split here silently changes sizeof(player_t) between objects.
+$CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
+    -Isrc -Isrc/doom \
+    test/test_abi_a.c test/test_abi_b.c test/test_abi.c \
+    -o "$OUT/test_abi"
+
+"$OUT/test_abi"
+
 "$OUT/test_net_ws_frame"
 
 # The loopback transport owns the packets its callers dup into it, so its

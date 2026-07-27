@@ -2256,12 +2256,14 @@ void G_BeginRecording (void)
 
     printf("DEMO CANARY: armed version=%d skill=%d episode=%d map=%d "
            "deathmatch=%d respawn=%d fast=%d nomonsters=%d consoleplayer=%d "
-           "playeringame=%d%d%d%d\n",
+           "playeringame=%d%d%d%d active=%d\n",
            (int) demobuffer[0], (int) gameskill, (int) gameepisode,
            (int) gamemap, (int) deathmatch, (int) respawnparm,
            (int) fastparm, (int) nomonsters, consoleplayer,
            playeringame[0], playeringame[1], playeringame[2],
-           playeringame[3]);
+           playeringame[3],
+           (playeringame[0] ? 1 : 0) + (playeringame[1] ? 1 : 0)
+         + (playeringame[2] ? 1 : 0) + (playeringame[3] ? 1 : 0));
 } 
  
 

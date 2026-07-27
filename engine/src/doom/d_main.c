@@ -433,6 +433,18 @@ boolean D_GrabMouseCallback(void)
 
 void D_DoomLoopIter()
 {
+    // The main loop is registered at the top of D_DoomMain, long before the
+    // game is ready, and Asyncify makes that reachable: every I_Sleep during
+    // the network connect and launch waits yields to the browser, which can
+    // dispatch this. Ticking then would run gameplay against half-built
+    // state. WebSocket callbacks keep arriving independently, which is the
+    // point of yielding; only the tics are held back.
+
+    if (!main_loop_started)
+    {
+        return;
+    }
+
     if (wipestart > 0)
     {
         D_Display();
@@ -515,8 +527,6 @@ void D_DoomLoop (void)
                " may cause demos and network games to get out of sync.\n");
     }
 
-    main_loop_started = true;
-
     I_SetWindowTitle(gamedescription);
     I_GraphicsCheckCommandLine();
     I_SetGrabMouseCallback(D_GrabMouseCallback);
@@ -534,6 +544,11 @@ void D_DoomLoop (void)
     {
         wipegamestate = gamestate;
     }
+
+    // Set last, not first. It is what releases D_DoomLoopIter, so anything
+    // above this line is startup that must complete before a tic can run.
+
+    main_loop_started = true;
 }
 
 
