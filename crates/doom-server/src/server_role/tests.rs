@@ -1968,3 +1968,37 @@ fn all_ready_excludes_disconnecting_peers() {
         "a draining peer must not block or count toward the start"
     );
 }
+
+#[test]
+fn disconnecting_drone_is_not_counted_in_waiting_data() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let drone = h.join("d");
+    h.syn(alice, "Alice");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_value("Observer", 0, 0, 1)),
+        },
+    );
+
+    // While the drone is connected it counts.
+    let data = h.role.waiting_data(alice);
+    assert_eq!(data.num_drones, 1);
+
+    // The player leaves: the game ends and the drone starts draining.
+    h.role.handle(T0, Input::Leave { player: alice });
+    assert!(matches!(
+        h.role.peers.get(&drone).expect("drone").conn,
+        super::Conn::Disconnecting { .. }
+    ));
+
+    // A new player connects: its first lobby update must not count the
+    // draining drone (NET_SV_NumDrones uses ClientConnected).
+    let carol = h.join("c");
+    h.syn(carol, "Carol");
+    let data = h.role.waiting_data(carol);
+    assert_eq!(data.num_drones, 0, "a disconnecting drone is not connected");
+}

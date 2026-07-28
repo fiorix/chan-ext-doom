@@ -1100,7 +1100,7 @@ impl ServerRole {
             num_drones: self
                 .peers
                 .values()
-                .filter(|peer| peer.syn && peer.drone)
+                .filter(|peer| peer.connected() && peer.drone)
                 .count() as u8,
             ready_players: self
                 .peers
