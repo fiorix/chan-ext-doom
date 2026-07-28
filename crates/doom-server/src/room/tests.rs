@@ -120,22 +120,6 @@ fn drain(host: &mut RoomHost<u32>, player: PlayerId) {
     while host.pop_outbound(player).is_some() {}
 }
 
-/// Drive a two-player room into InGame with extratics 1, wide codec.
-fn in_game_two() -> (RoomHost<u32>, PlayerId, PlayerId) {
-    let mut h = host(8);
-    let alice = join(&mut h);
-    let bob = join(&mut h);
-    h.packet(T0, alice, plain(), syn("Alice"));
-    h.packet(T0, bob, plain(), syn("Bob"));
-    launch(&mut h, alice);
-    ack(&mut h, alice, 1);
-    ack(&mut h, bob, 1);
-    gamestart(&mut h, alice, 1, 0);
-    gamestart(&mut h, bob, 0, 0);
-    assert_eq!(h.role.state(), ServerState::InGame);
-    (h, alice, bob)
-}
-
 #[test]
 fn join_then_syn_queues_accept_and_first_waiting_data_from_the_host() {
     let mut h = host(8);
