@@ -33,10 +33,15 @@ fn assert_round_trip(bytes: &[u8], file: &str) {
 }
 
 #[test]
-fn all_102_fixtures_decode_and_reencode_exactly() {
+fn all_fixtures_decode_and_reencode_exactly() {
     let manifest = fs::read_to_string(fixtures_dir().join("manifest.json")).expect("manifest");
     let entries = manifest_entries(&manifest);
-    assert_eq!(entries.len(), 102, "fixture count");
+    assert!(
+        entries.len() >= 102,
+        "corpus grew below the original baseline: {}",
+        entries.len()
+    );
+    println!("fixture corpus: {} packets", entries.len());
 
     for e in &entries {
         let bytes = read_fixture(&e.file);
@@ -153,6 +158,36 @@ fn rejected_round_trip() {
     let (hdr, decoded) = ServerPacket::decode(&bytes, false).expect("decode");
     assert_eq!(hdr, NO_RELIABLE);
     assert_eq!(decoded, pkt);
+}
+
+#[test]
+fn rejected_reason_must_terminate() {
+    // The captured REJECTED with its NUL stripped must not parse.
+    let rejected = read_fixture("rejected-in-game/273-s2c-client2-rejected.bin");
+    let nul = rejected
+        .iter()
+        .rposition(|&b| b == 0)
+        .expect("captured reason is terminated");
+    assert!(matches!(
+        ServerPacket::decode(&rejected[..nul], false),
+        Err(DecodeError::UnterminatedString { .. })
+    ));
+
+    // Truncations of the reason body must not parse either.
+    for cut in [2, 3, rejected.len() - 1] {
+        assert!(
+            ServerPacket::decode(&rejected[..cut], false).is_err(),
+            "REJECTED truncated to {cut} bytes must fail"
+        );
+    }
+
+    // A trailing byte after the terminator must not parse.
+    let mut padded = rejected.clone();
+    padded.push(0);
+    assert!(matches!(
+        ServerPacket::decode(&padded, false),
+        Err(DecodeError::TrailingBytes { .. })
+    ));
 }
 
 #[test]
