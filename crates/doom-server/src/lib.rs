@@ -4,7 +4,10 @@ mod core;
 pub mod room;
 mod runtime;
 pub mod server_role;
+mod udp;
 pub mod websocket;
+
+pub use runtime::serve;
 
 pub use core::{
     DEFAULT_OUTBOX_CAPACITY, HostError, HostOutcome, JoinError, MAX_PAYLOAD_LEN, MAX_PLAYERS,

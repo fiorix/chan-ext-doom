@@ -3,7 +3,6 @@
 //! permanently owned by the Rust server in every room; the old in-band
 //! reset marker is deleted, not disabled.
 
-use std::collections::HashMap;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-use crate::runtime::{Effects, Runtime, SharedState, timer_loop};
+use crate::runtime::{Effects, Runtime, SharedState};
 use crate::{MAX_PAYLOAD_LEN, PlayerId, RelayError, RoomName};
 
 pub(crate) use crate::runtime::{RouteId, SERVER_ROUTE};
@@ -26,7 +25,11 @@ pub(crate) use crate::runtime::{RouteId, SERVER_ROUTE};
 #[cfg(test)]
 pub(crate) use crate::runtime::classify_malformed;
 #[cfg(test)]
+pub(crate) use crate::runtime::timer_loop;
+#[cfg(test)]
 pub(crate) use crate::server_role::MalformedClass;
+#[cfg(test)]
+pub(crate) use std::collections::HashMap;
 #[cfg(test)]
 pub(crate) use tokio::sync::Mutex;
 #[cfg(test)]
@@ -42,20 +45,7 @@ type ServerState = SharedState;
 
 /// Serves named rooms at `/ws/{room}` until the listener shuts down.
 pub async fn serve(listener: TcpListener, outbox_capacity: NonZeroUsize) -> io::Result<()> {
-    let state = SharedState(Arc::new(tokio::sync::Mutex::new(Runtime {
-        rooms: HashMap::new(),
-        outbox_capacity,
-        started: tokio::time::Instant::now(),
-    })));
-    let router = router(state.clone());
-
-    // The timer's lifetime is the serve future's: neither future is
-    // detached, so aborting or dropping `serve` drops both.
-    let server = axum::serve(listener, router).into_future();
-    tokio::select! {
-        result = server => result,
-        () = timer_loop(state) => Ok(()),
-    }
+    crate::runtime::serve(listener, Vec::new(), outbox_capacity).await
 }
 
 /// The WebSocket router over the shared runtime state.
@@ -121,17 +111,19 @@ impl Runtime {
         };
         if destination.get() == SERVER_ROUTE {
             let now = self.now();
+            let notifier = self.udp_notifiers.get(room_name).cloned();
             let Some(room) = self.rooms.get_mut(room_name) else {
                 return Ok(Effects::default());
             };
             let effect = room.server_payload(now, player_id, envelope.payload);
-            return Ok(room.apply(effect));
+            return Ok(room.apply(effect, notifier.as_ref()));
         }
 
         let Some(recipient) = self.recipient(room_name, destination) else {
             return Ok(Effects::default());
         };
         let now = self.now();
+        let notifier = self.udp_notifiers.get(room_name).cloned();
         let room = self
             .rooms
             .get_mut(room_name)
@@ -139,7 +131,7 @@ impl Runtime {
         let (_, effect) =
             room.host
                 .relay(now, player_id, recipient, envelope.from, envelope.payload)?;
-        Ok(room.apply(effect))
+        Ok(room.apply(effect, notifier.as_ref()))
     }
 }
 
@@ -380,6 +372,7 @@ mod tests {
             rooms: HashMap::new(),
             outbox_capacity: NonZeroUsize::new(capacity).expect("test capacity is nonzero"),
             started: Instant::now(),
+            udp_notifiers: HashMap::new(),
         }
     }
 

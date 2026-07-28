@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 
@@ -31,10 +32,50 @@ pub(crate) const TIMER_PERIOD: std::time::Duration = std::time::Duration::from_m
 #[derive(Clone)]
 pub(crate) struct SharedState(pub(crate) Arc<Mutex<Runtime>>);
 
+/// The composition root: one shared runtime, one bounded timer, the
+/// WebSocket router, and every configured UDP listener, with no future
+/// detached, so cancelling or dropping the serve future cancels all of
+/// them together.
+pub async fn serve(
+    listener: TcpListener,
+    udp_listeners: Vec<(RoomName, tokio::net::UdpSocket)>,
+    outbox_capacity: NonZeroUsize,
+) -> std::io::Result<()> {
+    let state = SharedState(Arc::new(Mutex::new(Runtime {
+        rooms: HashMap::new(),
+        outbox_capacity,
+        started: Instant::now(),
+        udp_notifiers: HashMap::new(),
+    })));
+    let router = crate::websocket::router(state.clone());
+    let server = axum::serve(listener, router).into_future();
+    let timer = timer_loop(state.clone());
+    let udp = async move {
+        futures_util::future::join_all(
+            udp_listeners
+                .into_iter()
+                .map(|(room_name, socket)| crate::udp::listener(socket, room_name, state.clone())),
+        )
+        .await;
+        // No UDP listener ever completes normally, and an empty list
+        // must not end the serve future.
+        futures_util::future::pending::<()>().await
+    };
+    tokio::select! {
+        result = server => result,
+        () = timer => Ok(()),
+        _ = udp => Ok(()),
+    }
+}
+
 pub(crate) struct Runtime {
     pub(crate) rooms: HashMap<RoomName, BindRoom>,
     pub(crate) outbox_capacity: NonZeroUsize,
     pub(crate) started: Instant,
+    /// UDP listener notifiers by pinned room name, independent of the
+    /// room hosts' lifetime: a pinned room still drops when empty, so
+    /// a reconnect always starts a fresh role.
+    pub(crate) udp_notifiers: HashMap<RoomName, Arc<Notify>>,
 }
 
 /// One named room across all transports: the shared host plus the
@@ -47,8 +88,6 @@ pub(crate) struct BindRoom {
     /// reduction as the registry removal, without consulting the role.
     pub(crate) udp_players: HashMap<PlayerId, SocketAddr>,
     pub(crate) udp_addresses: HashMap<SocketAddr, PlayerId>,
-    /// The room's UDP listener notifier, registered by its task.
-    pub(crate) udp_notifier: Option<Arc<Notify>>,
     /// Datagrams captured at removal time (the removed peer's remaining
     /// outbox and its terminal, terminal last). Bounded per removal by
     /// the removed peer's own bounded outbox; drained by the listener.
@@ -70,12 +109,16 @@ pub(crate) struct Effects {
     pub(crate) ws_waiters: Vec<Arc<Notify>>,
     /// UDP room notifiers to wake so the listener drains and sends.
     pub(crate) udp_waiters: Vec<Arc<Notify>>,
+    /// Datagrams to send immediately, outside any room state (the
+    /// stateless QUERY reply).
+    pub(crate) direct_udp: Vec<(SocketAddr, Vec<u8>)>,
 }
 
 impl Effects {
     pub(crate) fn merge(&mut self, other: Effects) {
         self.ws_waiters.extend(other.ws_waiters);
         self.udp_waiters.extend(other.udp_waiters);
+        self.direct_udp.extend(other.direct_udp);
     }
 }
 
@@ -91,7 +134,6 @@ impl BindRoom {
             routes: HashMap::new(),
             udp_players: HashMap::new(),
             udp_addresses: HashMap::new(),
-            udp_notifier: None,
             pending_udp: std::collections::VecDeque::new(),
         }
     }
@@ -126,17 +168,25 @@ impl BindRoom {
     /// removals capture every already-owed datagram first and the
     /// terminal last into the bounded pending queue, drop the address
     /// mapping in the same batch, and wake the listener to send.
-    pub(crate) fn apply(&mut self, effect: HostEffect) -> Effects {
+    pub(crate) fn apply(
+        &mut self,
+        effect: HostEffect,
+        udp_notifier: Option<&Arc<Notify>>,
+    ) -> Effects {
         let mut effects = Effects::default();
+        let notify_udp = |effects: &mut Effects| {
+            if let Some(notifier) = udp_notifier
+                && !effects.udp_waiters.iter().any(|w| Arc::ptr_eq(w, notifier))
+            {
+                effects.udp_waiters.push(Arc::clone(notifier));
+            }
+        };
         for player in effect.wakes {
             if let Some(connection) = self.connections.get(&player) {
                 effects.ws_waiters.push(Arc::clone(&connection.waiter));
             }
-            if self.udp_players.contains_key(&player)
-                && let Some(notifier) = &self.udp_notifier
-                && !effects.udp_waiters.iter().any(|w| Arc::ptr_eq(w, notifier))
-            {
-                effects.udp_waiters.push(Arc::clone(notifier));
+            if self.udp_players.contains_key(&player) {
+                notify_udp(&mut effects);
             }
         }
         for (player, terminal) in effect.disconnects {
@@ -157,11 +207,7 @@ impl BindRoom {
                 if let Some(terminal) = terminal {
                     self.pending_udp.push_back((address, terminal));
                 }
-                if let Some(notifier) = &self.udp_notifier
-                    && !effects.udp_waiters.iter().any(|w| Arc::ptr_eq(w, notifier))
-                {
-                    effects.udp_waiters.push(Arc::clone(notifier));
-                }
+                notify_udp(&mut effects);
             }
         }
         effects
@@ -186,6 +232,7 @@ impl Runtime {
         waiter: Arc<Notify>,
     ) -> Result<(PlayerId, Effects), JoinError> {
         let now = self.now();
+        let notifier = self.udp_notifiers.get(&room_name).cloned();
         let room = self.room_or_insert(&room_name);
         let (player, effect) = room
             .host
@@ -198,7 +245,7 @@ impl Runtime {
                 terminal: None,
             },
         );
-        Ok((player, room.apply(effect)))
+        Ok((player, room.apply(effect, notifier.as_ref())))
     }
 
     /// Transport hangup or binding-initiated removal: the room host's
@@ -213,7 +260,8 @@ impl Runtime {
             return effects;
         };
         let effect = room.host.leave(now, player_id);
-        effects.merge(room.apply(effect));
+        let notifier = self.udp_notifiers.get(room_name).cloned();
+        effects.merge(room.apply(effect, notifier.as_ref()));
         if let Some(connection) = room.connections.remove(&player_id) {
             if let Some(route) = connection.route {
                 room.routes.remove(&route);
@@ -235,7 +283,8 @@ impl Runtime {
         let mut empty = Vec::new();
         for (room_name, room) in &mut self.rooms {
             let effect = room.host.tick(now);
-            effects.merge(room.apply(effect));
+            let notifier = self.udp_notifiers.get(room_name).cloned();
+            effects.merge(room.apply(effect, notifier.as_ref()));
             if room.is_empty() {
                 empty.push(room_name.clone());
             }
