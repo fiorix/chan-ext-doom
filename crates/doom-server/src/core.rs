@@ -17,6 +17,16 @@ pub const MAX_ROOM_NAME_LEN: usize = 64;
 /// Maximum opaque packet size accepted by the room core.
 pub const MAX_PAYLOAD_LEN: usize = 65_527;
 
+/// The largest legitimate host-originated batch one atomic reduction
+/// can queue for a single recipient, measured from the accepted
+/// protocol semantics: 64 contiguous expired resend runs in a 128-slot
+/// window, plus at most 40 replayed unacknowledged tics (the 40-tic
+/// stall guard), one deadlock request, one pump emission, one reliable
+/// retry, and one keepalive. Host batches are producer-bounded, so the
+/// effective memory bound per member is
+/// `outbox_capacity + MAX_HOST_BATCH` (64 + 108 = 172 with defaults).
+pub const MAX_HOST_BATCH: usize = 108;
+
 /// A validated room name.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RoomName(String);
@@ -191,6 +201,11 @@ pub struct Registry<Metadata = ()> {
     memberships: HashMap<PlayerId, RoomName>,
     next_player_id: Option<NonZeroU64>,
     outbox_capacity: NonZeroUsize,
+    /// Outbox occupancy at the start of the active host-originated
+    /// batch, while one runs. Slow-consumer removal for host sends is
+    /// measured against this snapshot: a single bounded producer batch
+    /// is never counted as consumer backlog.
+    host_batch_backlog: Option<Vec<(PlayerId, usize)>>,
 }
 
 impl<Metadata> Registry<Metadata> {
@@ -201,7 +216,33 @@ impl<Metadata> Registry<Metadata> {
             memberships: HashMap::new(),
             next_player_id: NonZeroU64::new(1),
             outbox_capacity,
+            host_batch_backlog: None,
         }
+    }
+
+    /// Marks the start of one atomic host-originated batch: removals
+    /// for host sends are measured against outbox occupancy now, so a
+    /// valid producer batch cannot trip the slow-consumer bound. The
+    /// consumer still proves backlog across the boundary: a member at
+    /// capacity at this moment is removed by its next host send, and an
+    /// overflow left undrained at batch end is measured by the next
+    /// batch's snapshot.
+    pub fn begin_host_batch(&mut self) {
+        let backlog = self
+            .rooms
+            .values()
+            .flat_map(|room| {
+                room.players
+                    .iter()
+                    .map(|(player_id, player)| (*player_id, player.outbox.len()))
+            })
+            .collect();
+        self.host_batch_backlog = Some(backlog);
+    }
+
+    /// Ends the active host-originated batch.
+    pub fn end_host_batch(&mut self) {
+        self.host_batch_backlog = None;
     }
 
     /// Joins a room, creating it when necessary.
@@ -317,19 +358,48 @@ impl<Metadata> Registry<Metadata> {
                 .memberships
                 .get(&recipient)
                 .ok_or(HostError::UnknownPlayer)?;
-            let recipient_player = self
-                .rooms
-                .get_mut(room_name)
-                .expect("a membership always points to an existing room")
-                .players
-                .get_mut(&recipient)
-                .expect("a membership always points to an existing player");
-            if recipient_player.outbox.len() < self.outbox_capacity.get() {
-                recipient_player.outbox.push_back(OutboundPacket {
-                    metadata,
-                    payload: payload.to_vec(),
-                });
-                return Ok(HostOutcome::Queued(recipient));
+            // Inside a host batch the removal decision was made by the
+            // batch-start snapshot; the producer's own bounded batch
+            // (`MAX_HOST_BATCH`) bounds growth here. Outside a batch,
+            // fall back to the per-packet measurement.
+            if let Some(backlog) = &self.host_batch_backlog {
+                let backlogged = backlog
+                    .iter()
+                    .find(|(player_id, _)| *player_id == recipient)
+                    .is_some_and(|(_, len)| *len >= self.outbox_capacity.get());
+                if !backlogged {
+                    let recipient_player = self
+                        .rooms
+                        .get_mut(room_name)
+                        .expect("a membership always points to an existing room")
+                        .players
+                        .get_mut(&recipient)
+                        .expect("a membership always points to an existing player");
+                    recipient_player.outbox.push_back(OutboundPacket {
+                        metadata,
+                        payload: payload.to_vec(),
+                    });
+                    debug_assert!(
+                        recipient_player.outbox.len() < self.outbox_capacity.get() + MAX_HOST_BATCH,
+                        "the documented memory bound holds for a producer-bounded batch"
+                    );
+                    return Ok(HostOutcome::Queued(recipient));
+                }
+            } else {
+                let recipient_player = self
+                    .rooms
+                    .get_mut(room_name)
+                    .expect("a membership always points to an existing room")
+                    .players
+                    .get_mut(&recipient)
+                    .expect("a membership always points to an existing player");
+                if recipient_player.outbox.len() < self.outbox_capacity.get() {
+                    recipient_player.outbox.push_back(OutboundPacket {
+                        metadata,
+                        payload: payload.to_vec(),
+                    });
+                    return Ok(HostOutcome::Queued(recipient));
+                }
             }
         }
 
@@ -648,6 +718,80 @@ mod tests {
         );
         assert!(registry.pop_outbound(recipient).is_none());
         assert!(registry.contains(recipient));
+    }
+
+    #[test]
+    fn host_batch_queues_past_capacity_and_removes_only_across_the_boundary() {
+        let mut registry = registry_with_capacity(64);
+        let player = registry.join(room()).expect("player joins");
+
+        // From an empty outbox, one valid batch may exceed the
+        // configured capacity up to the producer's own measured bound:
+        // the batch is producer-bounded, not consumer backlog.
+        registry.begin_host_batch();
+        for _ in 0..MAX_HOST_BATCH {
+            assert_eq!(
+                registry
+                    .queue_host(player, 1, b"burst")
+                    .expect("batch queue succeeds"),
+                HostOutcome::Queued(player)
+            );
+        }
+        registry.end_host_batch();
+
+        // Left undrained, the overflow is consumer backlog proven at
+        // the next batch start: the next host send removes the member.
+        registry.begin_host_batch();
+        assert_eq!(
+            registry
+                .queue_host(player, 1, b"next")
+                .expect("removal applies the policy"),
+            HostOutcome::SlowConsumerDisconnected(player)
+        );
+        registry.end_host_batch();
+        assert!(!registry.contains(player));
+    }
+
+    #[test]
+    fn host_batch_boundary_is_the_pre_batch_occupancy() {
+        let mut registry = registry_with_capacity(2);
+        let player = registry.join(room()).expect("player joins");
+
+        // One below capacity at batch start: the whole batch queues.
+        registry
+            .queue_host(player, 1, b"one")
+            .expect("pre-fill queues");
+        registry.begin_host_batch();
+        for _ in 0..5 {
+            assert_eq!(
+                registry
+                    .queue_host(player, 1, b"burst")
+                    .expect("batch queue succeeds"),
+                HostOutcome::Queued(player)
+            );
+        }
+        registry.end_host_batch();
+
+        // At capacity at batch start: the next host send removes.
+        let drained: Vec<_> = (0..6)
+            .map(|_| registry.pop_outbound(player).expect("six packets pending"))
+            .collect();
+        assert_eq!(drained.len(), 6);
+        registry
+            .queue_host(player, 1, b"one")
+            .expect("pre-fill queues");
+        registry
+            .queue_host(player, 1, b"two")
+            .expect("pre-fill queues");
+        registry.begin_host_batch();
+        assert_eq!(
+            registry
+                .queue_host(player, 1, b"overflow")
+                .expect("removal applies the policy"),
+            HostOutcome::SlowConsumerDisconnected(player)
+        );
+        registry.end_host_batch();
+        assert!(!registry.contains(player));
     }
 
     #[test]

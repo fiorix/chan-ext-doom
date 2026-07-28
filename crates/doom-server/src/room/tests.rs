@@ -70,6 +70,24 @@ fn settings(deathmatch: u8, lowres_turn: u8) -> GameSettings {
     }
 }
 
+fn diff(forward: i8) -> doom_proto::TiccmdDiff {
+    doom_proto::TiccmdDiff {
+        forward: Some(forward),
+        ..Default::default()
+    }
+}
+
+fn upload(ack: u8, start: u8, tics: Vec<(i16, doom_proto::TiccmdDiff)>) -> ClientPacket {
+    ClientPacket::GameData(doom_proto::GameDataClient {
+        ack,
+        start,
+        tics: tics
+            .into_iter()
+            .map(|(latency, diff)| doom_proto::ClientTic { latency, diff })
+            .collect(),
+    })
+}
+
 fn plain() -> WireHeader {
     WireHeader { reliable_seq: None }
 }
@@ -342,6 +360,73 @@ fn terminal_rejection_rides_the_disconnect_effect_not_the_outbox() {
     let (_, packet) = pop(&mut h, alice);
     assert!(matches!(packet, ServerPacket::Rejected { .. }));
     assert!(h.contains(alice));
+}
+
+#[test]
+fn valid_timer_batch_never_counts_as_consumer_backlog() {
+    let mut h = host(64);
+    let alice = join(&mut h);
+    h.packet(T0, alice, plain(), syn("Alice"));
+    launch(&mut h, alice);
+    ack(&mut h, alice, 1);
+    ack(&mut h, alice, 2);
+    gamestart(&mut h, alice, 1, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    // The authoritative GAMESTART stays the unacknowledged reliable
+    // head; everything else is drained.
+    drain(&mut h, alice);
+
+    // Seed the 64 alternating missing slots 0,2,...,126 through valid
+    // odd-slot uploads, draining every resulting request immediately:
+    // every even slot ends up missing and stamped, just past expiry.
+    for start in (1..=127u8).step_by(2) {
+        let effect = h.packet(T0, alice, plain(), upload(0, start, vec![(1, diff(1))]));
+        assert!(effect.disconnects.is_empty());
+        drain(&mut h, alice);
+    }
+    assert!(
+        h.pop_outbound(alice).is_none(),
+        "outbox is empty before the tick"
+    );
+
+    // Refresh the deadlock clock at +1000 ms without a send: a
+    // duplicate upload onto an active slot stores (resetting the
+    // clock) and requests nothing, since the slot behind it is already
+    // stamped. Then tick at +1001: keepalive, the GAMESTART retry, the
+    // pump, and the 64 expired contiguous resend runs are one valid
+    // producer batch.
+    let effect = h.packet(
+        Milliseconds(T0.0 + 1_000),
+        alice,
+        plain(),
+        upload(0, 1, vec![(9, diff(9))]),
+    );
+    assert_eq!(effect, HostEffect::default());
+    let effect = h.tick(Milliseconds(T0.0 + 1_001));
+
+    assert!(effect.disconnects.is_empty(), "no valid peer is removed");
+    assert!(h.contains(alice));
+
+    let mut resends = 0;
+    let mut retries = 0;
+    let mut keepalives = 0;
+    let mut gamedata = 0;
+    while let Some(packet) = h.pop_outbound(alice) {
+        match ServerPacket::decode(packet.payload(), false)
+            .expect("decodes")
+            .1
+        {
+            ServerPacket::GameDataResend { .. } => resends += 1,
+            ServerPacket::GameStart(_) => retries += 1,
+            ServerPacket::Keepalive => keepalives += 1,
+            ServerPacket::GameData(_) => gamedata += 1,
+            other => panic!("unexpected packet {other:?}"),
+        }
+    }
+    assert_eq!(resends, 64, "every expired run re-requests");
+    assert_eq!(retries, 1);
+    assert_eq!(keepalives, 1);
+    assert_eq!(gamedata, 1);
 }
 
 #[test]

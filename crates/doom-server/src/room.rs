@@ -200,6 +200,12 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         removals: Vec<PlayerId>,
         actions: Vec<Action>,
     ) -> HostEffect {
+        // One reduction is one atomic producer batch: consumer backlog
+        // is measured at this moment, never per packet inside the
+        // batch, so a valid burst (for example 64 contiguous expired
+        // resend runs plus the pump/retry/keepalive of one timer pass)
+        // cannot disconnect a draining peer.
+        self.registry.begin_host_batch();
         let mut effect = HostEffect::default();
         let mut removals = removals;
         let mut pending = actions;
@@ -266,6 +272,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                 effect.disconnects.push((player, None));
             }
         }
+        self.registry.end_host_batch();
         effect
     }
 }
