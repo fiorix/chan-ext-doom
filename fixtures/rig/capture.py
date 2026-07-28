@@ -576,7 +576,11 @@ def cmd_craft(args):
     """Build a documented probe packet (currently: a SYN with chosen
     gamemode/gamemission). The layout is exactly the c2s SYN documented
     in docs/protocol.md section 4, so the server's parser walks it like
-    a real client's packet and only the chosen fields differ."""
+    a real client's packet. Only the mode/mission fields are changed
+    deliberately; the WAD/DEH checksums can be copied from a real
+    packet, and the player class and name are deterministic craft
+    values, not the real client's (its class is uninitialized and its
+    name is random)."""
     wad_sha1 = bytes(20)
     deh_sha1 = bytes(20)
     if args.checksums_from:
@@ -714,8 +718,9 @@ def main(argv=None):
     pc.add_argument(
         "--checksums-from",
         default=None,
-        help="a real c2s SYN fixture to copy the wad/deh sha1 fields from, "
-        "so only the chosen fields differ from a real client packet",
+        help="a real c2s SYN fixture to copy the wad/deh sha1 fields from "
+        "(the mode/mission fields are then the only deliberate changes; "
+        "player class and name remain craft values, not the real client's)",
     )
     pc.add_argument("--out", required=True)
     pc.set_defaults(func=cmd_craft)

@@ -149,8 +149,13 @@ python3 fixtures/rig/capture.py run --name rejected-in-game \
   "--client-extra=-nodes 1" "--client2-extra=" --client2-delay 6 --duration 12 --sigterm-at 10
 
 # Cause 2 is a mismatched game mode/mission, which no two shareware
-# clients can produce; the rig crafts a documented SYN differing from a
-# real one only in gamemode/gamemission and injects it on a schedule.
+# clients can produce. The rig crafts a documented SYN: it copies the
+# real packet's WAD and DEH checksums, changes only the two
+# rejection-relevant fields (gamemode=2 commercial, gamemission=1
+# doom2), and supplies a deterministic player class and name that are
+# craft values, not the real client's (its class is uninitialized and
+# its name random). The upstream mode/mission check, not player
+# identity, produces the response.
 python3 fixtures/rig/capture.py craft --kind syn --gamemode 2 --gamemission 1 \
   --checksums-from fixtures/handshake-keepalive/000-c2s-client1-syn.bin \
   --out /tmp/doom-capture/crafted-syn.bin
@@ -158,7 +163,7 @@ python3 fixtures/rig/capture.py run --name rejected-game-mismatch \
   --description "crafted doom2/commercial SYN against a doom/shareware lobby; REJECTED 'Game mismatch'" \
   --server-bin $S --client-bin $C --iwad $W --out $O/rejected-game-mismatch \
   --signal none --duration 8 \
-  --inject "3:/tmp/doom-capture/crafted-syn.bin:crafted SYN per docs/protocol.md section 4 with only gamemode=2 and gamemission=1 changed; wad/deh sha1 reused from the real client SYN (handshake-keepalive/000)"
+  --inject "3:/tmp/doom-capture/crafted-syn.bin:crafted SYN per docs/protocol.md section 4: wad/deh sha1 copied from the real client SYN (handshake-keepalive/000); the two rejection-relevant fields changed deliberately (gamemode=2, gamemission=1); player_class=0 and name 'RigProbe' are deterministic craft choices, not the real client's values (its player_class is uninitialized and its name a random pet name)"
 ```
 
 Expected packet counts (timing-dependent, plus or minus a few): handshake-keepalive about 25, gamestart-gamedata about 550, drone-disconnect about 180, console-message about 315, query exactly 2, rejected-in-game about 560, rejected-game-mismatch about 27.

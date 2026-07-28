@@ -1,6 +1,6 @@
 {
   "name": "rejected-game-mismatch",
-  "description": "lobby client adopts doom/shareware; injected crafted SYN with gamemode=2 commercial gamemission=1 doom2 (all other fields identical to a real SYN); server replies REJECTED 'Game mismatch' (net_server.c:763-776)",
+  "description": "lobby client adopts doom/shareware; injected crafted SYN (documented section-4 layout; wad/deh checksums copied from the real client SYN; gamemode=2 commercial and gamemission=1 doom2 set deliberately; deterministic player_class=0 and name 'RigProbe', not the real client's values); server replies REJECTED 'Game mismatch' (net_server.c:763-776)",
   "captured_at": "2026-07-28T10:05:17.722602+00:00",
   "source": {
     "project": "chocolate-doom",
@@ -64,7 +64,7 @@
       "file": "/tmp/doom-capture/crafted-syn.bin",
       "sha256": "1d4965b9ab70682ad40364aff1d7ecddc95322930b646a9e006cb7ac5c4aeecc",
       "peer": "client2",
-      "note": "crafted SYN per docs/protocol.md section 4 with only gamemode=2 and gamemission=1 changed; wad/deh sha1 reused from the real client SYN (handshake-keepalive/000)"
+      "note": "crafted SYN per docs/protocol.md section 4: wad/deh sha1 copied from the real client SYN (handshake-keepalive/000); the two rejection-relevant fields changed deliberately (gamemode=2, gamemission=1); player_class=0 and name 'RigProbe' are deterministic craft choices, not the real client's values (its player_class is uninitialized and its name a random pet name)"
     }
   ],
   "exported_range": "0:3,10:12"
