@@ -24,7 +24,7 @@ use crate::{MAX_PAYLOAD_LEN, PlayerId, RelayError, RoomName};
 pub(crate) use crate::runtime::{RouteId, SERVER_ROUTE};
 
 #[cfg(test)]
-pub(crate) use crate::runtime::{OLD_SYN_MAGIC, classify_malformed};
+pub(crate) use crate::runtime::classify_malformed;
 #[cfg(test)]
 pub(crate) use crate::server_role::MalformedClass;
 #[cfg(test)]
