@@ -405,6 +405,17 @@ impl ServerRole {
         self.state
     }
 
+    /// The room's authoritative `lowres_turn` codec context: wide until
+    /// the controller's settings are adopted at GAMESTART, then their
+    /// negotiated value. The binding decodes and encodes every GAMEDATA
+    /// family packet with exactly this value; it must never infer width
+    /// from payload length or a client-local flag.
+    pub fn lowres_turn(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| settings.lowres_turn != 0)
+    }
+
     /// Number of admitted peers (players plus drones).
     pub fn peer_count(&self) -> usize {
         self.peers.len()

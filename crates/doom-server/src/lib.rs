@@ -1,6 +1,7 @@
 //! Sans-I/O room and server-role state machines for DOOM multiplayer.
 
 mod core;
+pub mod room;
 pub mod server_role;
 pub mod websocket;
 
