@@ -357,3 +357,1245 @@ impl Runtime {
         (out, effects)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::JoinError;
+    use crate::runtime::{ListenerFuture, udp_supervisor};
+    use doom_proto::{ConnectData, FullTic, GameSettings, Syn, TiccmdDiff};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+    use tokio::time::{Instant, timeout};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    // --- helpers ----------------------------------------------------------
+
+    fn room() -> RoomName {
+        RoomName::try_from("e1m1").expect("valid room")
+    }
+
+    fn runtime() -> Runtime {
+        Runtime {
+            rooms: std::collections::HashMap::new(),
+            outbox_capacity: NonZeroUsize::new(16).expect("nonzero"),
+            started: Instant::now(),
+            next_listener: 0,
+            udp_notifiers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn syn(name: &str, lowres: u8) -> ClientPacket {
+        ClientPacket::Syn(Syn {
+            version: b"Chocolate Doom 3.1.1".to_vec(),
+            protocols: vec![b"CHOCOLATE_DOOM_0".to_vec()],
+            connect: ConnectData {
+                gamemode: 0,
+                gamemission: 0,
+                lowres_turn: lowres,
+                drone: 0,
+                max_players: 4,
+                is_freedoom: 0,
+                wad_sha1: [7; 20],
+                deh_sha1: [8; 20],
+                player_class: 0,
+            },
+            player_name: name.as_bytes().to_vec(),
+        })
+    }
+
+    fn syn_bytes(name: &str, mission: u8, mode: u8, lowres: u8) -> Vec<u8> {
+        let ClientPacket::Syn(mut value) = syn(name, lowres) else {
+            unreachable!()
+        };
+        value.connect.gamemission = mission;
+        value.connect.gamemode = mode;
+        ClientPacket::Syn(value)
+            .encode(WireHeader { reliable_seq: None }, false)
+            .expect("syn encodes")
+    }
+
+    fn settings_bytes(seq: u8, deathmatch: u8) -> Vec<u8> {
+        ClientPacket::GameStart(GameSettings {
+            ticdup: 1,
+            extratics: 1,
+            deathmatch,
+            nomonsters: 0,
+            fast_monsters: 0,
+            respawn_monsters: 0,
+            episode: 1,
+            map: 1,
+            skill: 2,
+            gameversion: 5,
+            lowres_turn: 0,
+            new_sync: 1,
+            timelimit: 0,
+            loadgame: -1,
+            random: 0,
+            consoleplayer: 0,
+            player_classes: vec![0],
+        })
+        .encode(
+            WireHeader {
+                reliable_seq: Some(seq),
+            },
+            false,
+        )
+        .expect("gamestart encodes")
+    }
+
+    fn launch_bytes(seq: u8) -> Vec<u8> {
+        ClientPacket::Launch
+            .encode(
+                WireHeader {
+                    reliable_seq: Some(seq),
+                },
+                false,
+            )
+            .expect("launch encodes")
+    }
+
+    fn ack_bytes(next_seq: u8) -> Vec<u8> {
+        ClientPacket::ReliableAck { next_seq }
+            .encode(WireHeader { reliable_seq: None }, false)
+            .expect("ack encodes")
+    }
+
+    fn fixture_syn() -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/handshake-keepalive/000-c2s-client1-syn.bin");
+        std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:23420".parse().expect("valid addr")
+    }
+
+    /// A fully populated vanilla diff: 8 bytes wide, 7 lowres, so the
+    /// three-player construction lands exactly on the oracle figures.
+    fn full_diff() -> TiccmdDiff {
+        TiccmdDiff {
+            forward: Some(1),
+            side: Some(1),
+            turn: Some(0x100),
+            buttons: Some(1),
+            consistancy: Some(1),
+            chatchar: Some(1),
+            ..Default::default()
+        }
+    }
+
+    /// A server GAMEDATA packet of `tics` full tics carrying two full
+    /// diffs each (the three-player recipient view): 19 bytes per tic
+    /// wide, 17 lowres, plus the 4-byte header.
+    fn gamedata(start: u8, tics: usize, lowres: bool) -> (Vec<u8>, GameDataServer) {
+        let data = GameDataServer {
+            start,
+            tics: (0..tics)
+                .map(|tic| FullTic {
+                    latency: tic as i16,
+                    players: vec![(0, full_diff()), (1, full_diff())],
+                })
+                .collect(),
+        };
+        let bytes = ServerPacket::GameData(data.clone())
+            .encode(WireHeader { reliable_seq: None }, lowres)
+            .expect("gamedata encodes");
+        (bytes, data)
+    }
+
+    struct MixedServer {
+        ws_addr: SocketAddr,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+        udp: UdpSocket,
+    }
+
+    async fn spawn_mixed(room: &str) -> MixedServer {
+        let room_name = RoomName::try_from(room).expect("valid room");
+        let ws_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ws listener binds");
+        let ws_addr = ws_listener.local_addr().expect("ws address");
+        let udp_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp listener binds");
+        let udp_addr = udp_socket.local_addr().expect("udp address");
+        let server = tokio::spawn(crate::runtime::serve(
+            ws_listener,
+            vec![(room_name, udp_socket)],
+            NonZeroUsize::new(64).expect("nonzero"),
+        ));
+        let udp = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("client socket binds");
+        udp.connect(udp_addr).await.expect("client connects");
+        MixedServer {
+            ws_addr,
+            server,
+            udp,
+        }
+    }
+
+    /// A WebSocket peer whose incoming frames are drained continuously
+    /// by a reader task, so a test never stalls the server writer with
+    /// an unread socket. Frames arrive raw (route, payload).
+    struct WsPeer {
+        out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        incoming: tokio::sync::mpsc::UnboundedReceiver<(u32, Vec<u8>)>,
+    }
+
+    async fn ws_connect(url: &str) -> WsPeer {
+        let (socket, _) = connect_async(url).await.expect("ws connects");
+        let (mut sink, mut stream) = socket.split();
+        let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx, incoming) = tokio::sync::mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    frame = out_rx.recv() => {
+                        let Some(frame) = frame else { break; };
+                        if sink.send(ClientMessage::Binary(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(ClientMessage::Binary(frame))) => {
+                                let from = u32::from_le_bytes(frame[..4].try_into().expect("route"));
+                                if in_tx.send((from, frame[4..].to_vec())).is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        });
+        WsPeer { out, incoming }
+    }
+
+    impl WsPeer {
+        fn send(&self, to: u32, from: u32, payload: &[u8]) {
+            self.out
+                .send(ws_frame(to, from, payload))
+                .expect("ws frame queues");
+        }
+
+        async fn try_next(&mut self, millis: u64) -> Option<(u32, Vec<u8>)> {
+            timeout(Duration::from_millis(millis), self.incoming.recv())
+                .await
+                .ok()
+                .flatten()
+        }
+
+        async fn next(&mut self, millis: u64) -> (u32, Vec<u8>) {
+            self.try_next(millis).await.expect("ws frame arrives")
+        }
+    }
+
+    async fn udp_recv(socket: &UdpSocket, millis: u64) -> Vec<u8> {
+        udp_try_recv(socket, millis)
+            .await
+            .expect("datagram arrives")
+    }
+
+    async fn udp_try_recv(socket: &UdpSocket, millis: u64) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 2048];
+        match timeout(Duration::from_millis(millis), socket.recv(&mut buf)).await {
+            Ok(Ok(len)) => {
+                buf.truncate(len);
+                Some(buf)
+            }
+            _ => None,
+        }
+    }
+
+    async fn udp_expect_silence(socket: &UdpSocket, millis: u64) {
+        let mut buf = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(millis), socket.recv(&mut buf))
+                .await
+                .is_err(),
+            "expected silence, got a datagram"
+        );
+    }
+
+    fn decode_server(bytes: &[u8], lowres: bool) -> ServerPacket {
+        ServerPacket::decode(bytes, lowres)
+            .expect("server packet decodes")
+            .1
+    }
+
+    fn ws_frame(to: u32, from: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(8 + payload.len());
+        frame.extend_from_slice(&to.to_le_bytes());
+        frame.extend_from_slice(&from.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    // --- runtime-level tests ----------------------------------------------
+
+    #[test]
+    fn udp_unknown_traffic_is_silent_and_never_admitted() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        for payload in [
+            // decodable non-SYN (keepalive), truncated bytes, an
+            // arbitrary-magic SYN shape, wrong-direction bytes, and an
+            // oversized original datagram
+            ClientPacket::Keepalive
+                .encode(WireHeader { reliable_seq: None }, false)
+                .expect("encodes"),
+            vec![0x06],
+            [vec![0x00, 0x00], b"JUNK".to_vec()].concat(),
+            ServerPacket::Keepalive
+                .encode(WireHeader { reliable_seq: None }, false)
+                .expect("encodes"),
+            vec![0xaa; MAX_DATAGRAM_LEN + 1],
+        ] {
+            let effects = rt.udp_datagram(listener, &room(), from, &payload);
+            assert!(effects.ws_waiters.is_empty());
+            assert!(effects.udp_waiters.is_empty());
+            assert!(effects.direct_udp.is_empty());
+        }
+        let bind_room = rt.rooms.get(&room());
+        assert!(
+            bind_room.is_none() || bind_room.expect("room").udp_addresses.is_empty(),
+            "no mapping was created"
+        );
+        // A later valid SYN from the same address is admitted normally.
+        let effects = rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        assert!(
+            !effects.udp_waiters.is_empty(),
+            "the admitted peer's listener is woken"
+        );
+        let bind_room = rt.rooms.get(&room()).expect("room exists");
+        assert_eq!(bind_room.udp_addresses.len(), 1);
+    }
+
+    #[test]
+    fn udp_disconnect_acks_then_unmaps_and_readmits_fresh() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        let first = rt.rooms[&room()].udp_addresses[&(listener, from)];
+        // Drain the accept/waiting so the acknowledgement below is
+        // unambiguous.
+        rt.drain_udp(listener, &room());
+
+        // The remote disconnect is acknowledged through the ordinary
+        // outbox path.
+        rt.udp_datagram(
+            listener,
+            &room(),
+            from,
+            &ClientPacket::Disconnect
+                .encode(WireHeader { reliable_seq: None }, false)
+                .expect("encodes"),
+        );
+        let (datagrams, _) = rt.drain_udp(listener, &room());
+        assert!(
+            datagrams.iter().any(|(a, bytes)| {
+                *a == from && matches!(decode_server(bytes, false), ServerPacket::DisconnectAck)
+            }),
+            "the disconnect is acknowledged"
+        );
+
+        // After the sleep the mapping is removed exactly once; whatever
+        // removal traffic was captured is attempted before re-admission.
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(6))
+            .expect("backdate the clock past the sleep");
+        rt.tick();
+        assert!(
+            rt.rooms
+                .get(&room())
+                .is_none_or(|bind_room| bind_room.udp_addresses.is_empty())
+        );
+        rt.drain_udp(listener, &room());
+        if let Some(bind_room) = rt.rooms.get(&room()) {
+            assert!(!bind_room.host.contains(first));
+        }
+
+        // A fresh SYN from the same address is a brand-new admission
+        // with no stale state: exactly one member, a fresh accept owed.
+        let effects = rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        assert!(!effects.udp_waiters.is_empty());
+        let bind_room = rt.rooms.get(&room()).expect("room readmits");
+        let second = bind_room.udp_addresses[&(listener, from)];
+        assert!(bind_room.host.contains(second));
+        let ServerPacket::QueryResponse(query) = bind_room.host.query_response() else {
+            panic!("query response")
+        };
+        assert_eq!(query.num_players, 1);
+    }
+
+    // --- H1: listener-scoped identity --------------------------------------
+
+    #[test]
+    fn listener_scoped_identity_shares_one_room_without_aliasing() {
+        let mut rt = runtime();
+        let (l1, _n1) = rt.register_listener();
+        let (l2, _n2) = rt.register_listener();
+        let from = addr();
+
+        // (a) The same remote address SYNs via both listeners of one
+        // room: two independent admissions with distinct PlayerIds.
+        rt.udp_datagram(l1, &room(), from, &fixture_syn());
+        rt.udp_datagram(l2, &room(), from, &fixture_syn());
+        let bind_room = rt.rooms.get(&room()).expect("room");
+        let p1 = bind_room.udp_addresses[&(l1, from)];
+        let p2 = bind_room.udp_addresses[&(l2, from)];
+        assert_ne!(p1, p2, "the two listeners never alias one PlayerId");
+        assert!(bind_room.host.contains(p1));
+        assert!(bind_room.host.contains(p2));
+        // (e) One shared role: the authoritative query response reports
+        // both peers of the single room.
+        let ServerPacket::QueryResponse(query) = bind_room.host.query_response() else {
+            panic!("query response")
+        };
+        assert_eq!(query.num_players, 2);
+
+        // (b) Bytes via l2 from an address admitted only on l1 are
+        // unknown-address traffic there, never attributed to the l1
+        // peer and never admitted implicitly.
+        let other: SocketAddr = "127.0.0.1:29999".parse().expect("valid addr");
+        let keepalive = ClientPacket::Keepalive
+            .encode(WireHeader { reliable_seq: None }, false)
+            .expect("encodes");
+        let effects = rt.udp_datagram(l2, &room(), other, &keepalive);
+        assert!(effects.ws_waiters.is_empty());
+        assert!(effects.udp_waiters.is_empty());
+        assert!(effects.direct_udp.is_empty());
+        assert!(!rt.rooms[&room()].udp_addresses.contains_key(&(l2, other)));
+
+        // (d) Removal of (l1, from) leaves (l2, from) fully intact, and
+        // draining the removed peer's batch disturbs nothing else.
+        rt.leave(&room(), p1);
+        rt.drain_udp(l1, &room());
+        let bind_room = rt.rooms.get(&room()).expect("room stays alive");
+        assert!(!bind_room.udp_addresses.contains_key(&(l1, from)));
+        assert!(!bind_room.host.contains(p1));
+        assert!(bind_room.udp_addresses.contains_key(&(l2, from)));
+        assert!(bind_room.host.contains(p2));
+        let ServerPacket::QueryResponse(query) = bind_room.host.query_response() else {
+            panic!("query response")
+        };
+        assert_eq!(query.num_players, 1);
+    }
+
+    // --- H2: serve composition ---------------------------------------------
+
+    #[tokio::test]
+    async fn udp_supervisor_pends_with_no_listeners() {
+        assert!(
+            timeout(Duration::from_millis(200), udp_supervisor(Vec::new()))
+                .await
+                .is_err(),
+            "an empty listener list never resolves"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_supervisor_first_completion_ends_the_service() {
+        let done: ListenerFuture = Box::pin(async { Ok(()) });
+        let never: ListenerFuture = Box::pin(async {
+            futures_util::future::pending::<()>().await;
+            Ok(())
+        });
+        let result = timeout(Duration::from_secs(1), udp_supervisor(vec![done, never])).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "the first listener completion resolves the supervisor"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_supervisor_first_error_propagates() {
+        let failed: ListenerFuture =
+            Box::pin(async { Err(std::io::Error::other("listener socket died")) });
+        let never: ListenerFuture = Box::pin(async {
+            futures_util::future::pending::<()>().await;
+            Ok(())
+        });
+        let result = timeout(Duration::from_secs(1), udp_supervisor(vec![never, failed])).await;
+        match result {
+            Ok(Err(error)) => assert_eq!(error.to_string(), "listener socket died"),
+            other => panic!("expected the listener error to propagate, got {other:?}"),
+        }
+    }
+
+    // --- H3: outbound-size adaptation --------------------------------------
+
+    #[test]
+    fn adapt_gamedata_wide_suffix_exact_boundary() {
+        // The oracle construction: 128 tics with two full diffs per tic
+        // is 4 + 128 x 19 = 2436 bytes wide.
+        let (bytes, original) = gamedata(200, 128, false);
+        assert_eq!(bytes.len(), 2436, "the three-player 128-tic span");
+        let adapted = adapt_gamedata(&bytes, false).expect("gamedata adapts");
+        assert_eq!(adapted.len(), 1486, "78 wide tics is the largest fit");
+        let (_, ServerPacket::GameData(adapted)) =
+            ServerPacket::decode(&adapted, false).expect("the suffix decodes")
+        else {
+            unreachable!()
+        };
+        assert_eq!(adapted.tics.len(), 78);
+        assert_eq!(adapted.start, 200u8.wrapping_add(50));
+        assert_eq!(adapted.tics.as_slice(), &original.tics[50..]);
+        assert_eq!(adapted.tics.last(), original.tics.last());
+        // The 78-tic packet itself fits exactly and is never adapted.
+        let (fits, _) = gamedata(200, 78, false);
+        assert_eq!(fits.len(), 1486);
+    }
+
+    #[test]
+    fn adapt_gamedata_lowres_suffix_exact_boundary() {
+        // Lowres: 4 + 128 x 17 = 2180; the 88-tic suffix lands exactly
+        // on 1500, which the inclusive bound must accept.
+        let (bytes, original) = gamedata(200, 128, true);
+        assert_eq!(bytes.len(), 2180, "the three-player lowres span");
+        let adapted = adapt_gamedata(&bytes, true).expect("gamedata adapts");
+        assert_eq!(adapted.len(), 1500, "88 lowres tics is exactly 1500");
+        let (_, ServerPacket::GameData(adapted)) =
+            ServerPacket::decode(&adapted, true).expect("the suffix decodes")
+        else {
+            unreachable!()
+        };
+        assert_eq!(adapted.tics.len(), 88);
+        assert_eq!(adapted.start, 200u8.wrapping_add(40));
+        assert_eq!(adapted.tics.as_slice(), &original.tics[40..]);
+        assert_eq!(adapted.tics.last(), original.tics.last());
+        // The 88-tic packet is exactly 1500; the 89-tic adapts to 88.
+        let (fits, _) = gamedata(200, 88, true);
+        assert_eq!(fits.len(), 1500);
+        let (over, _) = gamedata(200, 89, true);
+        assert_eq!(over.len(), 1517);
+        let adapted = adapt_gamedata(&over, true).expect("gamedata adapts");
+        assert_eq!(adapted.len(), 1500);
+        // Wrap safety: 250 + 40 crosses the u8 boundary to 34 and the
+        // absolute sequence still moves forward (engine-31 FU17 §4b).
+        let (wrapped, _) = gamedata(250, 128, true);
+        let adapted = adapt_gamedata(&wrapped, true).expect("gamedata adapts");
+        let (_, ServerPacket::GameData(adapted)) =
+            ServerPacket::decode(&adapted, true).expect("the suffix decodes")
+        else {
+            unreachable!()
+        };
+        assert_eq!(adapted.start, 34);
+    }
+
+    #[test]
+    fn adapt_gamedata_rejects_non_gamedata() {
+        assert!(adapt_gamedata(&vec![0xaa; MAX_DATAGRAM_LEN + 1], false).is_none());
+        let keepalive = ServerPacket::Keepalive
+            .encode(WireHeader { reliable_seq: None }, false)
+            .expect("encodes");
+        assert!(adapt_gamedata(&keepalive, false).is_none());
+    }
+
+    #[test]
+    fn drain_udp_passes_boundary_packets_unmodified() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        let player = rt.rooms[&room()].udp_addresses[&(listener, from)];
+        let now = rt.now();
+        let bind_room = rt.rooms.get_mut(&room()).expect("room");
+        let (other, _) = bind_room
+            .host
+            .join(now, |_| b"ws:relay".to_vec())
+            .expect("member joins");
+        let route = crate::runtime::RouteId::new(11).expect("nonzero");
+        // The exact boundary packets: 78 wide tics (1486) and 88 lowres
+        // tics (exactly 1500) both pass the drain byte-identical.
+        let (wide, _) = gamedata(7, 78, false);
+        let (lowres, _) = gamedata(7, 88, true);
+        assert_eq!(wide.len(), 1486);
+        assert_eq!(lowres.len(), 1500);
+        bind_room
+            .host
+            .relay(now, other, player, route, &wide)
+            .expect("fits the room-core bound");
+        bind_room
+            .host
+            .relay(now, other, player, route, &lowres)
+            .expect("fits the room-core bound");
+        let (datagrams, _) = rt.drain_udp(listener, &room());
+        let relayed: Vec<&Vec<u8>> = datagrams
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .filter(|bytes| {
+                matches!(
+                    ServerPacket::decode(bytes, false),
+                    Ok((_, ServerPacket::GameData(_)))
+                ) || matches!(
+                    ServerPacket::decode(bytes, true),
+                    Ok((_, ServerPacket::GameData(_)))
+                )
+            })
+            .collect();
+        assert_eq!(relayed.len(), 2);
+        assert!(relayed.contains(&&wide));
+        assert!(relayed.contains(&&lowres));
+    }
+
+    #[test]
+    fn drain_adapts_oversize_gamedata_and_retains_the_peer() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        let player = rt.rooms[&room()].udp_addresses[&(listener, from)];
+
+        // The input-reachable worst case: a 128-tic wide span at 2436
+        // bytes, injected into the UDP peer's outbox.
+        let (bytes, original) = gamedata(250, 128, false);
+        assert_eq!(bytes.len(), 2436);
+        let now = rt.now();
+        let bind_room = rt.rooms.get_mut(&room()).expect("room");
+        let (other, _) = bind_room
+            .host
+            .join(now, |_| b"ws:relay".to_vec())
+            .expect("member joins");
+        let route = crate::runtime::RouteId::new(11).expect("nonzero");
+        bind_room
+            .host
+            .relay(now, other, player, route, &bytes)
+            .expect("fits the room-core bound");
+
+        let (datagrams, effects) = rt.drain_udp(listener, &room());
+        let adapted_bytes = datagrams
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .find(|bytes| {
+                matches!(
+                    ServerPacket::decode(bytes, false),
+                    Ok((_, ServerPacket::GameData(_)))
+                )
+            })
+            .expect("the adapted gamedata is emitted");
+        assert!(adapted_bytes.len() <= MAX_DATAGRAM_LEN);
+        assert_eq!(adapted_bytes.len(), 1486);
+        let (_, ServerPacket::GameData(adapted)) =
+            ServerPacket::decode(adapted_bytes, false).expect("the suffix decodes")
+        else {
+            unreachable!()
+        };
+        // Start advanced by the omitted 50 across the u8 wrap (250 ->
+        // 44), the original newest tic last, content exact.
+        assert_eq!(adapted.tics.len(), 78);
+        assert_eq!(adapted.start, 44);
+        assert_eq!(adapted.tics.as_slice(), &original.tics[50..]);
+        assert_eq!(adapted.tics.last(), original.tics.last());
+        // The peer is retained, never isolated: mapping and membership
+        // survive and the drain produced no removal effects.
+        assert!(
+            rt.rooms[&room()]
+                .udp_addresses
+                .contains_key(&(listener, from))
+        );
+        assert!(rt.rooms[&room()].host.contains(player));
+        assert!(effects.ws_waiters.is_empty());
+        assert!(effects.udp_waiters.is_empty());
+    }
+
+    // --- H4: pending traffic in room lifetime ------------------------------
+
+    #[test]
+    fn pending_removal_traffic_holds_room_until_listener_attempt() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+
+        // 30 s of silence: the role's own timeout removes the peer in a
+        // tick reduction, which captures the owed accept/waiting into
+        // the bounded pending batch. The mapping is gone but the room
+        // is retained against further sweeps until the listener
+        // attempts the batch.
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(31))
+            .expect("backdate the clock past the receive timeout");
+        rt.tick();
+        let bind_room = rt
+            .rooms
+            .get(&room())
+            .expect("pending traffic retains the room");
+        assert!(bind_room.udp_addresses.is_empty());
+        assert!(!bind_room.pending_udp[&listener].is_empty());
+        assert!(bind_room.udp_draining.contains(&(listener, from)));
+
+        // Before the attempt: the same (listener, address) is not
+        // re-admitted, a different address does not open a session in
+        // the draining room, and a WebSocket join is refused.
+        let effects = rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        assert!(effects.ws_waiters.is_empty());
+        assert!(effects.udp_waiters.is_empty());
+        assert!(effects.direct_udp.is_empty());
+        assert!(rt.rooms[&room()].udp_addresses.is_empty());
+        let other: SocketAddr = "127.0.0.1:29999".parse().expect("valid addr");
+        let effects = rt.udp_datagram(listener, &room(), other, &fixture_syn());
+        assert!(effects.udp_waiters.is_empty());
+        assert!(rt.rooms[&room()].udp_addresses.is_empty());
+        assert!(matches!(
+            rt.join(room(), Arc::new(Notify::new())),
+            Err(JoinError::RoomDraining)
+        ));
+        rt.tick();
+        assert!(rt.rooms.contains_key(&room()));
+
+        // The listener's drain attempt captures the owed batch,
+        // terminal-last order preserved, and drops the emptied room.
+        let (datagrams, _) = rt.drain_udp(listener, &room());
+        assert!(datagrams.len() >= 2, "accept and waiting are owed");
+        assert!(matches!(
+            decode_server(&datagrams[0].1, false),
+            ServerPacket::SynAccept(_)
+        ));
+        assert!(
+            !rt.rooms.contains_key(&room()),
+            "the drained empty room drops"
+        );
+
+        // The next valid SYN starts a fresh host.
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        let bind_room = rt.rooms.get(&room()).expect("fresh room");
+        assert_eq!(bind_room.udp_addresses.len(), 1);
+        let ServerPacket::QueryResponse(query) = bind_room.host.query_response() else {
+            panic!("query response")
+        };
+        assert_eq!(query.num_players, 1);
+    }
+
+    // --- H5: isolation effects delivered -----------------------------------
+
+    #[test]
+    fn oversize_isolation_delivers_survivor_and_listener_effects() {
+        let mut rt = runtime();
+        let (listener, udp_notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        let player = rt.rooms[&room()].udp_addresses[&(listener, from)];
+        let ws_waiter = Arc::new(Notify::new());
+        rt.join(room(), Arc::clone(&ws_waiter)).expect("ws joins");
+
+        // A third member relays one ordinary and one undecodable
+        // oversized payload into the UDP peer's outbox.
+        let now = rt.now();
+        let bind_room = rt.rooms.get_mut(&room()).expect("room");
+        let (other, _) = bind_room
+            .host
+            .join(now, |_| b"ws:relay".to_vec())
+            .expect("member joins");
+        let route = crate::runtime::RouteId::new(11).expect("nonzero");
+        bind_room
+            .host
+            .relay(now, other, player, route, b"small")
+            .expect("small relays");
+        let big = vec![0xaa; MAX_DATAGRAM_LEN + 1];
+        bind_room
+            .host
+            .relay(now, other, player, route, &big)
+            .expect("fits the room-core bound");
+
+        let (datagrams, effects) = rt.drain_udp(listener, &room());
+        assert!(
+            datagrams
+                .iter()
+                .all(|(_, bytes)| bytes.len() <= MAX_DATAGRAM_LEN),
+            "no oversized datagram is ever emitted"
+        );
+        assert!(
+            datagrams.iter().any(|(_, bytes)| bytes == b"small"),
+            "ordinary output ahead of the oversize is sent"
+        );
+        // The oversized recipient is isolated; the role may cascade an
+        // established departure into an abort that empties the room.
+        if let Some(bind_room) = rt.rooms.get(&room()) {
+            assert!(!bind_room.udp_addresses.contains_key(&(listener, from)));
+            assert!(!bind_room.host.contains(player));
+        }
+        // Every effect of the isolation rides the returned Effects: the
+        // WebSocket survivor is woken with its refreshed lobby state,
+        // and the isolating listener is woken so newly captured removal
+        // traffic is attempted instead of sleeping forever.
+        assert!(
+            effects
+                .ws_waiters
+                .iter()
+                .any(|waiter| Arc::ptr_eq(waiter, &ws_waiter)),
+            "the survivor wakeup is delivered"
+        );
+        assert!(
+            effects
+                .udp_waiters
+                .iter()
+                .any(|waiter| Arc::ptr_eq(waiter, &udp_notifier)),
+            "the isolating listener is woken for the removal traffic"
+        );
+    }
+
+    // --- loopback tests ----------------------------------------------------
+
+    #[tokio::test]
+    async fn two_listeners_one_remote_socket_distinct_admissions() {
+        let room_name = RoomName::try_from("arena").expect("valid room");
+        let ws_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ws listener binds");
+        let socket1 = UdpSocket::bind("127.0.0.1:0").await.expect("l1 binds");
+        let socket2 = UdpSocket::bind("127.0.0.1:0").await.expect("l2 binds");
+        let l1 = socket1.local_addr().expect("l1 address");
+        let l2 = socket2.local_addr().expect("l2 address");
+        let server = tokio::spawn(crate::runtime::serve(
+            ws_listener,
+            vec![(room_name.clone(), socket1), (room_name, socket2)],
+            NonZeroUsize::new(64).expect("nonzero"),
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("client binds");
+
+        // One remote socket SYNs to both listeners of the same room.
+        client.send_to(&fixture_syn(), l1).await.expect("syn to l1");
+        client.send_to(&fixture_syn(), l2).await.expect("syn to l2");
+
+        // Collect datagrams by reply source port until both admissions
+        // and the shared two-player lobby are observed on each socket.
+        let mut accepts = std::collections::HashSet::new();
+        let mut lobbies = std::collections::HashMap::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && (accepts.len() < 2 || lobbies.len() < 2) {
+            let mut buf = vec![0u8; 2048];
+            let Ok(Ok((len, source))) =
+                timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await
+            else {
+                continue;
+            };
+            match decode_server(&buf[..len], false) {
+                ServerPacket::SynAccept(_) => {
+                    accepts.insert(source);
+                }
+                ServerPacket::WaitingData(data) if data.players.len() == 2 => {
+                    lobbies.insert(source, data);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            accepts.contains(&l1) && accepts.contains(&l2),
+            "each listener answered its own SYN from its own socket"
+        );
+        let w1 = lobbies.get(&l1).expect("l1 two-player lobby");
+        let w2 = lobbies.get(&l2).expect("l2 two-player lobby");
+        // Distinct PlayerIds proven at the socket layer: the per-
+        // recipient consoleplayer differs while the one shared role
+        // reports the same two players through both sockets.
+        assert_eq!(w1.consoleplayer, 0);
+        assert_eq!(w2.consoleplayer, 1);
+        assert_eq!(w1.players.len(), 2);
+        assert_eq!(w2.players.len(), 2);
+
+        // A stateless QUERY describes the same shared room and is
+        // answered from the addressed socket only.
+        client
+            .send_to(&[0x00, 0x0d], l2)
+            .await
+            .expect("query to l2");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (source, query) = loop {
+            assert!(Instant::now() < deadline, "no query response arrived");
+            let mut buf = vec![0u8; 2048];
+            let Ok(Ok((len, source))) =
+                timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await
+            else {
+                continue;
+            };
+            if let ServerPacket::QueryResponse(query) = decode_server(&buf[..len], false) {
+                break (source, query);
+            }
+        };
+        assert_eq!(source, l2, "the query answer leaves from l2 only");
+        assert_eq!(query.num_players, 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_only_serve_persists_without_udp() {
+        let ws_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ws listener binds");
+        let ws_addr = ws_listener.local_addr().expect("ws address");
+        let server = tokio::spawn(crate::runtime::serve(
+            ws_listener,
+            Vec::new(),
+            NonZeroUsize::new(64).expect("nonzero"),
+        ));
+        let mut alice = ws_connect(&format!("ws://{ws_addr}/ws/solo")).await;
+        alice.send(1, 20, &syn_bytes("Alice", 0, 0, 0));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = false;
+        while !accepted && Instant::now() < deadline {
+            if let Some((_, payload)) = alice.try_next(300).await {
+                accepted = matches!(decode_server(&payload, false), ServerPacket::SynAccept(_));
+            }
+        }
+        assert!(accepted, "the websocket handshake completes");
+        assert!(!server.is_finished(), "a WebSocket-only serve persists");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_syn_fixture_produces_bare_accept_waiting_data_and_one_mapping() {
+        let mut server = spawn_mixed("fixture").await;
+        server.udp.send(&fixture_syn()).await.expect("syn sends");
+
+        let accept = udp_recv(&server.udp, 1_000).await;
+        assert_eq!(
+            u16::from_be_bytes([accept[0], accept[1]]),
+            0x8000,
+            "bare datagram with the big-endian reliable SYN accept word"
+        );
+        assert!(matches!(
+            decode_server(&accept, false),
+            ServerPacket::SynAccept(_)
+        ));
+        let data = udp_recv(&server.udp, 1_000).await;
+        match decode_server(&data, false) {
+            ServerPacket::WaitingData(data) => {
+                assert_eq!(data.players.len(), 1);
+                assert_eq!(data.is_controller, 1);
+            }
+            other => panic!("expected waiting data, got {other:?}"),
+        }
+
+        // A duplicate SYN neither duplicates membership nor repeats the
+        // accept; the member persists. Retried accepts and keepalives
+        // may interleave with the cadence's next waiting data.
+        server.udp.send(&fixture_syn()).await.expect("dup sends");
+        udp_expect_silence(&server.udp, 400).await;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert!(Instant::now() < deadline, "no further waiting data");
+            match decode_server(&udp_recv(&server.udp, 1_000).await, false) {
+                ServerPacket::WaitingData(data) => {
+                    assert_eq!(data.players.len(), 1);
+                    break;
+                }
+                ServerPacket::Keepalive | ServerPacket::SynAccept(_) => continue,
+                other => panic!("expected waiting data, got {other:?}"),
+            }
+        }
+
+        server.server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_old_magic_terminal_then_fresh_readmission() {
+        let mut server = spawn_mixed("old").await;
+        let mut old_syn = vec![0x00, 0x00];
+        old_syn.extend_from_slice(&0xccd9_74d4u32.to_be_bytes());
+        server.udp.send(&old_syn).await.expect("old magic sends");
+
+        let rejected = udp_recv(&server.udp, 1_000).await;
+        match decode_server(&rejected, false) {
+            ServerPacket::Rejected { reason } => assert!(
+                reason.starts_with(b"You are using an old client version that is not supported by this server. This server is running ")
+            ),
+            other => panic!("expected rejected, got {other:?}"),
+        }
+        udp_expect_silence(&server.udp, 400).await;
+
+        // The mapping is gone once the terminal left the socket: the
+        // same address is admitted fresh.
+        server.udp.send(&fixture_syn()).await.expect("syn sends");
+        let accept = udp_recv(&server.udp, 1_000).await;
+        assert!(matches!(
+            decode_server(&accept, false),
+            ServerPacket::SynAccept(_)
+        ));
+
+        server.server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_query_is_stateless() {
+        let mut server = spawn_mixed("query").await;
+        for _ in 0..2 {
+            server.udp.send(&[0x00, 0x0d]).await.expect("query sends");
+            let response = udp_recv(&server.udp, 1_000).await;
+            match decode_server(&response, false) {
+                ServerPacket::QueryResponse(data) => {
+                    assert_eq!(data.server_state, 0);
+                    assert_eq!(data.num_players, 0);
+                }
+                other => panic!("expected query response, got {other:?}"),
+            }
+        }
+
+        // Nothing accumulated: a later SYN sees a one-player room.
+        server.udp.send(&fixture_syn()).await.expect("syn sends");
+        udp_recv(&server.udp, 1_000).await;
+        let data = udp_recv(&server.udp, 1_000).await;
+        match decode_server(&data, false) {
+            ServerPacket::WaitingData(data) => assert_eq!(data.players.len(), 1),
+            other => panic!("expected waiting data, got {other:?}"),
+        }
+
+        server.server.abort();
+    }
+
+    #[tokio::test]
+    async fn mixed_room_shared_lobby_and_personalized_gamestart() {
+        let mut server = spawn_mixed("mixed").await;
+        // The UDP peer is the oldest: its SYN is admitted before the
+        // WebSocket connection (and its join) exists.
+        server
+            .udp
+            .send(&fixture_syn())
+            .await
+            .expect("udp syn sends");
+        let accept = udp_recv(&server.udp, 1_000).await;
+        assert!(matches!(
+            decode_server(&accept, false),
+            ServerPacket::SynAccept(_)
+        ));
+        let room_url = format!("ws://{}/ws/mixed", server.ws_addr);
+        let mut alice = ws_connect(&room_url).await;
+
+        alice.send(1, 20, &syn_bytes("Alice", 0, 0, 0));
+        alice.send(1, 20, &ack_bytes(1));
+        server.udp.send(&ack_bytes(1)).await.expect("udp ack sends");
+
+        // Both transports converge on the shared two-player lobby: the
+        // UDP peer is oldest (controller, consoleplayer 0), the
+        // WebSocket peer second.
+        let mut udp_wait = None;
+        let mut ws_wait = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && (udp_wait.is_none() || ws_wait.is_none()) {
+            if udp_wait.is_none()
+                && let Some(bytes) = udp_try_recv(&server.udp, 200).await
+                && let ServerPacket::WaitingData(data) = decode_server(&bytes, false)
+                && data.players.len() == 2
+            {
+                udp_wait = Some(data);
+            }
+            if ws_wait.is_none()
+                && let Some((_, payload)) = alice.try_next(200).await
+                && let ServerPacket::WaitingData(data) = decode_server(&payload, false)
+                && data.players.len() == 2
+            {
+                ws_wait = Some(data);
+            }
+        }
+        let udp_wait = udp_wait.expect("udp two-player lobby");
+        let ws_wait = ws_wait.expect("ws two-player lobby");
+        assert_eq!(udp_wait.is_controller, 1);
+        assert_eq!(udp_wait.consoleplayer, 0);
+        assert_eq!(ws_wait.is_controller, 0);
+        assert_eq!(ws_wait.consoleplayer, 1);
+
+        // The controller (the UDP peer) launches; both drive GAMESTART,
+        // deathmatch 1 from the controller only.
+        server.udp.send(&launch_bytes(0)).await.expect("udp launch");
+        server.udp.send(&ack_bytes(2)).await.expect("udp ack2");
+        alice.send(1, 20, &ack_bytes(2));
+        server
+            .udp
+            .send(&settings_bytes(1, 1))
+            .await
+            .expect("udp gamestart");
+        alice.send(1, 20, &settings_bytes(0, 0));
+
+        // Personalized authoritative GAMESTART on both transports:
+        // consoleplayer 0 for the UDP peer, 1 for the WebSocket peer,
+        // deathmatch 1 preserved end to end.
+        let mut udp_start = None;
+        let mut ws_start = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && (udp_start.is_none() || ws_start.is_none()) {
+            if udp_start.is_none()
+                && let Some(bytes) = udp_try_recv(&server.udp, 200).await
+                && let ServerPacket::GameStart(settings) = decode_server(&bytes, false)
+            {
+                udp_start = Some(settings);
+            }
+            if ws_start.is_none()
+                && let Some((_, payload)) = alice.try_next(200).await
+                && let ServerPacket::GameStart(settings) = decode_server(&payload, false)
+            {
+                ws_start = Some(settings);
+            }
+        }
+        let udp_start = udp_start.expect("udp gamestart");
+        let ws_start = ws_start.expect("ws gamestart");
+        assert_eq!(udp_start.consoleplayer, 0);
+        assert_eq!(udp_start.deathmatch, 1);
+        assert_eq!(ws_start.consoleplayer, 1);
+        assert_eq!(ws_start.deathmatch, 1);
+
+        server.server.abort();
+    }
+
+    #[tokio::test]
+    async fn mixed_narrow_turn_crosses_transports_at_the_room_width() {
+        let mut server = spawn_mixed("narrow").await;
+        // The UDP peer is the oldest (and therefore the controller that
+        // launches): its SYN is admitted before the WebSocket join.
+        server
+            .udp
+            .send(&syn_bytes("Udp", 0, 0, 1))
+            .await
+            .expect("udp syn sends");
+        let accept = udp_recv(&server.udp, 1_000).await;
+        assert!(matches!(
+            decode_server(&accept, false),
+            ServerPacket::SynAccept(_)
+        ));
+        let room_url = format!("ws://{}/ws/narrow", server.ws_addr);
+        let mut alice = ws_connect(&room_url).await;
+
+        alice.send(1, 20, &syn_bytes("Alice", 0, 0, 1));
+        server.udp.send(&ack_bytes(1)).await.expect("udp ack");
+        alice.send(1, 20, &ack_bytes(1));
+
+        // Both transports converge on the shared two-player lobby
+        // before the controller is allowed to launch.
+        let mut udp_wait = false;
+        let mut ws_wait = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !(udp_wait && ws_wait) {
+            if !udp_wait
+                && let Some(bytes) = udp_try_recv(&server.udp, 200).await
+                && let ServerPacket::WaitingData(data) = decode_server(&bytes, true)
+                && data.players.len() == 2
+            {
+                udp_wait = true;
+            }
+            if !ws_wait
+                && let Some((_, payload)) = alice.try_next(200).await
+                && let ServerPacket::WaitingData(data) = decode_server(&payload, true)
+                && data.players.len() == 2
+            {
+                ws_wait = true;
+            }
+        }
+        assert!(udp_wait && ws_wait, "both transports saw the lobby");
+
+        server.udp.send(&launch_bytes(0)).await.expect("udp launch");
+        server.udp.send(&ack_bytes(2)).await.expect("udp ack2");
+        alice.send(1, 20, &ack_bytes(2));
+        server
+            .udp
+            .send(&settings_bytes(1, 0))
+            .await
+            .expect("udp gamestart");
+        alice.send(1, 20, &settings_bytes(0, 0));
+
+        // Wait for the authoritative GAMESTART on both transports.
+        let mut udp_started = false;
+        let mut ws_started = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !(udp_started && ws_started) {
+            if !udp_started
+                && let Some(bytes) = udp_try_recv(&server.udp, 200).await
+                && let ServerPacket::GameStart(_) = decode_server(&bytes, true)
+            {
+                udp_started = true;
+            }
+            if !ws_started
+                && let Some((_, payload)) = alice.try_next(200).await
+                && let ServerPacket::GameStart(_) = decode_server(&payload, true)
+            {
+                ws_started = true;
+            }
+        }
+        assert!(
+            udp_started && ws_started,
+            "both transports reached gamestart"
+        );
+
+        // The UDP peer uploads a narrow nonzero angleturn.
+        let upload = ClientPacket::GameData(doom_proto::GameDataClient {
+            ack: 0,
+            start: 0,
+            tics: vec![doom_proto::ClientTic {
+                latency: 1,
+                diff: TiccmdDiff {
+                    turn: Some(0x100),
+                    ..Default::default()
+                },
+            }],
+        })
+        .encode(WireHeader { reliable_seq: None }, true)
+        .expect("narrow upload encodes");
+        server.udp.send(&upload).await.expect("upload sends");
+
+        // The WebSocket peer receives the fan-out decodable only at the
+        // room width, with the same value at the UDP peer's frozen
+        // index, among the pump's ordinary game data.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = None;
+        while found.is_none() && Instant::now() < deadline {
+            if let Some((_, payload)) = alice.try_next(300).await
+                && let Ok((_, ServerPacket::GameData(data))) = ServerPacket::decode(&payload, true)
+                && data.tics.iter().any(|tic| {
+                    tic.players
+                        .iter()
+                        .any(|(index, diff)| *index == 0 && diff.turn == Some(0x100))
+                })
+            {
+                found = Some((payload, data));
+            }
+        }
+        let (frame, data) = found.expect("the narrow turn crossed to the ws peer");
+        assert_eq!(data.tics[0].players[0].0, 0);
+        assert_eq!(data.tics[0].players[0].1.turn, Some(0x100));
+        assert!(
+            ServerPacket::decode(&frame, false).is_err(),
+            "the fan-out cannot be read at the wrong width"
+        );
+
+        server.server.abort();
+    }
+
+    #[tokio::test]
+    async fn udp_timer_traffic_shared_reducer_and_no_post_shutdown_work() {
+        let mut server = spawn_mixed("timer").await;
+        server.udp.send(&fixture_syn()).await.expect("syn sends");
+
+        // No acknowledgement and no input: the shared timer drives the
+        // cadence and retry, exactly once per period (no duplicate
+        // timer).
+        let mut accepts = 0;
+        let mut waiting = 0;
+        let deadline = Instant::now() + Duration::from_millis(1_600);
+        while Instant::now() < deadline && (accepts < 2 || waiting < 2) {
+            match decode_server(&udp_recv(&server.udp, 1_600).await, false) {
+                ServerPacket::SynAccept(_) => accepts += 1,
+                ServerPacket::WaitingData(_) => waiting += 1,
+                ServerPacket::Keepalive => {}
+                other => panic!("unexpected packet {other:?}"),
+            }
+        }
+        assert_eq!(accepts, 2, "the unacknowledged head retried once");
+        assert_eq!(waiting, 2, "the cadence produced a second waiting data");
+
+        server.server.abort();
+        udp_expect_silence(&server.udp, 1_500).await;
+    }
+}
