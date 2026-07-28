@@ -594,10 +594,6 @@ mod tests {
                 .ok()
                 .flatten()
         }
-
-        async fn next(&mut self, millis: u64) -> (u32, Vec<u8>) {
-            self.try_next(millis).await.expect("ws frame arrives")
-        }
     }
 
     async fn udp_recv(socket: &UdpSocket, millis: u64) -> Vec<u8> {
@@ -1260,7 +1256,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_syn_fixture_produces_bare_accept_waiting_data_and_one_mapping() {
-        let mut server = spawn_mixed("fixture").await;
+        let server = spawn_mixed("fixture").await;
         server.udp.send(&fixture_syn()).await.expect("syn sends");
 
         let accept = udp_recv(&server.udp, 1_000).await;
@@ -1305,7 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_old_magic_terminal_then_fresh_readmission() {
-        let mut server = spawn_mixed("old").await;
+        let server = spawn_mixed("old").await;
         let mut old_syn = vec![0x00, 0x00];
         old_syn.extend_from_slice(&0xccd9_74d4u32.to_be_bytes());
         server.udp.send(&old_syn).await.expect("old magic sends");
@@ -1333,7 +1329,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_query_is_stateless() {
-        let mut server = spawn_mixed("query").await;
+        let server = spawn_mixed("query").await;
         for _ in 0..2 {
             server.udp.send(&[0x00, 0x0d]).await.expect("query sends");
             let response = udp_recv(&server.udp, 1_000).await;
@@ -1360,7 +1356,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_room_shared_lobby_and_personalized_gamestart() {
-        let mut server = spawn_mixed("mixed").await;
+        let server = spawn_mixed("mixed").await;
         // The UDP peer is the oldest: its SYN is admitted before the
         // WebSocket connection (and its join) exists.
         server
@@ -1453,7 +1449,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_narrow_turn_crosses_transports_at_the_room_width() {
-        let mut server = spawn_mixed("narrow").await;
+        let server = spawn_mixed("narrow").await;
         // The UDP peer is the oldest (and therefore the controller that
         // launches): its SYN is admitted before the WebSocket join.
         server
@@ -1575,7 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_timer_traffic_shared_reducer_and_no_post_shutdown_work() {
-        let mut server = spawn_mixed("timer").await;
+        let server = spawn_mixed("timer").await;
         server.udp.send(&fixture_syn()).await.expect("syn sends");
 
         // No acknowledgement and no input: the shared timer drives the
