@@ -163,6 +163,34 @@ fn gamestart_reaches_everyone_with_per_recipient_consoleplayer() {
     drain(&mut h, bob);
 
     gamestart(&mut h, alice, 1, 1);
+    // The controller's GAMESTART only adopts settings and marks the
+    // controller ready: a reliable ack plus a refreshed waiting data to
+    // the ready peer, and no authoritative broadcast while bob is
+    // unready.
+    let mut acked = false;
+    let mut refreshed = false;
+    while let Some(packet) = h.pop_outbound(alice) {
+        match ServerPacket::decode(packet.payload(), false)
+            .expect("decodes")
+            .1
+        {
+            ServerPacket::ReliableAck { .. } => acked = true,
+            ServerPacket::WaitingData(data) => {
+                refreshed = true;
+                assert_eq!(data.ready_players, 1);
+            }
+            ServerPacket::GameStart(_) => {
+                panic!("no authoritative broadcast while a peer is unready")
+            }
+            _ => {}
+        }
+    }
+    assert!(acked, "the controller's reliable GAMESTART is acked");
+    assert!(refreshed, "ready peers are refreshed");
+    assert!(h.pop_outbound(bob).is_none(), "bob gets nothing yet");
+
+    // The second peer's GAMESTART completes readiness: the personalized
+    // authoritative GAMESTART goes to both.
     gamestart(&mut h, bob, 0, 0);
     assert_eq!(h.role.state(), ServerState::InGame);
 

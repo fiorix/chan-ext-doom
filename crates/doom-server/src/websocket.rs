@@ -231,17 +231,23 @@ impl Runtime {
         self.rooms.get(room_name)?.routes.get(&destination).copied()
     }
 
-    /// Transport hangup or binding-initiated removal: one `Leave` into
-    /// the role, reduced until quiescent; the room is dropped once it
-    /// holds neither members nor connections.
+    /// Transport hangup or binding-initiated removal: exactly one
+    /// `Leave` into the role, reduced until quiescent; the room is
+    /// dropped once it holds neither members nor connections. When the
+    /// role has already removed the peer itself (a role-originated
+    /// `Action::Disconnect`, whose registry removal rides its action
+    /// batch), the later socket cleanup is inert: zero `Leave` calls,
+    /// exactly as the clarified initiator rule requires.
     fn leave(&mut self, room_name: &RoomName, player_id: PlayerId) -> Vec<Arc<Notify>> {
         let mut waiters = Vec::new();
         let now = self.now();
         let Some(room) = self.rooms.get_mut(room_name) else {
             return waiters;
         };
-        let effect = room.host.leave(now, player_id);
-        waiters.extend(room.apply(effect));
+        if room.host.contains(player_id) {
+            let effect = room.host.leave(now, player_id);
+            waiters.extend(room.apply(effect));
+        }
         if let Some(connection) = room.connections.remove(&player_id) {
             if let Some(route) = connection.route {
                 room.routes.remove(&route);
@@ -595,31 +601,72 @@ mod tests {
     #[test]
     fn server_route_source_is_rejected_before_any_effect() {
         let mut runtime = test_runtime();
-        let player = join(&mut runtime);
-        let frame = client_frame(0, SERVER_ROUTE, &[]);
-        let envelope = decode_inbound(&frame).expect("marker decodes");
+        let offender_waiter = Arc::new(Notify::new());
+        let offender = runtime
+            .join(room(), Arc::clone(&offender_waiter))
+            .expect("offender joins")
+            .0;
+        let bystander_waiter = Arc::new(Notify::new());
+        let bystander = runtime
+            .join(room(), Arc::clone(&bystander_waiter))
+            .expect("bystander joins")
+            .0;
 
-        assert!(matches!(
-            runtime.handle_envelope(&room(), player, envelope),
-            Err(BindingError::ServerRoute)
-        ));
+        // The exact old reset marker, and a payload-carrying,
+        // destination-carrying source of 1: the same forbidden source,
+        // rejected before any route, packet, or third-party effect.
+        for frame in [
+            client_frame(0, SERVER_ROUTE, &[]),
+            client_frame(7, SERVER_ROUTE, b"payload"),
+        ] {
+            let envelope = decode_inbound(&frame).expect("frame decodes");
+            assert!(matches!(
+                runtime.handle_envelope(&room(), offender, envelope),
+                Err(BindingError::ServerRoute)
+            ));
+        }
+        {
+            let room = runtime.rooms.get(&room()).expect("room exists");
+            assert!(room.routes.is_empty(), "no route was bound");
+            assert!(room.connections[&offender].route.is_none());
+            // Admission already happened: the member stays until normal
+            // cleanup, with no effect on the bystander.
+            assert!(room.host.contains(offender));
+            assert!(room.host.contains(bystander));
+        }
+
+        // Normal cleanup removes the admitted offender with its one
+        // external Leave; a pre-SYN member's removal is quiet for
+        // everyone else (no abort, broadcast, or game-end effect).
+        let waiters = runtime.leave(&room(), offender);
+        assert!(!waiters.is_empty(), "the offender's writer is woken");
+        assert!(
+            waiters
+                .iter()
+                .all(|waiter| Arc::ptr_eq(waiter, &offender_waiter)),
+            "the cleanup is quiet for the bystander"
+        );
         let room = runtime.rooms.get(&room()).expect("room exists");
-        assert!(room.routes.is_empty(), "no route was bound");
-        assert!(room.connections[&player].route.is_none());
+        assert!(!room.host.contains(offender));
+        assert!(room.host.contains(bystander));
     }
+
+    /// The pinned pre-3.0 magic as a literal: the production constant
+    /// must classify exactly this value, not whatever it happens to hold.
+    const PINNED_OLD_MAGIC: u32 = 0xccd9_74d4;
 
     #[test]
     fn malformed_classification_is_narrow() {
         // The pinned pre-3.0 magic, reliable and plain framings
         // (protocol header words are big-endian on the wire).
         let mut old_reliable = vec![0x80, 0x00, 0x00];
-        old_reliable.extend_from_slice(&OLD_SYN_MAGIC.to_be_bytes());
+        old_reliable.extend_from_slice(&PINNED_OLD_MAGIC.to_be_bytes());
         assert_eq!(
             classify_malformed(&old_reliable),
             MalformedClass::Syn { old_magic: true }
         );
         let mut old_plain = vec![0x00, 0x00];
-        old_plain.extend_from_slice(&OLD_SYN_MAGIC.to_be_bytes());
+        old_plain.extend_from_slice(&PINNED_OLD_MAGIC.to_be_bytes());
         assert_eq!(
             classify_malformed(&old_plain),
             MalformedClass::Syn { old_magic: true }
@@ -1195,7 +1242,7 @@ mod tests {
         // binary frame, then the connection closes.
         let (mut old, _) = connect_async(&room_url).await.expect("old client connects");
         let mut old_syn = vec![0x00, 0x00];
-        old_syn.extend_from_slice(&OLD_SYN_MAGIC.to_be_bytes());
+        old_syn.extend_from_slice(&PINNED_OLD_MAGIC.to_be_bytes());
         send(&mut old, 1, 20, &old_syn).await;
         let (from, rejected) = next_decoded(&mut old, false).await;
         assert_eq!(from, SERVER_ROUTE);
@@ -1258,6 +1305,9 @@ mod tests {
 
         // Undecodable garbage to the server route: dropped, not rejected.
         send(&mut client, 1, 20, &[0x63, 0x80, 0, 1, 2, 3]).await;
+        // A payload shorter than the two-byte type word still reaches
+        // the role as Malformed (never a binding error or rejection).
+        send(&mut client, 1, 20, &[0x06]).await;
         // A server-family packet (wrong direction): unsupported c2s.
         let syn_accept = ServerPacket::SynAccept(doom_proto::SynAccept {
             version: b"x".to_vec(),
