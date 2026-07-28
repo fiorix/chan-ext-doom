@@ -242,6 +242,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "doom-proto",
  "futures-util",
  "thiserror",
  "tokio",
