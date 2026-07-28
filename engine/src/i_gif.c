@@ -8,8 +8,7 @@
 #include "z_zone.h"
 #include "gifenc.h"
 
-#include <emscripten.h>
-
+#include "i_host.h"
 #define GIF_FRAME_SIZE SCREENWIDTH * SCREENHEIGHT
 #define GIF_MAX_FRAME_COUNT 128
 
@@ -30,12 +29,7 @@ void I_CloseGIF()
     ge_close_gif(gif);
     gif = NULL;
 
-    EM_ASM({
-        var filename = Module.UTF8ToString($0);
-        var url = URL.createObjectURL(new Blob([Module.FS.readFile(filename)], {type: 'image/gif'}));
-        document.dispatchEvent(new CustomEvent("I_CloseGIF", { detail: { url: url } }));
-        Module.FS.unlink(filename);
-    }, "temp.gif");
+    I_HostFileReady("I_CloseGIF", "temp.gif", "image/gif");
 }
 
 void I_AddFrameGIF()

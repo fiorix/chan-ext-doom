@@ -18,8 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <emscripten.h>
-
+#include "i_host.h"
 #include "config.h"
 #include "doomtype.h"
 #include "i_video.h"
@@ -58,18 +57,12 @@ void I_Endoom(byte *endoom_data)
 
     TXT_UpdateScreen();
 
-    EM_ASM(
-        if (Module && Module.canvas && typeof Module.canvas.calcRatio == "function"){
-            Module.canvas.calcRatio(true);
-        }
-    );
+    I_HostResizeCanvas(true);
 
     // Shut down text mode screen
 
     TXT_Shutdown();
 
-    EM_ASM(
-        document.dispatchEvent(new CustomEvent("I_Endoom", { detail: {} }));
-    );
+    I_HostEndoom();
 }
 

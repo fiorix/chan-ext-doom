@@ -23,8 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <emscripten.h>
-
+#include "i_host.h"
 #include "doomtype.h"
 #include "d_event.h"
 #include "i_joystick.h"

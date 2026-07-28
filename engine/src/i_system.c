@@ -42,8 +42,7 @@
 #include "w_wad.h"
 #include "z_zone.h"
 
-#include <emscripten.h>
-
+#include "i_host.h"
 #define DEFAULT_RAM 16 /* MiB */
 #define MIN_RAM     4  /* MiB */
 
@@ -258,9 +257,7 @@ void I_Error (const char *error, ...)
     M_vsnprintf(msgbuf, sizeof(msgbuf), error, argptr);
     va_end(argptr);
 
-    EM_ASM_({
-        document.dispatchEvent(new CustomEvent("I_Error", { detail: { errorMsg: Module.UTF8ToString($0) } }));
-    }, msgbuf);
+    I_HostError(msgbuf);
 
     // Shutdown. Here might be other errors.
 
@@ -407,5 +404,5 @@ boolean I_GetMemoryValue(unsigned int offset, void *value, int size)
 
 boolean I_IsMobile(void)
 {
-    return EM_ASM_INT(return +(typeof navigator.maxTouchPoints == "number" ? navigator.maxTouchPoints > 0 : "ontouchstart" in window));
+    return I_HostIsMobile();
 }

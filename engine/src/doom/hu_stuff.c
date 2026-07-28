@@ -47,8 +47,7 @@
 
 #include "v_video.h" // [crispy] V_DrawPatch() et al.
 
-#include <emscripten.h>
-
+#include "i_host.h"
 //
 // Locally used constants, shortcuts.
 //

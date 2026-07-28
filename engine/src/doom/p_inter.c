@@ -41,8 +41,7 @@
 
 #include "hu_stuff.h"
 #include "f_finale.h"
-#include <emscripten.h>
-
+#include "i_host.h"
 #define BONUSADD	6
 
 
@@ -720,9 +719,7 @@ P_KillMobj
 	}
 
 	const char *s = HU_GetMapName();
-	EM_ASM_({
-        document.dispatchEvent(new CustomEvent("P_KillMobj", { detail: { mapname: Module.UTF8ToString($0), source: Module.UTF8ToString($1) } }));
-    }, s, t);
+	I_HostKill(s, t);
 
 	P_DropWeapon (target->player);
 

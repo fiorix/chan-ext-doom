@@ -59,7 +59,7 @@
 
 #include "m_menu.h"
 
-#include <emscripten.h>
+#include "i_host.h"
 #include <time.h>
 
 extern patch_t*		hu_font[HU_FONTSIZE];

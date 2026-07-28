@@ -1,42 +1,40 @@
 cmake_minimum_required(VERSION 3.13)
 
-# This entry point builds the browser engine and nothing else.
+# This entry point builds one of two declared targets, and never a mixture.
 #
-# The refusal below is deliberate, not a missing feature. This fork's source is
-# not native-ready: fifteen translation units include <emscripten.h>
-# unconditionally, there are twenty-one EM_ASM sites across video, audio,
-# input, joystick, GIF capture, ENDOOM and the game layer, and d_main.c inverts
-# the game loop through emscripten_set_main_loop. Selecting net_sdl.c instead
-# of net_websockets.c does not change any of that. A native target would
-# configure, then fail partway through compiling with a missing emscripten.h,
-# which reads like a broken build rather than an unfinished port.
+#   -DDOOMIT_TARGET=browser   WebAssembly, WebSocket transport, host page
+#   -DDOOMIT_TARGET=native    host executable, SDL_net UDP transport
 #
-# The check runs before project() so configure fails before CMake compiles even
-# its own compiler-identification program, and long before anything probes for
-# SDL. Native UDP interop is an M2 exit requirement and net_sdl.c is kept as
-# restored, reviewed source for it; it is not presently buildable.
+# Left unset it infers browser from an Emscripten toolchain and native
+# otherwise, which is what emcmake and a plain cmake respectively want. Stating
+# it explicitly is still better, because an inferred mode that disagrees with
+# the toolchain is exactly the partial-native configure this contract exists to
+# prevent: the mode and the compiler are cross-checked below, and a mismatch is
+# an error rather than a silent adjustment.
+#
+# The two targets differ in more than a transport. The browser build carries
+# Emscripten APIs, a WebAudio music module, and a main loop inverted so the
+# browser event loop drives it; the native build carries none of those and runs
+# its own loop. Those differences live in the source list below and in
+# src/i_host.h, not scattered through the tree.
 
-set(DOOMIT_TARGETING_EMSCRIPTEN FALSE)
+set(DOOMIT_TARGET "" CACHE STRING "browser or native")
+set_property(CACHE DOOMIT_TARGET PROPERTY STRINGS "" browser native)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
-    set(DOOMIT_TARGETING_EMSCRIPTEN TRUE)
-elseif(CMAKE_TOOLCHAIN_FILE MATCHES "Emscripten\\.cmake$")
-    set(DOOMIT_TARGETING_EMSCRIPTEN TRUE)
+if(DOOMIT_TARGET STREQUAL "")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten"
+       OR CMAKE_TOOLCHAIN_FILE MATCHES "Emscripten\\.cmake$")
+        set(DOOMIT_TARGET browser)
+    else()
+        set(DOOMIT_TARGET native)
+    endif()
+    message(STATUS "doomit-engine: DOOMIT_TARGET not set, inferring ${DOOMIT_TARGET}")
 endif()
 
-if(NOT DOOMIT_TARGETING_EMSCRIPTEN)
+if(NOT DOOMIT_TARGET STREQUAL "browser" AND NOT DOOMIT_TARGET STREQUAL "native")
     message(FATAL_ERROR
-        "doomit-engine: browser-only build; refusing a non-Emscripten toolchain.\n"
-        "\n"
-        "Configure through emsdk instead:\n"
-        "    source ~/dev/emsdk/emsdk_env.sh\n"
-        "    emcmake cmake -S engine -B <build-dir>\n"
-        "\n"
-        "This is not a toolchain detection failure. The engine sources depend "
-        "on Emscripten unconditionally, so no native engine can be produced "
-        "from this tree today. A real native engine, including native UDP "
-        "interop, is M2 work; src/net_sdl.c is restored source kept for it and "
-        "is not presently buildable.")
+        "doomit-engine: DOOMIT_TARGET must be browser or native, got "
+        "'${DOOMIT_TARGET}'.")
 endif()
 
 project(doomit-engine C)
@@ -75,10 +73,9 @@ check_c_source_compiles(
      int main(void) { return 0; }"
     DOOMIT_COMPILER_IS_EMSCRIPTEN)
 
-if(NOT DOOMIT_COMPILER_IS_EMSCRIPTEN)
+if(DOOMIT_TARGET STREQUAL "browser" AND NOT DOOMIT_COMPILER_IS_EMSCRIPTEN)
     message(FATAL_ERROR
-        "doomit-engine: browser-only build; the configured C compiler is not "
-        "an Emscripten compiler.\n"
+        "doomit-engine: DOOMIT_TARGET=browser needs an Emscripten compiler.\n"
         "\n"
         "    CMAKE_C_COMPILER = ${CMAKE_C_COMPILER}\n"
         "\n"
@@ -88,6 +85,17 @@ if(NOT DOOMIT_COMPILER_IS_EMSCRIPTEN)
         "Configure through emsdk instead:\n"
         "    source ~/dev/emsdk/emsdk_env.sh\n"
         "    emcmake cmake -S engine -B <build-dir>")
+endif()
+
+if(DOOMIT_TARGET STREQUAL "native" AND DOOMIT_COMPILER_IS_EMSCRIPTEN)
+    message(FATAL_ERROR
+        "doomit-engine: DOOMIT_TARGET=native cannot be built with emcc.\n"
+        "\n"
+        "    CMAKE_C_COMPILER = ${CMAKE_C_COMPILER}\n"
+        "\n"
+        "The native target links SDL2_net and runs its own main loop, neither "
+        "of which Emscripten provides. Configure with a host compiler, or ask "
+        "for -DDOOMIT_TARGET=browser.")
 endif()
 
 # This mirrors the single-emcc recipe in docs/provenance.md, which is the
@@ -134,16 +142,36 @@ file(GLOB_RECURSE ENGINE_SOURCES
 # order, so an unsorted list makes the artifact depend on readdir order.
 list(SORT ENGINE_SOURCES)
 
-# The transport is selected in two places that must agree: net_transport.h
-# picks the net_module_t symbol, and the build picks the translation unit.
-# Compiling the wrong one fails at the include (SDL_net.h) or at the link
-# (undefined net_sdl_module).
+# The partition between the two targets, in one place.
 #
-# Only the WebSocket transport is ever built here. net_sdl.c stays in the tree
-# as restored source for the M2 native engine and is excluded unconditionally,
-# because there is no configuration of this entry point that builds it.
+# The transport is selected twice and the two must agree: net_transport.h picks
+# the net_module_t symbol by preprocessor, and this picks the translation unit.
+# Compiling the wrong one fails at the include (SDL_net.h) or at the link
+# (undefined net_sdl_module), which is a deliberate property: the mismatch
+# cannot produce a working binary that talks to nothing.
+#
+# i_host_web.c and i_host_null.c are the two implementations of the host
+# notification seam declared in src/i_host.h. Exactly one is compiled, so a
+# notification added to only one of them fails to link rather than silently
+# doing nothing on the other target.
 
-list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_sdl.c)
+set(BROWSER_ONLY_SOURCES
+    ${ENGINE_ROOT}/src/net_websockets.c
+    ${ENGINE_ROOT}/src/net_ws_frame.c
+    ${ENGINE_ROOT}/src/i_webmusic.c
+    ${ENGINE_ROOT}/src/i_host_web.c
+    )
+
+set(NATIVE_ONLY_SOURCES
+    ${ENGINE_ROOT}/src/net_sdl.c
+    ${ENGINE_ROOT}/src/i_host_null.c
+    )
+
+if(DOOMIT_TARGET STREQUAL "browser")
+    list(REMOVE_ITEM ENGINE_SOURCES ${NATIVE_ONLY_SOURCES})
+else()
+    list(REMOVE_ITEM ENGINE_SOURCES ${BROWSER_ONLY_SOURCES})
+endif()
 
 add_executable(doom ${ENGINE_SOURCES})
 
@@ -181,6 +209,8 @@ target_compile_options(doom PRIVATE
     -ffile-prefix-map=${ENGINE_ROOT}/=
     )
 
+if(DOOMIT_TARGET STREQUAL "browser")
+
 set_target_properties(doom PROPERTIES SUFFIX ".js")
 
 target_compile_options(doom PRIVATE -sUSE_SDL=2 -sUSE_LIBPNG=1)
@@ -204,3 +234,39 @@ target_link_options(doom PRIVATE
     -sASYNCIFY_STACK_SIZE=32768
     -lwebsocket.js
     )
+
+else()
+
+# Native links the real libraries the browser build gets from emscripten ports.
+# SDL2_net is required rather than optional: it is what net_sdl.c needs, and a
+# native engine without its transport is not a target this contract offers.
+
+# The vendored sdl_mixer is partial: mixer.c keeps SDL_mixer's format dispatch
+# in Mix_LoadWAV_RW, whose AIFF and VOC branches call loaders this tree does
+# not carry. Nothing reaches that function. Doom loads its sfx from DMX lumps
+# through i_sdlsound.c, and the browser build has always dropped the whole
+# function during link, which is why those references have never been visible:
+# the symbols do not appear in doom.wasm at all.
+#
+# Sectioned compilation plus --gc-sections gives the native link the same
+# outcome by the same mechanism, rather than stubbing symbols the engine would
+# be unable to use or vendoring loaders it never calls.
+
+target_compile_options(doom PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(doom PRIVATE -Wl,--gc-sections)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SDL2 REQUIRED sdl2)
+pkg_check_modules(SDL2_NET REQUIRED SDL2_net)
+pkg_check_modules(PNG REQUIRED libpng)
+
+target_include_directories(doom PRIVATE
+    ${SDL2_INCLUDE_DIRS} ${SDL2_NET_INCLUDE_DIRS} ${PNG_INCLUDE_DIRS})
+
+target_link_directories(doom PRIVATE
+    ${SDL2_LIBRARY_DIRS} ${SDL2_NET_LIBRARY_DIRS} ${PNG_LIBRARY_DIRS})
+
+target_link_libraries(doom PRIVATE
+    ${SDL2_LIBRARIES} ${SDL2_NET_LIBRARIES} ${PNG_LIBRARIES} m)
+
+endif()

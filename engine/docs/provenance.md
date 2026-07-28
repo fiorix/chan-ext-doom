@@ -254,7 +254,8 @@ mkdir -p out
 emcc -Oz -std=gnu99 \
   '-Wno-#warnings' -Wno-macro-redefined -Wno-switch \
   -Igifenc -Iopl -Isdl_mixer -Isrc -Isrc/doom \
-  $(find gifenc opl sdl_mixer src -name '*.c' -not -name 'net_sdl.c' | LC_ALL=C sort) \
+  $(find gifenc opl sdl_mixer src -name '*.c' \
+        -not -name 'net_sdl.c' -not -name 'i_host_null.c' | LC_ALL=C sort) \
   -s WASM=1 -s USE_SDL=2 -s USE_LIBPNG=1 \
   -s ALLOW_MEMORY_GROWTH=1 -s NO_EXIT_RUNTIME=1 \
   -s EXPORTED_RUNTIME_METHODS=FS,UTF8ToString \
@@ -268,7 +269,8 @@ Four parts of that line are load-bearing:
 
 - `-std=gnu99` pins the language mode, for parity and reproducibility rather than to work around a broken default. emcc 6.0.3 defaults to GNU C17 (`__STDC_VERSION__` 201710L) and builds this tree without complaint, which is how the earlier unpinned pin was produced at all. The point is that GNU C17 and GNU C99 do not produce the same artifact: they differ by 83 wasm bytes. So an unpinned route leaves the pinned hashes hostage to whatever the toolchain default happens to be on the day, and pinning only one of the two routes is what once made a language difference look like a linker artifact. It must be GNU C99 rather than strict C99 because `sdl_mixer/music.c` calls `strtok_r`, which `-std=c99` hides behind `__STRICT_ANSI__`.
 
-- `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. There is no native build to mirror this: see "Native build" below.
+- `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native target excludes `net_websockets.c` for the mirror-image reason.
+- `-not -name i_host_null.c` keeps the native half of the host seam out. `src/i_host.h` declares the notifications the engine sends its host, and exactly one implementation is compiled: `i_host_web.c` here, `i_host_null.c` natively. Compiling both is a duplicate-symbol link failure, which is the intended way for that mistake to surface.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
 - `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1195049 to 1689701 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
@@ -312,26 +314,39 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188756 | b375a1eadb9c8cb5c90c7e5231b360792e52e49c5c9d5ac1750692e1a2ae56a5 |
-| doom.wasm | 1689701 | 9301edfe9ef92a297c390cc1b16ebec26dfc6d619225f4c340675931eb59db61 |
+| doom.js | 188773 | b358c18231ee471bf2245ac9a783f51155a3d003d4cf49cda60c2782b0dde15f |
+| doom.wasm | 1689820 | 2f6cd31a9db151464ef3e42281b1237b95536f10a2232b018e7e7dbaa222aeb0 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
 ## Native build
 
-**There is no native build of this fork, and the missing piece is the source, not the toolchain.**
+`CMakeLists.txt` builds one of two declared targets and never a mixture:
 
-With SDL2 2.32.10 and SDL2_net 2.2.0 present, a native configure gets past both packages and then dies partway through the build:
+```sh
+# browser
+source ~/dev/emsdk/emsdk_env.sh
+emcmake cmake -S engine -B build-web -DDOOMIT_TARGET=browser
 
+# native
+PKG_CONFIG_PATH=<prefix>/lib/pkgconfig cmake -S engine -B build-native -DDOOMIT_TARGET=native
 ```
-engine/src/doom/d_main.c:81:10: fatal error: emscripten.h: No such file or directory
-```
 
-That is not an isolated include. Fifteen translation units include `<emscripten.h>` unconditionally, only `i_timer.c` guards it. There are twenty-one `EM_ASM` sites spread across video, audio, input, joystick, GIF capture, ENDOOM and the game layer, with nine in `i_webmusic.c` alone. `d_main.c` inverts the game loop through `emscripten_set_main_loop` and `emscripten_cancel_main_loop`, which is an architectural difference rather than a flag. Selecting `net_sdl.c` instead of `net_websockets.c` changes none of it.
+Unset, the mode is inferred from the toolchain. It is still cross-checked against the compiler: `DOOMIT_TARGET=browser` requires a compiler defining `__EMSCRIPTEN__` and `DOOMIT_TARGET=native` refuses one, so a mode that disagrees with the toolchain is an error rather than a partial configure that dies later on a flag neither side understands.
 
-So `CMakeLists.txt` refuses a non-Emscripten toolchain at configure time rather than advertising a native target it cannot deliver. The refusal is checked before `project()`, so it fires before any C is compiled and before SDL is probed at all: a host with every native dependency installed still gets the same diagnostic, because the dependency that is missing is in this tree.
+Native dependencies: SDL2 2.32.10 and SDL2_net 2.2.0 (both required, from any prefix on `PKG_CONFIG_PATH`), and libpng. SDL_mixer is not needed; the tree vendors the parts of it that it uses.
 
-`net_sdl.c` remains in the tree as restored source, excluded from every build here and **not buildable as the tree stands**. It is the UDP transport that would let native chocolate-doom clients share a room, and it is complete; what is absent is a native engine to carry it. Producing one means porting the browser-only seams listed above, not flipping the transport selection.
+The two targets differ in more than a transport, and the difference is made in three places rather than scattered:
+
+- `src/i_host.h` declares what the engine tells its host. `i_host_web.c` dispatches browser CustomEvents and hands finished files to the page as object URLs; `i_host_null.c` does nothing, because a native host has a terminal rather than a page and its files are already on disk. Exactly one is compiled, so a notification added to one and not the other fails to link.
+- `net_transport.h` selects the `net_module_t`, and the build selects the matching translation unit: `net_websockets.c` for the browser, `net_sdl.c` natively.
+- `i_webmusic.c` drives a WebAudio graph through the host page and is browser-only. Native music is OPL synthesis, which is self-contained.
+
+The main loop is the one structural difference. A browser cannot be held in a loop of the engine's, so the browser build registers `D_DoomLoopIter` with `emscripten_set_main_loop` and returns; a native build owns its process and runs the same iteration in an ordinary loop at the end of `D_DoomLoop`. Both read the same `main_loop_started` flag, so startup ordering is identical.
+
+**Current native status: the target builds and links, and boots the pinned shareware IWAD through startup, but does not yet reach interactive play.** A native `doom` links at roughly 900 KB and reaches `W_Init` adding `doom1.wad`, the `DOOM Shareware` banner, `I_Init`, `NET_Init`, `M_Init`, `R_Init`, `P_Init`, `S_Init`, `D_CheckNetGame` reporting `player 1 of 1 (1 nodes)`, `HU_Init` and `ST_Init` with no error. It then aborts inside the attract-mode demo: `TryRunTics` to `G_Ticker` to `G_DoPlayDemo` to `G_DoLoadLevel` to `P_SetupLevel` to `S_ChangeMusic`, which reaches `W_CacheLumpNum` with lump `-1`. `S_ChangeMusic` looks a music lump up only when `music->lumpnum` is zero, so a stored `-1` is treated as a cached answer rather than as the failure it is. Native UDP interoperability against an upstream server is not demonstrated while that holds.
+
+`net_sdl.c` is compiled and linked into the native target rather than excluded, so the UDP transport is present in the binary; what has not been shown is a live session through it.
 
 ## Running it
 

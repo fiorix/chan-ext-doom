@@ -40,7 +40,7 @@
 
 #include "config.h"
 #ifdef HAVE_LIBPNG
-#include <emscripten.h>
+#include "i_host.h"
 #include <png.h>
 #endif
 
@@ -1008,12 +1008,7 @@ void WritePNGfile(char *filename, pixel_t *data,
     png_destroy_write_struct(&ppng, &pinfo);
     fclose(handle);
 
-    EM_ASM({
-        var filename = Module.UTF8ToString($0);
-        var url = URL.createObjectURL(new Blob([Module.FS.readFile(filename)], {type: 'image/png'}));
-        document.dispatchEvent(new CustomEvent("V_ScreenShot", { detail: { url: url } }));
-        Module.FS.unlink(filename);
-    }, filename);
+    I_HostFileReady("V_ScreenShot", filename, "image/png");
 }
 #endif
 

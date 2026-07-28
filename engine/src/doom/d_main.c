@@ -78,8 +78,7 @@
 #include "d_main.h"
 #include "i_gif.h"
 
-#include <emscripten.h>
-
+#include "i_host.h"
 // Inspect mode
 boolean inspectmode = false;
 boolean firstScreen = true;
@@ -469,6 +468,14 @@ void D_DoomLoopIter()
     }
 }
 
+// The browser cannot be blocked in a loop of ours: it has to return to its
+// own event loop for anything to happen, so the engine registers one
+// iteration and gets called back. A native build owns its process and runs
+// the ordinary loop at the end of D_DoomLoop instead. This is the one place
+// the two hosts differ structurally rather than in a called function.
+
+#ifdef __EMSCRIPTEN__
+
 EMSCRIPTEN_KEEPALIVE
 void D_SetLoopIter()
 {
@@ -480,6 +487,8 @@ void D_CancelLoopIter()
 {
     emscripten_cancel_main_loop();
 }
+
+#endif
 
 EMSCRIPTEN_KEEPALIVE
 char* G_GetGameDescription()
@@ -549,6 +558,19 @@ void D_DoomLoop (void)
     // above this line is startup that must complete before a tic can run.
 
     main_loop_started = true;
+
+#ifndef __EMSCRIPTEN__
+
+    // Native: nothing is going to call us back, so run the iteration the
+    // browser would have driven. D_DoomLoopIter reads the same flag set
+    // immediately above, so the startup ordering is identical either way.
+
+    while (true)
+    {
+        D_DoomLoopIter();
+    }
+
+#endif
 }
 
 
@@ -1388,9 +1410,18 @@ void D_DoomMain (void)
 
     I_PrintBanner(PACKAGE_STRING);
 
+#ifdef __EMSCRIPTEN__
+
+    // Registered here rather than in D_DoomLoop because Asyncify can yield to
+    // the browser during startup, and the browser needs something to call.
+    // D_DoomLoopIter refuses to tick until D_DoomLoop says startup is done.
+
     printf("D_MAIN: init emscripten main loop.\n");
     D_SetLoopIter();
     I_AtExit(D_CancelLoopIter, true);
+
+#endif
+
     I_AtExit(D_Endoom, false);
 
     DEH_printf("Z_Init: Init zone memory allocation daemon. \n");

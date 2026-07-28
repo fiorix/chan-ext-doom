@@ -19,8 +19,7 @@
 
 #include "SDL.h"
 
-#include <emscripten.h>
-
+#include "i_host.h"
 #include "config.h"
 #include "d_loop.h"
 #include "deh_str.h"
@@ -452,13 +451,28 @@ static void LimitTextureSize(int *w_upscale, int *h_upscale)
                 SDL_GetError());
     }
 
-    while (*w_upscale * SCREENWIDTH > rinfo.max_texture_width)
+    // SDL reports 0 for "no limit", not for "no texture may exist". Clamping
+    // against it drives the scale factor to zero and then SDL_CreateTexture
+    // is asked for a 0x0 texture and fails. The I_Error below already knows
+    // this, which is why it is conditional on the maximum being positive, but
+    // nothing restored the factor it had already destroyed. Any renderer
+    // reporting no limit hits this, which includes the software renderer used
+    // for headless runs.
+
+    if (rinfo.max_texture_width > 0)
     {
-        --*w_upscale;
+        while (*w_upscale * SCREENWIDTH > rinfo.max_texture_width)
+        {
+            --*w_upscale;
+        }
     }
-    while (*h_upscale * SCREENHEIGHT > rinfo.max_texture_height)
+
+    if (rinfo.max_texture_height > 0)
     {
-        --*h_upscale;
+        while (*h_upscale * SCREENHEIGHT > rinfo.max_texture_height)
+        {
+            --*h_upscale;
+        }
     }
 
     if ((*w_upscale < 1 && rinfo.max_texture_width > 0) ||
@@ -1112,11 +1126,7 @@ void I_InitGraphics(void)
 
     I_AtExit(I_ShutdownGraphics, true);
 
-    EM_ASM(
-        if (Module && Module.canvas && typeof Module.canvas.calcRatio == "function"){
-            Module.canvas.calcRatio();
-        }
-    );
+    I_HostResizeCanvas(false);
 }
 
 EMSCRIPTEN_KEEPALIVE

@@ -63,7 +63,9 @@ int snd_sfxdevice = SNDDEVICE_SB;
 
 extern sound_module_t sound_sdl_module;
 extern music_module_t music_opl_module;
+#ifdef __EMSCRIPTEN__
 extern music_module_t music_web_module;
+#endif
 
 // For OPL module:
 
@@ -89,9 +91,14 @@ static sound_module_t *sound_modules[] =
 
 // Compiled-in music modules:
 
+// The web module drives a WebAudio graph through the host page, so it exists
+// only in a browser build. OPL synthesis is self-contained and serves both.
+
 static music_module_t *music_modules[] =
 {
+#ifdef __EMSCRIPTEN__
     &music_web_module,
+#endif
     &music_opl_module,
     NULL,
 };

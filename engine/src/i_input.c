@@ -27,8 +27,7 @@
 #include "m_argv.h"
 #include "m_config.h"
 
-#include <emscripten.h>
-
+#include "i_host.h"
 static const int scancode_translate_table[] = SCANCODE_TO_KEYS_ARRAY;
 
 // Lookup table for mapping ASCII characters to their equivalent when

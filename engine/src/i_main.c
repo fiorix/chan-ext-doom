@@ -26,8 +26,7 @@
 #include "i_system.h"
 #include "m_argv.h"
 
-#include <emscripten.h>
-
+#include "i_host.h"
 //
 // D_DoomMain()
 // Not a globally visible function, just included for source reference,
