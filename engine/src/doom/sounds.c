@@ -225,5 +225,18 @@ sfxinfo_t S_sfx[] =
   SOUND("skesit", 70),
   SOUND("skeatk", 70),
   SOUND("radio",  60),
+
+  // Restored from crispy-doom-5.6.2 (blob 8906bfdd4dd7e6576c4e3291165aa0fc58c9b398).
+  // sfxenum_t in sounds.h already names these six, so a table stopping at
+  // "radio" is shorter than NUMSFX claims, and S_Start's initialisation loop
+  // runs past the end of S_sfx into whatever the linker placed next.
+
+  SOUND("dgsit",  98),
+  SOUND("dgatk",  70),
+  SOUND("dgact", 120),
+  SOUND("dgdth",  70),
+  SOUND("dgpain", 96),
+  // [crispy] play DSSECRET if available
+  SOUND("secret",  60),
 };
 

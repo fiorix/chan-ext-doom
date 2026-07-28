@@ -314,8 +314,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188773 | b358c18231ee471bf2245ac9a783f51155a3d003d4cf49cda60c2782b0dde15f |
-| doom.wasm | 1689820 | 2f6cd31a9db151464ef3e42281b1237b95536f10a2232b018e7e7dbaa222aeb0 |
+| doom.js | 188773 | 692d05e8eb96d913cd3f3f66e10fd66cdaca2b947318463166847ae3cdebe84b |
+| doom.wasm | 1690108 | 814929d027480cf74c6734d3ece5b42c62c46d3d21a35fea15d79e16ee1dc009 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
@@ -344,9 +344,9 @@ The two targets differ in more than a transport, and the difference is made in t
 
 The main loop is the one structural difference. A browser cannot be held in a loop of the engine's, so the browser build registers `D_DoomLoopIter` with `emscripten_set_main_loop` and returns; a native build owns its process and runs the same iteration in an ordinary loop at the end of `D_DoomLoop`. Both read the same `main_loop_started` flag, so startup ordering is identical.
 
-**Current native status: the target builds and links, and boots the pinned shareware IWAD through startup, but does not yet reach interactive play.** A native `doom` links at roughly 900 KB and reaches `W_Init` adding `doom1.wad`, the `DOOM Shareware` banner, `I_Init`, `NET_Init`, `M_Init`, `R_Init`, `P_Init`, `S_Init`, `D_CheckNetGame` reporting `player 1 of 1 (1 nodes)`, `HU_Init` and `ST_Init` with no error. It then aborts inside the attract-mode demo: `TryRunTics` to `G_Ticker` to `G_DoPlayDemo` to `G_DoLoadLevel` to `P_SetupLevel` to `S_ChangeMusic`, which reaches `W_CacheLumpNum` with lump `-1`. `S_ChangeMusic` looks a music lump up only when `music->lumpnum` is zero, so a stored `-1` is treated as a cached answer rather than as the failure it is. Native UDP interoperability against an upstream server is not demonstrated while that holds.
+**Current native status: the target builds, links, boots the pinned shareware IWAD and runs.** A native `doom` links at roughly 900 KB and reaches `W_Init` adding `doom1.wad`, the `DOOM Shareware` banner, `I_Init`, `NET_Init`, `M_Init`, `R_Init`, `P_Init`, `S_Init`, `D_CheckNetGame` reporting `player 1 of 1 (1 nodes)`, `HU_Init` and `ST_Init`, then runs the attract sequence with no error on stderr.
 
-`net_sdl.c` is compiled and linked into the native target rather than excluded, so the UDP transport is present in the binary; what has not been shown is a live session through it.
+`net_sdl.c` is compiled and linked into the native target, so the UDP transport is present in the binary. A live session against an upstream server has not been demonstrated.
 
 ## Running it
 

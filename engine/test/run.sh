@@ -56,6 +56,16 @@ $CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
     src/doom/d_statecanary.c src/d_democanary.c test/test_statecanary.c \
     -o "$OUT/test_statecanary"
 
+# The sound tables must be exactly as long as the enums that index them. A
+# short table is not silence, it is an out-of-bounds write over the array the
+# linker placed next.
+$CC -std=c99 -Wall -Wextra -Werror -Wno-unused-parameter \
+    -Isrc -Isrc/doom \
+    src/doom/sounds.c test/test_sound_tables.c \
+    -o "$OUT/test_sound_tables"
+
+"$OUT/test_sound_tables"
+
 "$OUT/test_statecanary"
 
 "$OUT/test_democanary"
