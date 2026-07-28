@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
-use doom_proto::{ClientPacket, WireHeader};
+use doom_proto::{ClientPacket, GameDataServer, ServerPacket, WireHeader};
 
 use crate::runtime::{
     BindRoom, Effects, ListenerId, Runtime, SharedState, UdpPeer, classify_malformed,
@@ -25,6 +25,44 @@ pub(crate) const MAX_DATAGRAM_LEN: usize = 1500;
 /// oversized original datagram is always detected and rejected whole
 /// rather than truncated into a valid-looking packet.
 const RECV_BUF_LEN: usize = 2048;
+
+/// The accepted outbound-size adaptation (the proto-35 addendum 4/5
+/// and engine-31 FU17 oracle): an oversize `GAMEDATA` emission is
+/// re-encoded as the largest complete NEWEST suffix of its tic span
+/// that fits the ceiling, with the advertised start advanced by the
+/// omitted count (u8 wrap-safe by the expansion straddle rule) and the
+/// original newest tic last, the only tic whose latency the client
+/// uses for clock sync. The pinned client then requests exactly the
+/// omitted prefix through its ordinary `GAMEDATA_RESEND` path, whose
+/// bounded answers repeat the same rule, so reconstruction is exact
+/// and terminates. Anything else over the ceiling — a non-`GAMEDATA`
+/// packet or a one-tic oversize, neither reachable from accepted input
+/// — cannot be adapted and takes the isolated-recipient producer-error
+/// path. The boundary is inclusive: exactly 1500 bytes is emitted
+/// unadapted.
+fn adapt_gamedata(bytes: &[u8], lowres: bool) -> Option<Vec<u8>> {
+    let (header, packet) = ServerPacket::decode(bytes, lowres).ok()?;
+    let ServerPacket::GameData(data) = packet else {
+        return None;
+    };
+    let total = data.tics.len();
+    // The full span is already known to exceed the ceiling, so only
+    // proper suffixes are candidates; the first fit is the largest.
+    for count in (1..total).rev() {
+        let omitted = total - count;
+        let candidate = ServerPacket::GameData(GameDataServer {
+            start: data.start.wrapping_add(omitted as u8),
+            tics: data.tics[omitted..].to_vec(),
+        });
+        let encoded = candidate
+            .encode(header, lowres)
+            .expect("a gamedata suffix always encodes");
+        if encoded.len() <= MAX_DATAGRAM_LEN {
+            return Some(encoded);
+        }
+    }
+    None
+}
 
 /// One listener task per configured `--udp ROOM=ADDR` bind: receives
 /// datagrams for its pinned room, drives the shared runtime, and sends
@@ -219,11 +257,12 @@ impl Runtime {
     /// pending batch for the send attempt clears this listener's
     /// removal tombstones, and a room left empty afterwards is dropped
     /// here, so pending traffic is part of room lifetime. An outbound
-    /// datagram over the 1500-byte ceiling is a distinct producer
-    /// error: it is never truncated, split, silently dropped, or sent
-    /// through the slow-consumer path, and it isolates exactly its
-    /// intended recipient through the normal removal path while every
-    /// other peer continues.
+    /// datagram over the 1500-byte ceiling is first offered to the
+    /// accepted `GAMEDATA` newest-suffix adaptation; only a packet that
+    /// cannot be adapted is a distinct producer error, never truncated,
+    /// split, silently dropped, or sent through the slow-consumer path,
+    /// isolating exactly its intended recipient through the normal
+    /// removal path while every other peer continues.
     pub(crate) fn drain_udp(
         &mut self,
         listener: ListenerId,
@@ -241,13 +280,17 @@ impl Runtime {
             let Some(room) = rooms.get_mut(room_name) else {
                 return out;
             };
+            let lowres = room.host.lowres_turn();
             if let Some(pending) = room.pending_udp.get_mut(&listener) {
                 while let Some((address, bytes)) = pending.pop_front() {
                     if bytes.len() > MAX_DATAGRAM_LEN {
-                        eprintln!(
-                            "doomd udp: producer error: {} bytes exceeds the 1500-byte datagram ceiling for {address}; discarded with its removed peer",
-                            bytes.len()
-                        );
+                        match adapt_gamedata(&bytes, lowres) {
+                            Some(adapted) => out.push((address, adapted)),
+                            None => eprintln!(
+                                "doomd udp: producer error: {} bytes exceeds the 1500-byte datagram ceiling for {address}; discarded with its removed peer",
+                                bytes.len()
+                            ),
+                        }
                         continue;
                     }
                     out.push((address, bytes));
@@ -268,6 +311,14 @@ impl Runtime {
                 while let Some(packet) = room.host.pop_outbound(player) {
                     let bytes = packet.payload();
                     if bytes.len() > MAX_DATAGRAM_LEN {
+                        // Input-reachable oversize (a three-player
+                        // extratics=127 GAMEDATA span) is adapted, never
+                        // isolated; only the impossible non-GAMEDATA or
+                        // one-tic case takes the producer-error path.
+                        if let Some(adapted) = adapt_gamedata(bytes, lowres) {
+                            out.push((address, adapted));
+                            continue;
+                        }
                         eprintln!(
                             "doomd udp: producer error: {} bytes exceeds the 1500-byte datagram ceiling for {address}; isolating the recipient",
                             bytes.len()
