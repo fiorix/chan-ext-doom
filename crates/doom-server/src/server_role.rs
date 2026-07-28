@@ -1335,8 +1335,9 @@ impl ServerRole {
     /// Pinned `NET_SV_AdvanceWindow`: advance only up to the minimum
     /// acknowledgement and only while the first tic is complete for
     /// every connected non-drone player. Disconnected or draining peers
-    /// and drones never hold advancement. Absolute identity is preserved
-    /// by construction while shifting.
+    /// never hold advancement; connected drones hold the minimum
+    /// acknowledgement but contribute no receive completeness columns.
+    /// Absolute identity is preserved by construction while shifting.
     fn advance_window(&mut self) {
         let Some(min_ack) = self.latest_acknowledged() else {
             return;
@@ -1571,6 +1572,30 @@ impl ServerRole {
         )]
     }
 
+    /// Pinned deadlock request: the wire always asks for the first
+    /// missing tic plus five (six tics), even when that interval extends
+    /// past the window tail; only the local stamps are bounded.
+    fn emit_deadlock_resend(
+        &mut self,
+        player: PlayerId,
+        index: usize,
+        first: usize,
+    ) -> Vec<Action> {
+        let now = self.clock;
+        let Some(recv) = self.recv.as_mut() else {
+            return Vec::new();
+        };
+        for slot in first..=(first + 5).min(BACKUPTICS - 1) {
+            recv.entries[slot][index].resend_time = Some(now);
+        }
+        let start = recv.start + first as u32;
+        vec![self.emit(
+            player,
+            plain(),
+            ServerPacket::GameDataResend { start, count: 6 },
+        )]
+    }
+
     /// Pinned `NET_SV_CheckDeadlock`: strictly more than 1000 ms without
     /// accepted in-range game data from a connected non-drone player
     /// triggers a resend request for the first missing tic plus five and
@@ -1600,12 +1625,14 @@ impl ServerRole {
             return actions;
         }
 
-        // The first missing tic for this player, plus five.
+        // The first missing tic for this player, plus five: the pinned
+        // wire request always covers six tics; only the local stamps are
+        // bounded to the window.
         let missing = (0..BACKUPTICS).find(|slot| !recv.entries[*slot][index].active);
         let Some(first) = missing else {
             return actions;
         };
-        actions.extend(self.emit_resend(player, index, first, (first + 5).min(BACKUPTICS - 1)));
+        actions.extend(self.emit_deadlock_resend(player, index, first));
 
         // Replay the client's exact unacknowledged queue.
         let (acknowledged, sendseq) = {
