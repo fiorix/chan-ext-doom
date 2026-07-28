@@ -17,15 +17,19 @@ pub const MAX_ROOM_NAME_LEN: usize = 64;
 /// Maximum opaque packet size accepted by the room core.
 pub const MAX_PAYLOAD_LEN: usize = 65_527;
 
-/// The largest legitimate host-originated batch one atomic reduction
-/// can queue for a single recipient, measured from the accepted
-/// protocol semantics: 64 contiguous expired resend runs in a 128-slot
-/// window, plus at most 40 replayed unacknowledged tics (the 40-tic
-/// stall guard), one deadlock request, one pump emission, one reliable
-/// retry, and one keepalive. Host batches are producer-bounded, so the
-/// effective memory bound per member is
-/// `outbox_capacity + MAX_HOST_BATCH` (64 + 108 = 172 with defaults).
-pub const MAX_HOST_BATCH: usize = 108;
+/// The exact largest legitimate host-originated batch one atomic
+/// reduction can queue for a single recipient, in packet units,
+/// composition-proved against the accepted protocol semantics: 64
+/// contiguous expired resend-run requests in a 128-slot window, one
+/// pump emission, one keepalive, and one head-only reliable-lane
+/// emission. The deadlock request and replay cannot raise it, because
+/// stamping from the first missing slot suppresses enough expired
+/// runs in the same pass, and foreign timeout broadcasts share the
+/// same reliable lane. The exact maximum retained outbox count is
+/// `(capacity - 1) + MAX_HOST_BATCH` (63 + 67 = 130 with defaults),
+/// because a batch-start snapshot at capacity removes on the next
+/// send; `capacity + MAX_HOST_BATCH` is a safe loose upper bound.
+pub const MAX_HOST_BATCH: usize = 67;
 
 /// A validated room name.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

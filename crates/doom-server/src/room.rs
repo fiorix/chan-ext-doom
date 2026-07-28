@@ -11,8 +11,8 @@ use doom_proto::{ClientPacket, WireHeader};
 
 use crate::server_role::{Action, Input, MalformedClass, Milliseconds, ServerRole};
 use crate::{
-    HostError, HostOutcome, JoinError, OutboundPacket, PlayerId, Registry, RelayError,
-    RelayOutcome, RoomName,
+    HostError, HostOutcome, JoinError, MAX_HOST_BATCH, OutboundPacket, PlayerId, Registry,
+    RelayError, RelayOutcome, RoomName,
 };
 
 /// What the binding must apply after one consistent reduction batch.
@@ -209,6 +209,13 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         let mut effect = HostEffect::default();
         let mut removals = removals;
         let mut pending = actions;
+        // The producer invariant, enforced distinctly from the
+        // slow-consumer policy: one reduction may queue at most
+        // MAX_HOST_BATCH host-originated sends for one recipient,
+        // across the initial batch and every recursively induced
+        // Leave batch. Exceeding it is a producer bug, never a slow
+        // peer, so it fails loudly instead of disconnecting anyone.
+        let mut produced: Vec<(PlayerId, usize)> = Vec::new();
         while !pending.is_empty() {
             let mut next = Vec::new();
             for action in pending.drain(..) {
@@ -221,6 +228,23 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                         let bytes = packet
                             .encode(header, self.role.lowres_turn())
                             .expect("role outputs always encode");
+                        {
+                            let position = produced
+                                .iter()
+                                .position(|(candidate, _)| *candidate == player);
+                            let index = match position {
+                                Some(index) => index,
+                                None => {
+                                    produced.push((player, 0));
+                                    produced.len() - 1
+                                }
+                            };
+                            produced[index].1 += 1;
+                            assert!(
+                                produced[index].1 <= MAX_HOST_BATCH,
+                                "one reduction produced more than {MAX_HOST_BATCH} host sends for {player:?}"
+                            );
+                        }
                         match self
                             .registry
                             .queue_host(player, self.server_metadata.clone(), &bytes)

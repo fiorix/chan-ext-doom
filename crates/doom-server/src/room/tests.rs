@@ -313,6 +313,12 @@ fn host_origin_slow_consumer_feeds_leave_into_the_role_once() {
         assert_eq!(outcome, RelayOutcome::Queued(bob));
     }
 
+    // A zero-production pass first: bob merely has packets queued, and
+    // the policy is next-packet-removes, never proactive eviction.
+    let effect = h.tick(Milliseconds(T0.0 + 500));
+    assert!(effect.disconnects.is_empty());
+    assert!(h.contains(bob));
+
     // The next host-originated send to bob (the waiting-data cadence)
     // removes him, and the role is told in the same batch. Alice has
     // headroom and survives the cascade.
