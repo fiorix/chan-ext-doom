@@ -347,14 +347,27 @@ impl ServerRole {
         // A member that never completed SYN is not a protocol client: its
         // removal carries no abort or game-end effects.
         if !peer.syn {
-            self.peers.remove(&player);
-            return vec![Action::Disconnect {
-                player,
-                reason: DisconnectReason::Remote,
-                terminal: None,
-            }];
+            return self.remove_unconnected(player, DisconnectReason::Remote, None);
         }
         self.remove_connected(player, DisconnectReason::Remote, None, None)
+    }
+
+    /// Remove a member that never completed SYN. Pinned
+    /// `NET_SV_SendReject` handling: the address never becomes an active
+    /// client, so no abort, zero-player, broadcast, or game-end path can
+    /// fire for it, and no other admitted member is touched.
+    fn remove_unconnected(
+        &mut self,
+        player: PlayerId,
+        reason: DisconnectReason,
+        terminal: Option<Box<(WireHeader, ServerPacket)>>,
+    ) -> Vec<Action> {
+        self.peers.remove(&player);
+        vec![Action::Disconnect {
+            player,
+            reason,
+            terminal,
+        }]
     }
 
     /// The single removal path for protocol-connected peers.
@@ -1133,18 +1146,17 @@ impl ServerRole {
         })
     }
 
+    /// Reject a never-connected peer. Only the stranger is removed, with
+    /// the terminal REJECTED riding the close atomically; no connected
+    /// client abort, zero-player, broadcast, or game-end path runs, and
+    /// no admitted bystander is affected (pinned `NET_SV_SendReject`).
     fn reject(&mut self, actions: &mut Vec<Action>, player: PlayerId, mut reason: Vec<u8>) {
         reason.truncate(256);
         let terminal = Box::new((
             WireHeader { reliable_seq: None },
             ServerPacket::Rejected { reason },
         ));
-        actions.extend(self.remove_connected(
-            player,
-            DisconnectReason::Remote,
-            None,
-            Some(terminal),
-        ));
+        actions.extend(self.remove_unconnected(player, DisconnectReason::Remote, Some(terminal)));
     }
 
     /// Begin an initiated DISCONNECT: five sends at one-second intervals

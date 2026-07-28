@@ -2117,3 +2117,132 @@ fn reliable_cap_is_literally_sixty_four() {
     );
     assert_eq!(h.role.peer_count(), 0);
 }
+
+#[test]
+fn rejection_on_empty_room_emits_no_game_ended() {
+    let mut h = Harness::new();
+    let stranger = h.join("s");
+    let mut syn = syn_value("Stranger", 0, 0, 0);
+    syn.protocols = vec![b"OBSOLETE".to_vec()];
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: stranger,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn),
+        },
+    );
+
+    // Exactly the terminal rejection/removal; nothing else.
+    assert_eq!(actions.len(), 1);
+    let expected = format!(
+        "Version mismatch: server version is: {}; client is: Chocolate Doom 3.1.1. No common compatible protocol could be negotiated.",
+        String::from_utf8_lossy(super::SERVER_VERSION)
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| is_reject_with(a, expected.as_bytes()))
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::GameEnded)),
+        "a rejected stranger must not end the game"
+    );
+    assert_eq!(h.role.peer_count(), 0);
+}
+
+#[test]
+fn rejection_leaves_presyn_bystander_untouched() {
+    let mut h = Harness::new();
+    let stranger = h.join("s");
+    let bystander = h.join("b");
+    let mut syn = syn_value("Stranger", 0, 0, 0);
+    syn.protocols = vec![b"OBSOLETE".to_vec()];
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: stranger,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn),
+        },
+    );
+
+    // The bystander is neither targeted nor removed, and no game-end or
+    // broadcast path fires.
+    assert!(
+        Harness::sends_to(&actions, bystander).is_empty(),
+        "the bystander must receive nothing, got {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Disconnect { player, .. } if *player == bystander)),
+        "the bystander must not be removed"
+    );
+    assert!(!actions.iter().any(|a| matches!(a, Action::GameEnded)));
+    assert_eq!(h.role.peer_count(), 1);
+    assert_eq!(
+        h.role.peers.get(&bystander).map(|peer| peer.syn),
+        Some(false),
+        "the bystander remains an admitted pre-SYN member"
+    );
+}
+
+#[test]
+fn rejection_terminal_stays_final_before_close_in_the_reducer() {
+    #[derive(Default)]
+    struct MockHost {
+        outboxes: std::collections::BTreeMap<PlayerId, Vec<ServerPacket>>,
+        closed: Vec<PlayerId>,
+    }
+    impl MockHost {
+        fn apply(&mut self, actions: &[Action]) {
+            for action in actions {
+                match action {
+                    Action::Send { player, packet, .. } => {
+                        self.outboxes
+                            .entry(*player)
+                            .or_default()
+                            .push(packet.clone());
+                    }
+                    Action::Disconnect {
+                        player, terminal, ..
+                    } => {
+                        if let Some(terminal) = terminal {
+                            self.outboxes
+                                .entry(*player)
+                                .or_default()
+                                .push(terminal.1.clone());
+                        }
+                        self.closed.push(*player);
+                    }
+                    Action::GameEnded => {}
+                }
+            }
+        }
+    }
+
+    let mut h = Harness::new();
+    let stranger = h.join("s");
+    let bystander = h.join("b");
+    let mut syn = syn_value("Stranger", 0, 0, 0);
+    syn.protocols = vec![b"OBSOLETE".to_vec()];
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: stranger,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn),
+        },
+    );
+
+    let mut host = MockHost::default();
+    host.apply(&actions);
+    let outbox = host.outboxes.get(&stranger).expect("an outbox exists");
+    assert!(
+        matches!(outbox.last(), Some(ServerPacket::Rejected { .. })),
+        "the terminal REJECTED is the final packet before the close"
+    );
+    assert!(host.closed.contains(&stranger));
+    assert!(!host.closed.contains(&bystander));
+}
