@@ -2509,6 +2509,13 @@ fn expand_boundaries_wrap_and_range() {
 fn upload_stores_only_in_range_tics_and_raises_ack_monotonically() {
     let (mut h, alice) = in_game_one();
 
+    // Three single-player pumps put tics 0..2 on the wire, so the
+    // acknowledgement of exactly the send sequence below is the valid
+    // ceiling boundary rather than an acknowledgement of unsent tics.
+    h.tick(1);
+    h.tick(2);
+    h.tick(3);
+
     // Tics 0..2 in range, nothing missing behind them: no request.
     let actions = h.role.handle(
         T0,
@@ -2769,6 +2776,17 @@ fn stall_guard_stops_pumping_past_forty_ahead() {
             .as_mut()
             .expect("game");
         game.sendseq = 40;
+        // The forced send sequence skips the queue entries real pumps
+        // would have written; the all-or-nothing span needs them whole.
+        for seq in 39..=41u32 {
+            game.sendqueue[(seq as usize) % BACKUPTICS] = Some(QueuedTic {
+                seq,
+                tic: doom_proto::FullTic {
+                    latency: 0,
+                    players: Vec::new(),
+                },
+            });
+        }
     }
     assert_eq!(
         gamedata_to(&h.tick(1), alice).len(),
@@ -2794,12 +2812,14 @@ fn stall_guard_stops_pumping_past_forty_ahead() {
 #[test]
 fn advance_window_requires_min_ack_and_completeness() {
     let (mut h, alice, bob) = in_game_two();
+    // Alice uploads tic 0; nothing has been sent to her yet, so her
+    // upload cannot carry a valid non-zero acknowledgement.
     h.role.handle(
         T0,
         Input::Packet {
             player: alice,
             header: WireHeader { reliable_seq: None },
-            packet: upload(1, 0, vec![(1, diff(1))]),
+            packet: upload(0, 0, vec![(1, diff(1))]),
         },
     );
     h.tick(1);
@@ -2809,8 +2829,8 @@ fn advance_window_requires_min_ack_and_completeness() {
         "bob's tic is required"
     );
 
-    // Bob's tic completes the first window slot; both ack to 1 (his
-    // upload carries its own ack); the window advances by one only.
+    // Bob's tic completes the first window slot. His first pump above
+    // sent his tic 0, so the ack 1 his upload carries is exactly valid.
     {
         let recv = h.role.recv.as_ref().expect("window");
         assert_eq!(recv.entries[0][0].diff.forward, Some(1));
@@ -2823,6 +2843,9 @@ fn advance_window_requires_min_ack_and_completeness() {
             packet: upload(1, 0, vec![(1, diff(2))]),
         },
     );
+    // Alice's first pump happens once bob's tic is in; only then can her
+    // standalone ack 1 pass the send-sequence ceiling.
+    h.tick(2);
     h.role.handle(
         T0,
         Input::Packet {
@@ -2831,7 +2854,7 @@ fn advance_window_requires_min_ack_and_completeness() {
             packet: ClientPacket::GameDataAck { ack: 1 },
         },
     );
-    h.tick(2);
+    h.tick(3);
     assert_eq!(h.role.recv.as_ref().expect("window").start, 1);
 
     // The completed tic is consumed off the bottom of the window; the
@@ -3128,4 +3151,516 @@ fn transcript_single_player_gamedata_stable_fields() {
         "single-player fan-out carries no other player's commands"
     );
     let _ = header;
+}
+
+// --- followup battery: frozen indices, acknowledgement contract, abuse
+// bounds, drones, resend immutability, zero-count split, wire asymmetry
+
+fn acknowledged(h: &Harness, player: PlayerId) -> u32 {
+    h.role
+        .peers
+        .get(&player)
+        .expect("peer")
+        .game
+        .as_ref()
+        .expect("game")
+        .acknowledged
+}
+
+fn active_count(h: &Harness) -> usize {
+    h.role
+        .recv
+        .as_ref()
+        .expect("window")
+        .entries
+        .iter()
+        .flatten()
+        .filter(|entry| entry.active)
+        .count()
+}
+
+fn queued(latency: i16, seq: u32) -> QueuedTic {
+    QueuedTic {
+        seq,
+        tic: doom_proto::FullTic {
+            latency,
+            players: Vec::new(),
+        },
+    }
+}
+
+fn game_mut(h: &mut Harness, player: PlayerId) -> &mut PeerGame {
+    h.role
+        .peers
+        .get_mut(&player)
+        .expect("peer")
+        .game
+        .as_mut()
+        .expect("game")
+}
+
+fn send(h: &mut Harness, player: PlayerId, packet: ClientPacket) -> Vec<Action> {
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player,
+            header: WireHeader { reliable_seq: None },
+            packet,
+        },
+    )
+}
+
+/// Drive a three-player room into InGame with extratics 1.
+fn in_game_three() -> (Harness, PlayerId, PlayerId, PlayerId) {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    let carol = h.join("c");
+    h.syn(alice, "Alice");
+    h.syn(bob, "Bob");
+    h.syn(carol, "Carol");
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.ack(bob, 1);
+    h.ack(carol, 1);
+    h.gamestart(alice, 1, 0);
+    h.gamestart(bob, 0, 0);
+    h.gamestart(carol, 0, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    (h, alice, bob, carol)
+}
+
+/// Drive a player-plus-drone room into InGame with extratics 1.
+fn in_game_drone() -> (Harness, PlayerId, PlayerId) {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let drone = h.join("d");
+    h.syn(alice, "Alice");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_value("Observer", 0, 0, 1)),
+        },
+    );
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.ack(drone, 1);
+    h.gamestart(alice, 1, 0);
+    h.gamestart(drone, 0, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    (h, alice, drone)
+}
+
+/// Drive a two-player room into InGame with controller extratics 127.
+fn in_game_two_127() -> (Harness, PlayerId, PlayerId) {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    h.syn(alice, "Alice");
+    h.syn(bob, "Bob");
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.ack(bob, 1);
+    let mut settings = settings_value(0);
+    settings.extratics = 127;
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader {
+                reliable_seq: Some(1),
+            },
+            packet: ClientPacket::GameStart(settings),
+        },
+    );
+    h.gamestart(bob, 0, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    assert_eq!(
+        h.role.settings.as_ref().expect("settings").extratics,
+        127,
+        "the controller settings are authoritative"
+    );
+    (h, alice, bob)
+}
+
+#[test]
+fn acknowledgement_contract_ceiling_negative_and_independence() {
+    let (mut h, alice) = in_game_one();
+    // Three single-player pumps put tics 0..2 on the wire.
+    h.tick(1);
+    h.tick(2);
+    h.tick(3);
+
+    // Exactly the send sequence: valid.
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 3 });
+    assert_eq!(acknowledged(&h, alice), 3);
+
+    // One beyond what was ever sent: invalid. The expansion itself is
+    // non-negative (4), so this is blocked by the ceiling alone.
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 4 });
+    assert_eq!(acknowledged(&h, alice), 3);
+
+    // 0xb0 expands to +176 against a zero window: again blocked only by
+    // the ceiling, never by negativity (0xb0 does not wrap down).
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 0xb0 });
+    assert_eq!(acknowledged(&h, alice), 3);
+
+    // 0xb1 expands to -79: invalid regardless of the ceiling.
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 0xb1 });
+    assert_eq!(acknowledged(&h, alice), 3);
+
+    // A regression is ignored.
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 2 });
+    assert_eq!(acknowledged(&h, alice), 3);
+
+    // An invalid acknowledgement never blocks valid in-window tics in
+    // the same packet.
+    send(&mut h, alice, upload(0xb1, 1, vec![(5, diff(4))]));
+    assert!(h.role.recv.as_ref().expect("window").entries[1][0].active);
+    assert_eq!(acknowledged(&h, alice), 3);
+}
+
+#[test]
+fn negative_expanded_start_skips_insertion_and_gaps_but_ack_applies() {
+    let (mut h, alice) = in_game_one();
+    h.tick(1);
+    h.tick(2);
+    h.tick(3);
+
+    // start 0xb1 expands to -79 against a zero window. The upload carries
+    // 90 tics: if a negative start were inserted offset by offset,
+    // offsets 79..89 would land inside the window.
+    let tics: Vec<(i16, doom_proto::TiccmdDiff)> = (0..90i16).map(|i| (i, diff(1))).collect();
+    let actions = send(&mut h, alice, upload(2, 0xb1, tics));
+    assert!(
+        actions.is_empty(),
+        "no gap generation from a negative start"
+    );
+    assert_eq!(
+        active_count(&h),
+        0,
+        "nothing inserted from a negative start"
+    );
+    assert_eq!(acknowledged(&h, alice), 2, "the valid ack still applied");
+}
+
+#[test]
+fn extratics_127_accepted_128_rejected() {
+    // 128 cannot be served atomically from a 128-entry queue: rejected
+    // as malformed at GAMESTART, with no adoption and no readiness.
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+    h.launch(alice);
+    h.ack(alice, 1);
+    let mut settings = settings_value(0);
+    settings.extratics = 128;
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader {
+                reliable_seq: Some(1),
+            },
+            packet: ClientPacket::GameStart(settings),
+        },
+    );
+    // Only the reliable acknowledgement; no adoption, no readiness.
+    assert!(!actions.is_empty());
+    assert!(actions.iter().all(|a| matches!(
+        a,
+        Action::Send {
+            packet: ServerPacket::ReliableAck { .. },
+            ..
+        }
+    )));
+    assert_eq!(h.role.state(), ServerState::WaitingStart);
+    assert!(h.role.settings.is_none());
+    assert!(!h.role.peers.get(&alice).expect("peer").ready);
+
+    // 127 spans at most the whole queue: accepted, and the game starts.
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+    h.launch(alice);
+    h.ack(alice, 1);
+    let mut settings = settings_value(0);
+    settings.extratics = 127;
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader {
+                reliable_seq: Some(1),
+            },
+            packet: ClientPacket::GameStart(settings),
+        },
+    );
+    assert_eq!(h.role.state(), ServerState::InGame);
+    assert_eq!(h.role.settings.as_ref().expect("settings").extratics, 127);
+}
+
+#[test]
+fn extratics_127_pumps_a_whole_128_tic_span() {
+    let (mut h, alice, bob) = in_game_two_127();
+    // Force the boundary state: deep acknowledgements keep the stall
+    // guard out of the way, and alice's queue holds 0..=126 whole.
+    for player in [alice, bob] {
+        game_mut(&mut h, player).acknowledged = 100;
+    }
+    {
+        let game = game_mut(&mut h, alice);
+        game.sendseq = 127;
+        for seq in 0..=126u32 {
+            game.sendqueue[seq as usize] = Some(queued(seq as i16, seq));
+        }
+    }
+    // Bob's tic 127 completes the recipient requirement at that slot.
+    send(&mut h, bob, upload(0, 127, vec![(7, diff(9))]));
+
+    let actions = h.tick(1);
+    let to_alice = gamedata_to(&actions, alice);
+    assert_eq!(to_alice.len(), 1);
+    assert_eq!(to_alice[0].start, 0, "exact start of the 128-tic span");
+    assert_eq!(to_alice[0].tics.len(), 128, "exact count of the span");
+    assert_eq!(to_alice[0].tics[0].latency, 0);
+    assert_eq!(to_alice[0].tics[126].latency, 126);
+    // The fresh tic carries bob's diff at his frozen index.
+    assert_eq!(to_alice[0].tics[127].latency, 7);
+    assert_eq!(to_alice[0].tics[127].players, vec![(1, diff(9))]);
+}
+
+#[test]
+fn send_tics_is_all_or_nothing_across_an_interior_hole() {
+    let (mut h, alice) = in_game_one();
+    {
+        let game = game_mut(&mut h, alice);
+        for seq in 0..=9u32 {
+            game.sendqueue[seq as usize] = Some(queued(seq as i16, seq));
+        }
+        game.sendqueue[5] = None;
+    }
+    // The hole is interior: skipping it would compress the span under
+    // its old start and alias the tail onto the wrong absolute tics.
+    assert!(h.role.send_tics(alice, 0, 9).is_empty());
+
+    // Filled, the same span emits exactly its ten entries.
+    game_mut(&mut h, alice).sendqueue[5] = Some(queued(5, 5));
+    let actions = h.role.send_tics(alice, 0, 9);
+    let to_alice = gamedata_to(&actions, alice);
+    assert_eq!(to_alice.len(), 1);
+    assert_eq!(to_alice[0].start, 0);
+    assert_eq!(to_alice[0].tics.len(), 10);
+}
+
+#[test]
+fn removal_keeps_frozen_indices_and_reciprocal_bits() {
+    let (mut h, alice, bob, carol) = in_game_three();
+    send(&mut h, alice, upload(0, 0, vec![(1, diff(1))]));
+    send(&mut h, bob, upload(0, 0, vec![(2, diff(2))]));
+    send(&mut h, carol, upload(0, 0, vec![(3, diff(3))]));
+    let actions = h.tick(1);
+    // Baseline: reciprocal fan-out at the frozen indices 0, 1, 2.
+    assert_eq!(
+        gamedata_to(&actions, bob)[0].tics[0].players,
+        vec![(0, diff(1)), (2, diff(3))]
+    );
+
+    // Advance once so the completed tic is consumed off the window:
+    // nothing stale remains in any column to satisfy a wrong
+    // completeness set after the removal.
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 1 });
+    send(&mut h, bob, ClientPacket::GameDataAck { ack: 1 });
+    send(&mut h, carol, ClientPacket::GameDataAck { ack: 1 });
+    h.tick(2);
+    assert_eq!(h.role.recv.as_ref().expect("window").start, 1);
+
+    // Player 0 leaves mid-game; the game continues with holes preserved.
+    h.role.handle(T0, Input::Leave { player: alice });
+    assert_eq!(h.role.state(), ServerState::InGame);
+
+    send(&mut h, bob, upload(0, 1, vec![(4, diff(8))]));
+    send(&mut h, carol, upload(0, 1, vec![(5, diff(9))]));
+    let actions = h.tick(3);
+    // The reciprocal fan-out bits stay at the frozen indices 1 and 2:
+    // carol was not renumbered into the hole.
+    let to_bob = gamedata_to(&actions, bob);
+    assert_eq!(to_bob[0].tics[1].players, vec![(2, diff(9))]);
+    let to_carol = gamedata_to(&actions, carol);
+    assert_eq!(to_carol[0].tics[1].players, vec![(1, diff(8))]);
+
+    // Advancement resumes with only the survivors' columns required.
+    send(&mut h, bob, ClientPacket::GameDataAck { ack: 2 });
+    send(&mut h, carol, ClientPacket::GameDataAck { ack: 2 });
+    h.tick(4);
+    assert_eq!(h.role.recv.as_ref().expect("window").start, 2);
+    assert!(
+        !h.role.recv.as_ref().expect("window").entries[0][0].active,
+        "the old column 0 holds nothing and is ignored"
+    );
+}
+
+#[test]
+fn drone_gets_full_fanout_holds_min_ack_and_never_gets_requests() {
+    let (mut h, alice, drone) = in_game_drone();
+    send(&mut h, alice, upload(0, 0, vec![(11, diff(5))]));
+    let actions = h.tick(1);
+    // The drone receives the full fan-out: every player is "other" to a
+    // drone, so alice's own command is included at her frozen index.
+    let to_drone = gamedata_to(&actions, drone);
+    assert_eq!(to_drone.len(), 1);
+    assert_eq!(to_drone[0].start, 0);
+    assert_eq!(to_drone[0].tics.len(), 1);
+    assert_eq!(to_drone[0].tics[0].latency, 11);
+    assert_eq!(to_drone[0].tics[0].players, vec![(0, diff(5))]);
+    // The player herself gets the recipient-excluding empty merge.
+    assert!(gamedata_to(&actions, alice)[0].tics[0].players.is_empty());
+
+    // A drone upload is rejected outright: drones hold no receive slot.
+    let before = active_count(&h);
+    let actions = send(&mut h, drone, upload(0, 0, vec![(1, diff(9))]));
+    assert!(actions.is_empty());
+    assert_eq!(active_count(&h), before);
+
+    // Alice alone cannot lift the minimum acknowledgement: the drone
+    // participates in it even though it never uploads.
+    send(&mut h, alice, ClientPacket::GameDataAck { ack: 1 });
+    h.tick(2);
+    assert_eq!(h.role.recv.as_ref().expect("window").start, 0);
+
+    // Over a second of silence: no resend and no deadlock replay is ever
+    // addressed to the drone (alice gets hers as usual).
+    let actions = h.tick(1_500);
+    assert!(resends_to(&actions, drone).is_empty());
+    assert!(gamedata_to(&actions, drone).is_empty());
+    assert!(!resends_to(&actions, alice).is_empty());
+
+    // The drone's standalone acknowledgement is accepted and finally
+    // lets the window advance past the completed tic.
+    send(&mut h, drone, ClientPacket::GameDataAck { ack: 1 });
+    h.tick(1_501);
+    assert_eq!(h.role.recv.as_ref().expect("window").start, 1);
+}
+
+#[test]
+fn resend_replays_queued_tics_verbatim_not_the_live_window() {
+    let (mut h, alice, bob) = in_game_two();
+    // Three of alice's tics queue for bob across three pumps; capture
+    // the new tail tic of each emission.
+    let mut originals: Vec<doom_proto::FullTic> = Vec::new();
+    for step in 0..3u64 {
+        h.role.handle(
+            T0,
+            Input::Packet {
+                player: alice,
+                header: WireHeader { reliable_seq: None },
+                packet: upload(0, step as u8, vec![(step as i16, diff(5 + step as i8))]),
+            },
+        );
+        let actions = h.tick(step + 1);
+        let to_bob = gamedata_to(&actions, bob);
+        assert_eq!(to_bob.len(), 1);
+        originals.push(to_bob[0].tics.last().expect("tail tic").clone());
+    }
+
+    // A conflicting duplicate then rewrites alice's live window slot:
+    // the live window and bob's queue now disagree.
+    send(&mut h, alice, upload(0, 0, vec![(50, diff(99))]));
+    assert_eq!(
+        h.role.recv.as_ref().expect("window").entries[0][0]
+            .diff
+            .forward,
+        Some(99)
+    );
+
+    // The resend replays the queued tics verbatim, in original order, so
+    // a client reconstructing cumulatively (base plus diffs) rebuilds
+    // exactly the sequence the server first sent.
+    let actions = send(
+        &mut h,
+        bob,
+        ClientPacket::GameDataResend { start: 0, count: 3 },
+    );
+    let resent = gamedata_to(&actions, bob);
+    assert_eq!(resent.len(), 1);
+    assert_eq!(resent[0].start, 0);
+    assert_eq!(resent[0].tics, originals);
+}
+
+#[test]
+fn zero_count_gamedata_runs_ack_and_gaps_but_zero_count_resend_is_inert() {
+    let (mut h, alice) = in_game_one();
+    h.tick(1);
+    h.tick(2);
+    h.tick(3);
+
+    // GAMEDATA with no tics: acknowledgement and gap logic still run.
+    let actions = send(&mut h, alice, upload(2, 6, vec![]));
+    assert_eq!(acknowledged(&h, alice), 2);
+    assert_eq!(resends_to(&actions, alice), vec![(0, 6)]);
+    assert_eq!(active_count(&h), 0, "no tics inserted");
+
+    // RESEND with count zero is a quiet whole-request ignore, even
+    // though tics 0..2 are legitimately queued.
+    let actions = send(
+        &mut h,
+        alice,
+        ClientPacket::GameDataResend { start: 0, count: 0 },
+    );
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn wire_shapes_keep_the_server_client_asymmetry_explicit() {
+    // The server GAMEDATA has no acknowledgement field at all: the type
+    // cannot carry one, and a roundtrip preserves exactly start + tics.
+    let server = ServerPacket::GameData(doom_proto::GameDataServer {
+        start: 5,
+        tics: vec![doom_proto::FullTic {
+            latency: 2,
+            players: vec![(1, diff(4))],
+        }],
+    });
+    let bytes = server
+        .encode(WireHeader { reliable_seq: None }, false)
+        .expect("encode");
+    let (_, decoded) = ServerPacket::decode(&bytes, false).expect("decode");
+    assert_eq!(decoded, server);
+
+    // The client resend request carries a full u32 start, not the low
+    // byte the tic-number fields use.
+    let resend = ClientPacket::GameDataResend {
+        start: 0x1234_5678,
+        count: 3,
+    };
+    let bytes = resend
+        .encode(WireHeader { reliable_seq: None }, false)
+        .expect("encode");
+    let (_, decoded) = ClientPacket::decode(&bytes, false).expect("decode");
+    assert_eq!(decoded, resend);
+
+    // lowres_turn is the codec width switch for the angleturn field.
+    let data = ClientPacket::GameData(doom_proto::GameDataClient {
+        ack: 3,
+        start: 5,
+        tics: vec![doom_proto::ClientTic {
+            latency: 1,
+            diff: doom_proto::TiccmdDiff {
+                turn: Some(0x100),
+                ..Default::default()
+            },
+        }],
+    });
+    let wide = data
+        .encode(WireHeader { reliable_seq: None }, false)
+        .expect("encode");
+    let narrow = data
+        .encode(WireHeader { reliable_seq: None }, true)
+        .expect("encode");
+    assert!(
+        wide.len() > narrow.len(),
+        "lowres_turn narrows the angleturn field"
+    );
 }
