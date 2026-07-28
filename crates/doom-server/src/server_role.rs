@@ -175,6 +175,10 @@ struct Peer {
     /// member but not a Chocolate client: only the SYN/refusal and QUERY
     /// paths exist for it (pinned unknown-address handling).
     syn: bool,
+    /// The reusable protocol slot, assigned at acceptance as the lowest
+    /// free slot (upstream's first-inactive-slot rule). Slot order drives
+    /// player numbering and the max_players reference; `None` pre-SYN.
+    slot: Option<usize>,
     conn: Conn,
     name: Vec<u8>,
     addr_label: Vec<u8>,
@@ -199,6 +203,7 @@ impl Peer {
     fn admitted(now: Milliseconds, order: u64, addr_label: Vec<u8>) -> Self {
         Peer {
             syn: false,
+            slot: None,
             conn: Conn::Connected,
             name: Vec::new(),
             addr_label,
@@ -568,14 +573,18 @@ impl ServerRole {
     fn on_syn(&mut self, player: PlayerId, syn: doom_proto::Syn) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Protocol negotiation: the only protocol this role speaks.
+        // Protocol negotiation: the only protocol this role speaks. The
+        // rejection keeps the pinned shape, including the client-reported
+        // version after validation, bounded for the wire.
         if !syn
             .protocols
             .iter()
             .any(|name| name.as_slice() == PROTOCOL_NAME)
         {
-            let mut reason = b"Version mismatch: server is: ".to_vec();
+            let mut reason = b"Version mismatch: server version is: ".to_vec();
             reason.extend_from_slice(SERVER_VERSION);
+            reason.extend_from_slice(b"; client is: ");
+            reason.extend_from_slice(&syn.version);
             reason.extend_from_slice(b". No common compatible protocol could be negotiated.");
             reason.truncate(256);
             self.reject(&mut actions, player, reason);
@@ -631,13 +640,16 @@ impl ServerRole {
             return actions;
         }
 
-        // Accept.
+        // Accept, taking the lowest free protocol slot (upstream's
+        // first-inactive-slot rule; a slot frees for reuse on removal).
+        let slot = self.free_slot();
         {
             let peer = self
                 .peers
                 .get_mut(&player)
                 .expect("the peer was admitted by the room host");
             peer.syn = true;
+            peer.slot = Some(slot);
             peer.name = {
                 let mut name = syn.player_name;
                 name.truncate(MAX_NAME_LEN - 1);
@@ -694,9 +706,9 @@ impl ServerRole {
             && self
                 .peers
                 .values()
-                .filter(|peer| peer.syn)
+                .filter(|peer| peer.connected())
                 .all(|peer| peer.ready);
-        if all_ready && self.peers.values().any(|peer| peer.syn) {
+        if all_ready && self.peers.values().any(|peer| peer.connected()) {
             return self.start_game();
         }
 
@@ -1014,13 +1026,21 @@ impl ServerRole {
         }
     }
 
-    /// Every protocol-connected peer, players and drones, in admit order.
+    /// The lowest protocol slot no SYN-accepted peer occupies.
+    fn free_slot(&self) -> usize {
+        (0..MAX_NODES)
+            .find(|slot| !self.peers.values().any(|peer| peer.slot == Some(*slot)))
+            .expect("SYN capacity is checked before acceptance")
+    }
+
+    /// Every protocol-connected peer, players and drones, in slot order
+    /// (upstream's slot-ordered assignments).
     fn connected_peers(&self) -> Vec<PlayerId> {
         let mut peers: Vec<_> = self
             .peers
             .iter()
             .filter(|(_, peer)| peer.connected())
-            .map(|(player, peer)| (peer.order, *player))
+            .map(|(player, peer)| (peer.slot.expect("connected peers hold slots"), *player))
             .collect();
         peers.sort_unstable();
         peers.into_iter().map(|(_, player)| player).collect()
@@ -1034,6 +1054,8 @@ impl ServerRole {
             .collect()
     }
 
+    /// `NET_SV_MaxPlayers`: the value of the connected peer in the
+    /// lowest occupied slot, which a disconnect frees for reuse.
     fn max_players(&self) -> usize {
         self.connected_peers()
             .first()
@@ -1169,8 +1191,8 @@ fn valid_game_mode(mission: u8, mode: u8) -> bool {
             | (1, 2)
             | (2, 2)
             | (3, 2)
-            | (4, 2)
-            | (5, 3)
+            | (4, 3)
+            | (5, 2)
             | (6, 0)
             | (6, 1)
             | (6, 3)
@@ -1195,8 +1217,8 @@ fn valid_episode_map(mission: u8, mode: u8, episode: u8, map: u8) -> bool {
         (0, 0) => Some((1, 9)),
         (0, 1) => Some((3, 9)),
         (0, 3) => Some((4, 9)),
-        (1, 2) | (2, 2) | (3, 2) | (4, 2) => Some((1, 32)),
-        (5, 3) => Some((1, 5)),
+        (4, 3) => Some((1, 5)),
+        (1, 2) | (2, 2) | (3, 2) | (5, 2) => Some((1, 32)),
         (6, 0) => Some((1, 9)),
         (6, 1) => Some((3, 9)),
         (6, 3) => Some((5, 9)),

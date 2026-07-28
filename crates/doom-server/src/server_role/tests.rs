@@ -1729,3 +1729,239 @@ fn terminal_packets_survive_a_binding_style_reducer() {
             .any(|p| matches!(p, ServerPacket::DisconnectAck))
     );
 }
+
+// --- followup-9 pinned-source corrections ------------------------------------
+
+fn syn_full(name: &str, gamemode: u8, gamemission: u8, drone: u8, max_players: u8) -> Syn {
+    let mut syn = syn_value(name, gamemode, gamemission, drone);
+    syn.connect.max_players = max_players;
+    syn
+}
+
+#[test]
+fn accepted_non_doom_mission_mode_pairs() {
+    // Every accepted pair from the pinned table, plus the doom family.
+    let accepted = [
+        (0, 0),
+        (0, 1),
+        (0, 3),
+        (1, 2),
+        (2, 2),
+        (3, 2),
+        (4, 3), // pack_chex retail
+        (5, 2), // pack_hacx commercial
+        (6, 0),
+        (6, 1),
+        (6, 3),
+        (7, 2),
+        (8, 2),
+    ];
+    for (mission, mode) in accepted {
+        assert!(
+            valid_game_mode(mission, mode),
+            "({mission}, {mode}) must be accepted"
+        );
+    }
+
+    // The transposed Chex/Hacx shapes must both be rejected.
+    assert!(!valid_game_mode(4, 2), "chex is not commercial");
+    assert!(!valid_game_mode(5, 3), "hacx is not retail");
+}
+
+#[test]
+fn genuine_chex_and_hacx_syns_are_accepted() {
+    // pack_chex (mission 4, retail): previously silently dropped by the
+    // transposed table.
+    let mut h = Harness::new();
+    let chex = h.join("c");
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: chex,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_full("ChexPlayer", 3, 4, 0, 4)),
+        },
+    );
+    assert!(
+        actions.iter().any(is_syn_accept),
+        "a genuine Chex SYN must be accepted, got {actions:?}"
+    );
+
+    // pack_hacx (mission 5, commercial).
+    let mut h = Harness::new();
+    let hacx = h.join("x");
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: hacx,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_full("HacxPlayer", 2, 5, 0, 4)),
+        },
+    );
+    assert!(
+        actions.iter().any(is_syn_accept),
+        "a genuine Hacx SYN must be accepted, got {actions:?}"
+    );
+
+    // The transposed shapes still take the source-compatible silent
+    // invalid path (dropped, no accept, no reject).
+    let mut h = Harness::new();
+    let wrong = h.join("w");
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: wrong,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_full("Wrong", 2, 4, 0, 4)),
+        },
+    );
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn episode_map_upper_boundaries() {
+    // Chex: retail, E1 only, maps through 5.
+    assert!(valid_episode_map(4, 3, 1, 5));
+    assert!(!valid_episode_map(4, 3, 1, 6));
+    assert!(!valid_episode_map(4, 3, 2, 1));
+    // Hacx: commercial, E1 only, maps through 32.
+    assert!(valid_episode_map(5, 2, 1, 32));
+    assert!(!valid_episode_map(5, 2, 1, 33));
+    assert!(!valid_episode_map(5, 2, 2, 1));
+    // Heretic shareware: E1, maps through 9.
+    assert!(valid_episode_map(6, 0, 1, 9));
+    assert!(!valid_episode_map(6, 0, 1, 10));
+    assert!(!valid_episode_map(6, 0, 2, 1));
+    // Heretic registered: E1-E3 plus the E4M1 exception only.
+    assert!(valid_episode_map(6, 1, 3, 9));
+    assert!(valid_episode_map(6, 1, 4, 1));
+    assert!(!valid_episode_map(6, 1, 4, 2));
+    assert!(!valid_episode_map(6, 1, 3, 10));
+    // Heretic retail: E1-E5 plus E6M1 through E6M3.
+    assert!(valid_episode_map(6, 3, 5, 9));
+    assert!(valid_episode_map(6, 3, 6, 1));
+    assert!(valid_episode_map(6, 3, 6, 3));
+    assert!(!valid_episode_map(6, 3, 6, 4));
+    assert!(!valid_episode_map(6, 3, 5, 10));
+    // Hexen: map 60 boundary.
+    assert!(valid_episode_map(7, 2, 1, 60));
+    assert!(!valid_episode_map(7, 2, 1, 61));
+    // Strife: map 34 boundary.
+    assert!(valid_episode_map(8, 2, 1, 34));
+    assert!(!valid_episode_map(8, 2, 1, 35));
+}
+
+#[test]
+fn slot_reuse_moves_the_max_players_reference() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_full("Alice", 0, 0, 0, 4)),
+        },
+    );
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: bob,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_full("Bob", 0, 0, 0, 8)),
+        },
+    );
+    assert_eq!(h.role.max_players(), 4, "the lowest slot's value wins");
+
+    // Alice disconnects; carol takes her freed slot, not a new one.
+    h.role.handle(T0, Input::Leave { player: alice });
+    let carol = h.join("c");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: carol,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_full("Carol", 0, 0, 0, 8)),
+        },
+    );
+    assert_eq!(
+        h.role.peers.get(&carol).expect("carol").slot,
+        Some(0),
+        "the freed slot is reused, not a fresh one"
+    );
+    assert_eq!(
+        h.role.peers.get(&bob).expect("bob").slot,
+        Some(1),
+        "existing slots are not renumbered"
+    );
+    assert_eq!(
+        h.role.max_players(),
+        8,
+        "the reused slot drives the reference"
+    );
+
+    // Player numbering follows slot order, not admission order.
+    assert_eq!(h.role.player_index(bob), 1);
+    assert_eq!(h.role.player_index(carol), 0);
+}
+
+#[test]
+fn version_mismatch_rejection_uses_the_pinned_text() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let mut syn = syn_value("Alice", 0, 0, 0);
+    syn.version = b"Chocolate Doom 2.3.0".to_vec();
+    syn.protocols = vec![b"OBSOLETE".to_vec()];
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn),
+        },
+    );
+    let expected = format!(
+        "Version mismatch: server version is: {}; client is: Chocolate Doom 2.3.0. No common compatible protocol could be negotiated.",
+        String::from_utf8_lossy(super::SERVER_VERSION)
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|a| is_reject_with(a, expected.as_bytes()))
+    );
+}
+
+#[test]
+fn all_ready_excludes_disconnecting_peers() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    h.syn(alice, "Alice");
+    h.syn(bob, "Bob");
+    h.launch(alice);
+
+    // Alice readies alone, then leaves: the abort ends the game and bob
+    // (never ready) starts disconnecting.
+    h.ack(alice, 1);
+    h.ack(bob, 1);
+    h.gamestart(alice, 1, 0);
+    h.role.handle(T0, Input::Leave { player: alice });
+    assert!(matches!(
+        h.role.peers.get(&bob).expect("bob").conn,
+        super::Conn::Disconnecting { .. }
+    ));
+
+    // A new player connects, launches, and readies. Bob is draining and
+    // must not count in the readiness requirement at all.
+    let carol = h.join("c");
+    h.syn(carol, "Carol");
+    h.launch(carol);
+    h.ack(carol, 1);
+    h.gamestart(carol, 1, 0);
+    assert_eq!(
+        h.role.state(),
+        ServerState::InGame,
+        "a draining peer must not block or count toward the start"
+    );
+}
