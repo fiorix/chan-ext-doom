@@ -152,6 +152,35 @@
         {"i": 0, "dir": "c2s", "peer": "client1", "type": 13, "type_name": "QUERY", "reliable": false, "file": "query/000-c2s-client1-query.bin", "length": 2, "sha256": "a1f386a0ecb061b3c46a038616212779858ba7258b2eccb818a64986c97282da"},
         {"i": 1, "dir": "s2c", "peer": "client1", "type": 14, "type_name": "QUERY_RESPONSE", "reliable": false, "file": "query/001-s2c-client1-query_response.bin", "length": 61, "sha256": "98cfcd94dce639b706d559d7c955c81af4c78db14e7f53eeb8e99b108bc66617"}
       ]
+    },
+    {
+      "name": "rejected-game-mismatch",
+      "description": "lobby client adopts doom/shareware; injected crafted SYN with gamemode=2 commercial gamemission=1 doom2 (all other fields identical to a real SYN); server replies REJECTED 'Game mismatch' (net_server.c:763-776)",
+      "captured_at": "2026-07-28T10:05:17.722602+00:00",
+      "server_argv": ["/tmp/doom-capture/build/choc/src/chocolate-server", "-port", "2343", "-privateserver", "-netlog", "/tmp/doom-capture/captures/rejected-game-mismatch/server.netlog"],
+      "clients": [{"name": "client1", "argv": ["/tmp/doom-capture/build/choc/src/chocolate-doom", "-iwad", "/tmp/doom-capture/doom1.wad", "-connect", "127.0.0.1", "-config", "/tmp/doom-rig-client1-sid594ir/default.cfg", "-extraconfig", "/tmp/doom-rig-client1-sid594ir/chocolate-doom.cfg", "-savedir", "/tmp/doom-rig-client1-sid594ir", "-netlog", "/tmp/doom-capture/captures/rejected-game-mismatch/client1.netlog"], "env": {"SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy"}, "start_delay_s": 0.0, "signal": "none", "signal_at_s": 6.0, "exit_code": -15}],
+      "packets": [
+        {"i": 0, "dir": "c2s", "peer": "client1", "type": 0, "type_name": "SYN", "reliable": false, "file": "rejected-game-mismatch/000-c2s-client1-syn.bin", "length": 111, "sha256": "002dc040db581648dca64dfdc71eb5d4b606a9fac4908543e8335b7314ae51eb"},
+        {"i": 1, "dir": "s2c", "peer": "client1", "type": 0, "type_name": "SYN", "reliable": true, "file": "rejected-game-mismatch/001-s2c-client1-syn.bin", "length": 41, "sha256": "6650176c09885589348a05d367bd8be73f8cc5a368a2166f1f77d807908186b8"},
+        {"i": 2, "dir": "s2c", "peer": "client1", "type": 4, "type_name": "WAITING_DATA", "reliable": false, "file": "rejected-game-mismatch/002-s2c-client1-waiting_data.bin", "length": 84, "sha256": "2b6013a0248346fd937c162cdb1320411059128758c62f12190c737889f6cda3"},
+        {"i": 10, "dir": "c2s", "peer": "client2", "type": 0, "type_name": "SYN", "reliable": false, "file": "rejected-game-mismatch/010-c2s-client2-syn.bin", "length": 101, "sha256": "1d4965b9ab70682ad40364aff1d7ecddc95322930b646a9e006cb7ac5c4aeecc"},
+        {"i": 11, "dir": "s2c", "peer": "client2", "type": 2, "type_name": "REJECTED", "reliable": false, "file": "rejected-game-mismatch/011-s2c-client2-rejected.bin", "length": 74, "sha256": "eaef58d044d8575bd4e1a812e4d801d4cc6d5c5061e023dffcacada125055387"}
+      ]
+    },
+    {
+      "name": "rejected-in-game",
+      "description": "client1 starts a netgame via -nodes 1; client2 joins while the server is in game; server replies REJECTED 'Server is not currently accepting connections' (net_server.c:726-732)",
+      "captured_at": "2026-07-28T10:06:34.321050+00:00",
+      "server_argv": ["/tmp/doom-capture/build/choc/src/chocolate-server", "-port", "2343", "-privateserver", "-netlog", "/tmp/doom-capture/captures/rejected-in-game/server.netlog"],
+      "clients": [{"name": "client1", "argv": ["/tmp/doom-capture/build/choc/src/chocolate-doom", "-iwad", "/tmp/doom-capture/doom1.wad", "-connect", "127.0.0.1", "-config", "/tmp/doom-rig-client1-ilggom_e/default.cfg", "-extraconfig", "/tmp/doom-rig-client1-ilggom_e/chocolate-doom.cfg", "-savedir", "/tmp/doom-rig-client1-ilggom_e", "-netlog", "/tmp/doom-capture/captures/rejected-in-game/client1.netlog", "-nodes", "1"], "env": {"SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy"}, "start_delay_s": 0.0, "signal": "term", "signal_at_s": 10.0, "exit_code": -15}, {"name": "client2", "argv": ["/tmp/doom-capture/build/choc/src/chocolate-doom", "-iwad", "/tmp/doom-capture/doom1.wad", "-connect", "127.0.0.1", "-config", "/tmp/doom-rig-client2-lk0r8dk0/default.cfg", "-extraconfig", "/tmp/doom-rig-client2-lk0r8dk0/chocolate-doom.cfg", "-savedir", "/tmp/doom-rig-client2-lk0r8dk0", "-netlog", "/tmp/doom-capture/captures/rejected-in-game/client2.netlog"], "env": {"SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy"}, "start_delay_s": 6.0, "signal": "none", "signal_at_s": 1000000000.0, "exit_code": 255}],
+      "packets": [
+        {"i": 8, "dir": "c2s", "peer": "client1", "type": 5, "type_name": "GAMESTART", "reliable": true, "file": "rejected-in-game/008-c2s-client1-gamestart.bin", "length": 24, "sha256": "0491e0ecf997fed36416c1b9dc665cf84f9abba20f221f39787d5d4be1e12d13"},
+        {"i": 9, "dir": "s2c", "peer": "client1", "type": 10, "type_name": "RELIABLE_ACK", "reliable": false, "file": "rejected-in-game/009-s2c-client1-reliable_ack.bin", "length": 3, "sha256": "b0dee266d108862c239cf67540f997c110bada15308c04ed558eb4306f2b8270"},
+        {"i": 10, "dir": "s2c", "peer": "client1", "type": 4, "type_name": "WAITING_DATA", "reliable": false, "file": "rejected-in-game/010-s2c-client1-waiting_data.bin", "length": 80, "sha256": "df36983509e35f6d271017c72c454a09ad7c09542ca0071224ee102ad2505f28"},
+        {"i": 11, "dir": "s2c", "peer": "client1", "type": 5, "type_name": "GAMESTART", "reliable": true, "file": "rejected-in-game/011-s2c-client1-gamestart.bin", "length": 24, "sha256": "68558799056f39e84f28a98a1b69998f3ec7d10d7edd610ab841c90e35931a85"},
+        {"i": 272, "dir": "c2s", "peer": "client2", "type": 0, "type_name": "SYN", "reliable": false, "file": "rejected-in-game/272-c2s-client2-syn.bin", "length": 111, "sha256": "5151197eecfd90cfbf1b266755a17d3fa72f4bbdeb9c25d5d3ef1fea8789e14d"},
+        {"i": 273, "dir": "s2c", "peer": "client2", "type": 2, "type_name": "REJECTED", "reliable": false, "file": "rejected-in-game/273-s2c-client2-rejected.bin", "length": 48, "sha256": "9fb8f57e2a6be6ccaa3cac1d50d0699d8417b4074df3c010a350826be13452b6"}
+      ]
     }
   ]
 }

@@ -1,0 +1,71 @@
+{
+  "name": "rejected-game-mismatch",
+  "description": "lobby client adopts doom/shareware; injected crafted SYN with gamemode=2 commercial gamemission=1 doom2 (all other fields identical to a real SYN); server replies REJECTED 'Game mismatch' (net_server.c:763-776)",
+  "captured_at": "2026-07-28T10:05:17.722602+00:00",
+  "source": {
+    "project": "chocolate-doom",
+    "url": "https://github.com/chocolate-doom/chocolate-doom.git",
+    "tag": "chocolate-doom-3.1.1",
+    "commit": "410d96855b5df5410ff591a90efeafa889119224"
+  },
+  "toolchain": {
+    "platform": "linux x86_64 (Ubuntu 26.04)",
+    "sdl2": "2.32.10 (built from source, scratch prefix)",
+    "sdl2_net": "2.2.0 (built from source, scratch prefix)",
+    "configure_flags": "--disable-sdl2mixer --without-libsamplerate --disable-doc"
+  },
+  "iwad": {
+    "file": "doom1.wad",
+    "sha1": "5b2e249b9c5133ec987b3ea77596381dc0d6bc1d",
+    "note": "shareware doom1.wad; used at capture time, never committed"
+  },
+  "server_argv": [
+    "/tmp/doom-capture/build/choc/src/chocolate-server",
+    "-port",
+    "2343",
+    "-privateserver",
+    "-netlog",
+    "/tmp/doom-capture/captures/rejected-game-mismatch/server.netlog"
+  ],
+  "clients": [
+    {
+      "name": "client1",
+      "argv": [
+        "/tmp/doom-capture/build/choc/src/chocolate-doom",
+        "-iwad",
+        "/tmp/doom-capture/doom1.wad",
+        "-connect",
+        "127.0.0.1",
+        "-config",
+        "/tmp/doom-rig-client1-sid594ir/default.cfg",
+        "-extraconfig",
+        "/tmp/doom-rig-client1-sid594ir/chocolate-doom.cfg",
+        "-savedir",
+        "/tmp/doom-rig-client1-sid594ir",
+        "-netlog",
+        "/tmp/doom-capture/captures/rejected-game-mismatch/client1.netlog"
+      ],
+      "env": {
+        "SDL_VIDEODRIVER": "dummy",
+        "SDL_AUDIODRIVER": "dummy"
+      },
+      "start_delay_s": 0.0,
+      "signal": "none",
+      "signal_at_s": 6.0,
+      "exit_code": -15
+    }
+  ],
+  "duration_s": 8.0,
+  "packet_count": 27,
+  "server_exit_code": -15,
+  "injects": [
+    {
+      "at_s": 3.0,
+      "file": "/tmp/doom-capture/crafted-syn.bin",
+      "sha256": "1d4965b9ab70682ad40364aff1d7ecddc95322930b646a9e006cb7ac5c4aeecc",
+      "peer": "client2",
+      "note": "crafted SYN per docs/protocol.md section 4 with only gamemode=2 and gamemission=1 changed; wad/deh sha1 reused from the real client SYN (handshake-keepalive/000)"
+    }
+  ],
+  "exported_range": "0:3,10:12"
+}
