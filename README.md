@@ -48,7 +48,7 @@ single-`emcc` artifact hashes, are in
 ## Licensing
 
 The engine fork (`engine/`) is GPL-2.0, derived from the documented
-DOOM/Chocolate/Crispy lineage. The Rust crates are Apache-2.0 and written from
-scratch. Rust binaries do not link GPL engine object code; a browser or future
+DOOM/Chocolate/Crispy lineage (see `engine/LICENSE`). The Rust crates are
+Apache-2.0 (see `LICENSE-APACHE`) and written from scratch. Rust binaries do not link GPL engine object code; a browser or future
 wasmtime host loads the separately licensed engine WASM as runtime data across
 a defined sandbox interface.
