@@ -2407,3 +2407,725 @@ fn presyn_leave_beside_a_connected_player_changes_nothing_else() {
         }
     )));
 }
+
+// --- in-game tic windows -------------------------------------------------------
+
+fn diff(forward: i8) -> doom_proto::TiccmdDiff {
+    doom_proto::TiccmdDiff {
+        forward: Some(forward),
+        ..Default::default()
+    }
+}
+
+fn upload(ack: u8, start: u8, tics: Vec<(i16, doom_proto::TiccmdDiff)>) -> ClientPacket {
+    ClientPacket::GameData(doom_proto::GameDataClient {
+        ack,
+        start,
+        tics: tics
+            .into_iter()
+            .map(|(latency, diff)| doom_proto::ClientTic { latency, diff })
+            .collect(),
+    })
+}
+
+fn gamedata_to(actions: &[Action], player: PlayerId) -> Vec<&doom_proto::GameDataServer> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                player: p,
+                packet: ServerPacket::GameData(data),
+                ..
+            } if *p == player => Some(data),
+            _ => None,
+        })
+        .collect()
+}
+
+fn resends_to(actions: &[Action], player: PlayerId) -> Vec<(u32, u8)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                player: p,
+                packet: ServerPacket::GameDataResend { start, count },
+                ..
+            } if *p == player => Some((*start, *count)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Drive a one-player room into InGame with extratics 1.
+fn in_game_one() -> (Harness, PlayerId) {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.gamestart(alice, 1, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    (h, alice)
+}
+
+/// Drive a two-player room into InGame with extratics 1.
+fn in_game_two() -> (Harness, PlayerId, PlayerId) {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    h.syn(alice, "Alice");
+    h.syn(bob, "Bob");
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.ack(bob, 1);
+    h.gamestart(alice, 1, 0);
+    h.gamestart(bob, 0, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    (h, alice, bob)
+}
+
+#[test]
+fn expand_boundaries_wrap_and_range() {
+    // Middle of a byte: no wrap.
+    assert_eq!(expand_tic(512, 10), 512 + 10);
+    // 0x40 boundary: at it exactly, no backward wrap (strictly below).
+    assert_eq!(expand_tic(0x140, 0xb1), 0x1b1);
+    // Below it, a byte above 0xb0 wraps backward.
+    assert_eq!(expand_tic(0x13f, 0xb1), 0xb1);
+    // Just at 0x40: no backward wrap (strictly below required); the
+    // byte is replaced as-is.
+    assert_eq!(expand_tic(0x140, 0xb0), 0x1b0);
+    // 0xb0 boundary: above it, a byte below 0x40 wraps forward.
+    assert_eq!(expand_tic(0x1b1, 0x3f), 0x23f);
+    // Exactly 0xb0: no forward wrap, the byte is replaced as-is.
+    assert_eq!(expand_tic(0x1b0, 0x3f), 0x13f);
+    // Backward wrap below zero stays out of range rather than aliasing.
+    assert!(expand_tic(0x20, 0xf0) < 0);
+    // Huge references stay exact in i64 with no accidental truncation.
+    assert_eq!(expand_tic(u32::MAX - 0x7f, 0x3f), 0xffff_ff3f_i64);
+}
+
+#[test]
+fn upload_stores_only_in_range_tics_and_raises_ack_monotonically() {
+    let (mut h, alice) = in_game_one();
+
+    // Tics 0..2 in range, nothing missing behind them: no request.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(3, 0, vec![(10, diff(1)), (11, diff(2)), (12, diff(3))]),
+        },
+    );
+    assert!(actions.is_empty(), "no resend needed behind present tics");
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert!(recv.entries[0][0].active);
+        assert!(recv.entries[1][0].active);
+        assert!(!recv.entries[3][0].active);
+        assert_eq!(recv.entries[0][0].latency, 10);
+    }
+    assert_eq!(
+        h.role
+            .peers
+            .get(&alice)
+            .expect("peer")
+            .game
+            .as_ref()
+            .expect("game")
+            .acknowledged,
+        3
+    );
+
+    // A mid-window upload legitimately reveals the missing prefix behind
+    // it, exactly as pinned: one bounded request for it.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(3, 5, vec![(10, diff(4))]),
+        },
+    );
+    let requests = resends_to(&actions, alice);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, 3);
+    assert_eq!(requests[0].1, 2);
+
+    // A lower ack does not move the acknowledgement back.
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(1, 7, vec![(5, diff(4))]),
+        },
+    );
+    assert_eq!(
+        h.role
+            .peers
+            .get(&alice)
+            .expect("peer")
+            .game
+            .as_ref()
+            .expect("game")
+            .acknowledged,
+        3
+    );
+}
+
+#[test]
+fn stale_and_future_uploads_are_dropped_without_aliasing() {
+    let (mut h, alice) = in_game_one();
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 5, vec![(1, diff(9))]),
+        },
+    );
+
+    // Re-uploading the same absolute tic overwrites nothing extra and
+    // cannot alias a later slot (absolute identity preserved).
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 5, vec![(1, diff(42))]),
+        },
+    );
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert_eq!(recv.entries[5][0].diff.forward, Some(42));
+        assert!(!recv.entries[6][0].active);
+    }
+
+    // A tic beyond the window end is dropped, and the discovered run it
+    // reveals is bounded by the upstream clamp: the request covers only
+    // in-window missing tics, never the out-of-range ones.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 130, vec![(1, diff(1))]),
+        },
+    );
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert!(!recv.entries[BACKUPTICS - 1][0].active);
+    }
+    let requests = resends_to(&actions, alice);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, 6);
+    assert_eq!(
+        requests[0].1, 121,
+        "the run is bounded at the upstream clamp"
+    );
+}
+
+#[test]
+fn uploads_from_wrong_states_are_inert() {
+    let (mut h, alice) = in_game_one();
+
+    // A drone upload is rejected in game.
+    let drone = h.join("d");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_value("Observer", 0, 0, 1)),
+        },
+    );
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(1, diff(1))]),
+        },
+    );
+    assert!(actions.is_empty());
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert!(!recv.entries[0][0].active);
+    }
+
+    // An upload after the game ends is inert too.
+    h.role.handle(T0, Input::Leave { player: alice });
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(1, diff(1))]),
+        },
+    );
+    assert!(actions.is_empty());
+    assert!(h.role.recv.is_none(), "the window resets at game end");
+}
+
+#[test]
+fn two_player_reciprocal_fanout_excludes_recipient_and_maxes_latency() {
+    let (mut h, alice, bob) = in_game_two();
+
+    // Alice uploads tic 0; alice's fan-out needs bob's tic first, but
+    // bob's fan-out does not need bob's own.
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(30, diff(5))]),
+        },
+    );
+    let actions = h.tick(1);
+    assert!(
+        gamedata_to(&actions, alice).is_empty(),
+        "alice needs bob's tic first"
+    );
+
+    // Bob already receives alice's command at index 0: his own tic is
+    // excluded from his requirements too.
+    let to_bob = gamedata_to(&actions, bob);
+    assert_eq!(to_bob.len(), 1);
+    assert_eq!(to_bob[0].tics.len(), 1);
+    assert_eq!(to_bob[0].tics[0].players.len(), 1);
+    assert_eq!(to_bob[0].tics[0].players[0].0, 0);
+    assert_eq!(to_bob[0].tics[0].players[0].1.forward, Some(5));
+
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: bob,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(99, diff(7))]),
+        },
+    );
+
+    // Alice then receives only bob's command, with bob's latency, at 1.
+    let actions = h.tick(2);
+    let to_alice = gamedata_to(&actions, alice);
+    assert_eq!(to_alice.len(), 1);
+    assert_eq!(to_alice[0].start, 0);
+    assert_eq!(to_alice[0].tics.len(), 1);
+    assert_eq!(to_alice[0].tics[0].latency, 99);
+    assert_eq!(to_alice[0].tics[0].players.len(), 1);
+    assert_eq!(to_alice[0].tics[0].players[0].0, 1);
+    assert_eq!(to_alice[0].tics[0].players[0].1.forward, Some(7));
+}
+
+#[test]
+fn single_player_empty_fanout_capped_at_ten_ahead() {
+    let (mut h, alice) = in_game_one();
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(1, diff(1))]),
+        },
+    );
+
+    // With no other player, the server fans out empty commands but stays
+    // at most 10 tics ahead of the window.
+    let mut total = 0;
+    for step in 1..=12 {
+        total += gamedata_to(&h.tick(step), alice).len();
+    }
+    assert_eq!(total, 11, "tics 0..=10 fan out, then the limit holds");
+
+    // extratics replay: each emission covers sendseq-1 .. sendseq.
+    let actions = h.tick(13);
+    let last = gamedata_to(&actions, alice);
+    assert!(last.is_empty());
+}
+
+#[test]
+fn stall_guard_stops_pumping_past_forty_ahead() {
+    let (mut h, alice, bob) = in_game_two();
+    // Bob's tics 40 and 41 are present so completeness cannot mask the
+    // stall guard at either send sequence.
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: bob,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 40, vec![(1, diff(1)), (1, diff(2))]),
+        },
+    );
+    // At exactly 40 ahead of the minimum acknowledgement, alice pumps.
+    {
+        let game = h
+            .role
+            .peers
+            .get_mut(&alice)
+            .expect("peer")
+            .game
+            .as_mut()
+            .expect("game");
+        game.sendseq = 40;
+    }
+    assert_eq!(
+        gamedata_to(&h.tick(1), alice).len(),
+        1,
+        "exactly 40 still pumps"
+    );
+
+    // One further ahead and the pinned stall guard stops the pump.
+    {
+        let game = h
+            .role
+            .peers
+            .get_mut(&alice)
+            .expect("peer")
+            .game
+            .as_mut()
+            .expect("game");
+        game.sendseq = 41;
+    }
+    assert!(gamedata_to(&h.tick(2), alice).is_empty(), "41 ahead stalls");
+}
+
+#[test]
+fn advance_window_requires_min_ack_and_completeness() {
+    let (mut h, alice, bob) = in_game_two();
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(1, 0, vec![(1, diff(1))]),
+        },
+    );
+    h.tick(1);
+    assert_eq!(
+        h.role.recv.as_ref().expect("window").start,
+        0,
+        "bob's tic is required"
+    );
+
+    // Bob's tic completes the first window slot; both ack to 1 (his
+    // upload carries its own ack); the window advances by one only.
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert_eq!(recv.entries[0][0].diff.forward, Some(1));
+    }
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: bob,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(1, 0, vec![(1, diff(2))]),
+        },
+    );
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::GameDataAck { ack: 1 },
+        },
+    );
+    h.tick(2);
+    assert_eq!(h.role.recv.as_ref().expect("window").start, 1);
+
+    // The completed tic is consumed off the bottom of the window; the
+    // next slot now holds nothing until more data arrives.
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert!(!recv.entries[0][0].active);
+        assert!(!recv.entries[0][1].active);
+    }
+}
+
+#[test]
+fn gap_triggers_one_request_then_strict_300ms_re_requests() {
+    let (mut h, alice) = in_game_one();
+
+    // Tics 0..2 arrive; tic 3 is skipped; tic 4 arrives and reveals 3.
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(1, diff(0)), (1, diff(1)), (1, diff(2))]),
+        },
+    );
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 4, vec![(1, diff(4))]),
+        },
+    );
+    let requests = resends_to(&actions, alice);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, 3);
+    assert_eq!(requests[0].1, 1);
+
+    // No duplicate before the expiry.
+    assert!(resends_to(&h.tick(300), alice).is_empty());
+    // Strictly more than 300 ms: the run is re-requested once.
+    let again = resends_to(&h.tick(301), alice);
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].0, 3);
+    assert_eq!(again[0].1, 1);
+    // And not again immediately after.
+    assert!(resends_to(&h.tick(601), alice).is_empty());
+}
+
+#[test]
+fn resend_request_is_atomic_against_stale_and_spoofed() {
+    let (mut h, alice) = in_game_one();
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(1, diff(1)), (1, diff(2)), (1, diff(3))]),
+        },
+    );
+    // Pump so the queue holds tics 0..2.
+    h.tick(1);
+    h.tick(2);
+    h.tick(3);
+
+    // A valid request for 0..2 replays exactly those queued tics.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::GameDataResend { start: 0, count: 3 },
+        },
+    );
+    let replay = gamedata_to(&actions, alice);
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].tics.len(), 3);
+
+    // A stale request (tic 9 not queued) is ignored entirely.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::GameDataResend { start: 1, count: 9 },
+        },
+    );
+    assert!(gamedata_to(&actions, alice).is_empty());
+
+    // Zero count is ignored, not answered with an empty packet.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::GameDataResend { start: 0, count: 0 },
+        },
+    );
+    assert!(gamedata_to(&actions, alice).is_empty());
+
+    // Arithmetic boundary: a count wrapping past u32 must not panic or
+    // alias the queue.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::GameDataResend {
+                start: u32::MAX - 1,
+                count: 255,
+            },
+        },
+    );
+    assert!(gamedata_to(&actions, alice).is_empty());
+}
+
+#[test]
+fn deadlock_requests_first_missing_plus_five_and_replays_queue() {
+    let (mut h, alice, bob) = in_game_two();
+
+    // Both players upload tic 0; both pump once (sendseq 1 each).
+    for player in [alice, bob] {
+        h.role.handle(
+            T0,
+            Input::Packet {
+                player,
+                header: WireHeader { reliable_seq: None },
+                packet: upload(0, 0, vec![(1, diff(1))]),
+            },
+        );
+    }
+    h.tick(1);
+
+    // Bob goes silent past the deadlock threshold; alice stays fresh.
+    let actions = h.role.handle(
+        Milliseconds(T0.0 + 1001),
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 1, vec![(1, diff(2))]),
+        },
+    );
+    let mut all = actions;
+    all.extend(h.tick(1001));
+
+    // First missing tic (1) plus five.
+    let requests = resends_to(&all, bob);
+    assert!(
+        requests.iter().any(|r| r.0 == 1 && r.1 == 6),
+        "deadlock requests first missing plus five, got {requests:?}"
+    );
+    // And bob's exact unacknowledged queue (tic 0) is replayed.
+    let replay = gamedata_to(&all, bob);
+    assert!(
+        replay
+            .iter()
+            .any(|g| g.tics.iter().any(|t| !t.players.is_empty())),
+        "the unacknowledged queue replays with alice's command"
+    );
+
+    // The 300 ms resend cadence re-requests the stamped run while it
+    // stays missing: nothing at 100 ms, one re-request at 301 ms.
+    assert!(resends_to(&h.tick(1101), bob).is_empty());
+    let cadence = h.tick(1302);
+    assert!(
+        resends_to(&cadence, bob)
+            .iter()
+            .any(|r| r.0 == 1 && r.1 == 6)
+    );
+
+    // And the >1000 ms deadlock recovery fires again on its own clock.
+    let second = h.tick(2003);
+    assert!(
+        resends_to(&second, bob)
+            .iter()
+            .any(|r| r.0 == 1 && r.1 == 6)
+    );
+}
+
+#[test]
+fn window_resets_across_game_end_and_second_launch() {
+    let (mut h, alice) = in_game_one();
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: upload(0, 0, vec![(1, diff(9))]),
+        },
+    );
+
+    // End the game: the old peer is gone, as pinned (every client is
+    // disconnected at game end). A new game needs a new admission and
+    // SYN, and nothing stale survives into it.
+    h.role.handle(T0, Input::Leave { player: alice });
+    assert!(h.role.recv.is_none());
+    let alice = h.join("a2");
+    h.syn(alice, "Alice");
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.gamestart(alice, 1, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert!(!recv.entries[0][0].active, "the old tic is gone");
+        let game = h
+            .role
+            .peers
+            .get(&alice)
+            .expect("peer")
+            .game
+            .as_ref()
+            .expect("game");
+        assert_eq!(game.sendseq, 0);
+        assert_eq!(game.acknowledged, 0);
+    }
+}
+
+#[test]
+fn transcript_single_player_gamedata_stable_fields() {
+    // The committed single-player session: after GAMESTART the client
+    // uploads from tic 0 and the server fans out empty commands.
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let (_, syn) = ClientPacket::decode(
+        &fixture_bytes("gamestart-gamedata", "000-c2s-client1-syn.bin"),
+        false,
+    )
+    .expect("syn");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: syn,
+        },
+    );
+    let (launch_header, launch) = ClientPacket::decode(
+        &fixture_bytes("gamestart-gamedata", "004-c2s-client1-launch.bin"),
+        false,
+    )
+    .expect("launch");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: launch_header,
+            packet: launch,
+        },
+    );
+    h.ack(alice, 1);
+    let (start_header, start) = ClientPacket::decode(
+        &fixture_bytes("gamestart-gamedata", "008-c2s-client1-gamestart.bin"),
+        false,
+    )
+    .expect("gamestart");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: start_header,
+            packet: start,
+        },
+    );
+    h.ack(alice, 2);
+    assert_eq!(h.role.state(), ServerState::InGame);
+
+    // Feed the committed first upload (one tic, zero diff) and pump: the
+    // single-player fan-out is an empty command list, stable by packet
+    // order and field shape.
+    let (header, packet) = ClientPacket::decode(
+        &fixture_bytes("gamestart-gamedata", "029-c2s-client1-gamedata.bin"),
+        false,
+    )
+    .expect("gamedata decodes");
+    let ClientPacket::GameData(data) = packet else {
+        panic!("fixture 029 is GAMEDATA");
+    };
+    assert_eq!(data.tics.len(), 1);
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header,
+            packet: ClientPacket::GameData(data),
+        },
+    );
+
+    let actions = h.tick(1);
+    let fanout = gamedata_to(&actions, alice);
+    assert_eq!(fanout.len(), 1);
+    assert_eq!(fanout[0].tics.len(), 1);
+    assert!(
+        fanout[0].tics[0].players.is_empty(),
+        "single-player fan-out carries no other player's commands"
+    );
+    let _ = header;
+}
