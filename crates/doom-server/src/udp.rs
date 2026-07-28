@@ -28,9 +28,14 @@ const RECV_BUF_LEN: usize = 2048;
 
 /// One listener task per configured `--udp ROOM=ADDR` bind: receives
 /// datagrams for its pinned room, drives the shared runtime, and sends
-/// every queued datagram FIFO as individual packets. Its lifetime is
-/// the serve future's through the composition root's join.
-pub(crate) async fn listener(socket: UdpSocket, room_name: RoomName, state: SharedState) {
+/// every queued datagram FIFO as individual packets. It is the only
+/// writer for its socket, and its lifetime is the serve future's: a
+/// socket failure resolves it, which ends the shared service.
+pub(crate) async fn listener(
+    socket: UdpSocket,
+    room_name: RoomName,
+    state: SharedState,
+) -> std::io::Result<()> {
     let (listener_id, notifier) = {
         let mut runtime = state.0.lock().await;
         runtime.register_listener()
@@ -39,9 +44,7 @@ pub(crate) async fn listener(socket: UdpSocket, room_name: RoomName, state: Shar
     loop {
         tokio::select! {
             received = socket.recv_from(&mut buf) => {
-                let Ok((len, from)) = received else {
-                    break;
-                };
+                let (len, from) = received?;
                 let effects = {
                     let mut runtime = state.0.lock().await;
                     runtime.udp_datagram(listener_id, &room_name, from, &buf[..len])

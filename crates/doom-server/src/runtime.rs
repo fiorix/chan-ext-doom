@@ -32,6 +32,11 @@ pub(crate) const TIMER_PERIOD: std::time::Duration = std::time::Duration::from_m
 #[derive(Clone)]
 pub(crate) struct SharedState(pub(crate) Arc<Mutex<Runtime>>);
 
+/// One configured UDP listener's future: it resolves only when its
+/// socket fails or closes, which must end the shared service.
+type ListenerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+
 /// The composition root: one shared runtime, one bounded timer, the
 /// WebSocket router, and every configured UDP listener, with no future
 /// detached, so cancelling or dropping the serve future cancels all of
@@ -51,22 +56,32 @@ pub async fn serve(
     let router = crate::websocket::router(state.clone());
     let server = axum::serve(listener, router).into_future();
     let timer = timer_loop(state.clone());
-    let udp = async move {
-        futures_util::future::join_all(
-            udp_listeners
-                .into_iter()
-                .map(|(room_name, socket)| crate::udp::listener(socket, room_name, state.clone())),
-        )
-        .await;
-        // No UDP listener ever completes normally, and an empty list
-        // must not end the serve future.
-        futures_util::future::pending::<()>().await
-    };
+    let udp = udp_supervisor(
+        udp_listeners
+            .into_iter()
+            .map(|(room_name, socket)| {
+                Box::pin(crate::udp::listener(socket, room_name, state.clone())) as ListenerFuture
+            })
+            .collect(),
+    );
     tokio::select! {
         result = server => result,
         () = timer => Ok(()),
-        _ = udp => Ok(()),
+        result = udp => result,
     }
+}
+
+/// The UDP branch of the composition root. An empty listener list
+/// pends forever so a WebSocket-only serve persists; with any listener
+/// configured, the FIRST listener completion or error resolves the
+/// branch and ends the shared service, cancelling the rest with it.
+pub(crate) async fn udp_supervisor(listeners: Vec<ListenerFuture>) -> std::io::Result<()> {
+    if listeners.is_empty() {
+        futures_util::future::pending::<()>().await;
+        unreachable!("the empty-listener pending branch never resolves");
+    }
+    let (result, _, _) = futures_util::future::select_all(listeners).await;
+    result
 }
 
 pub(crate) struct Runtime {
