@@ -10,7 +10,7 @@ Two browser engines use the Rust server role instead of running `NET_SV_*` insid
 
 ```mermaid
 flowchart LR
-    fixtures["102 native UDP fixtures"] --> codec["doom-proto<br/>directional byte-exact codec"]
+    fixtures["Native UDP fixture corpus<br/>102 baseline + REJECTED refusals"] --> codec["doom-proto<br/>directional byte-exact codec"]
     room["existing bounded room core"] --> state["Rust Chocolate server role<br/>sans-I/O state machine"]
     codec --> state
     state --> ws["WebSocket binding<br/>route envelope at edge"]
@@ -29,7 +29,8 @@ The room core continues to own names, membership, stable connection identities, 
 - Implement explicit big-endian readers and writers for the Chocolate 3.1.1 packet family documented in `docs/protocol.md`.
 - Model client-to-server and server-to-client packets separately where the same type has different layouts.
 - Cover SYN, REJECTED, KEEPALIVE, WAITING_DATA, LAUNCH, GAMESTART, GAMEDATA, GAMEDATA_ACK, DISCONNECT, DISCONNECT_ACK, RELIABLE_ACK, GAMEDATA_RESEND, CONSOLE_MESSAGE, QUERY, and QUERY_RESPONSE. Keep deprecated ACK and NAT_HOLE_PUNCH explicitly unsupported unless source evidence establishes a needed representation.
-- Preserve every represented field required to decode and re-encode all 102 committed datagrams byte-for-byte, including volatile and Doom-unused bytes. Do not normalize captured garbage into invented defaults.
+- Preserve every represented field required to decode and re-encode the complete committed corpus byte-for-byte, including the 102 baseline datagrams, new REJECTED evidence, volatile bytes, and Doom-unused bytes. Do not normalize captured garbage into invented defaults.
+- Extend the capture rig with at least two deterministic connection-refusal causes against the real pinned chocolate-server and commit the resulting REJECTED packets with full provenance. Keep scratch IWAD/DEH inputs, binaries, and logs out of the repository. If a selected refusal is unreachable, record the source-backed reason and replace it with another independently caused refusal.
 - Reject truncation, unterminated strings, impossible counts, size arithmetic overflow, invalid direction/layout combinations, and trailing bytes where the packet layout is exact.
 - Use fixed-width field operations with no transmute, C-layout dependency, copied GPL implementation code, I/O, async runtime, or unsafe code.
 
@@ -60,7 +61,7 @@ The room core continues to own names, membership, stable connection identities, 
 
 ## Evidence and acceptance
 
-1. Every committed fixture decodes under its manifest direction and re-encodes to the exact original bytes. Mutation tests prove endian, length, count, string-termination, direction, reliable-sequence, and ticcmd-diff checks can fail.
+1. Every committed fixture decodes under its manifest direction and re-encodes to the exact original bytes. The corpus includes REJECTED packets from at least two distinct refusal causes produced by the real pinned chocolate-server. Mutation tests prove endian, length, count, string-termination, direction, reliable-sequence, and ticcmd-diff checks can fail.
 2. Transcript tests drive the server state machine with committed client packets and compare its observable packet sequence and stable fields with the corresponding real chocolate-server fixture evidence. Volatile fields are compared by documented invariants rather than copied fixture values.
 3. Deterministic state-machine tests cover valid handshake through tic exchange plus rejection, malformed input, reliable wrap/retry, resend, timeout, disconnect, room capacity, and slow-consumer behavior with a controlled clock.
 4. A real pinned native Chocolate Doom 3.1.1 client connects over UDP to the Rust server, reaches lobby and GAMESTART, and exchanges game tics.
@@ -70,7 +71,7 @@ The room core continues to own names, membership, stable connection identities, 
 
 ## Sequence
 
-1. Land the codec and exact 102-fixture round-trip gate while the server lane maps the state-machine seam and the engine lane opens the native build path.
+1. Land the codec, the two-cause REJECTED capture extension, and the exact full-corpus round-trip gate while the server lane maps the state-machine seam and the engine lane opens the native build path.
 2. Land the sans-I/O server lifecycle against the codec, then independently replay and mutate it before adding network runtimes.
 3. Bind the accepted state machine to WebSocket and UDP, preserving one action model and one set of bounds across both transports.
 4. Switch the browser loader to client-only operation and run native, mixed-transport, co-op, and deathmatch integration checks.
