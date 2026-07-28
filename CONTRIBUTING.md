@@ -1,0 +1,29 @@
+# Contributing
+
+Keep changes narrow, use conventional commit messages, stage explicit pathspecs, review the staged diff, and run the relevant repository checks before committing.
+
+## Documentation
+
+- Describe the repository as it works now. Do not organize reference documentation around staged delivery labels, task or review language, or development-process framing.
+- Keep development history only in `CHANGELOG.md`.
+- Do not use em dashes. Prefer a colon, period, comma, or parentheses.
+- Add a Mermaid diagram when it makes a multi-component relationship or sequence materially easier to understand. Keep diagrams small and factual.
+- Keep each prose paragraph and list item on one logical line. Tables, code fences, license text, and upstream files retain their native formatting.
+- Do not rewrite upstream `engine/README.md`, `engine/COPYING.md`, or license texts to match repository-authored style.
+
+## Checks
+
+Run the Rust gate for workspace changes:
+
+```sh
+./scripts/gate.sh
+```
+
+Run the engine tests for changes under `engine/`:
+
+```sh
+cd engine
+npm test
+```
+
+Engine build and artifact verification commands are documented in [`engine/docs/provenance.md`](engine/docs/provenance.md).

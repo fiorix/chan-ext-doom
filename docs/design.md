@@ -1,119 +1,141 @@
-# doomit — DOOM net-revival: standalone repo + generalised Rust crate
+# doomit design
 
-Status: ACCEPTED 2026-07-27 by @@Alex review; all open questions from the review draft are resolved in "Decisions" below. This is the spec of record for the doomit team. The reviewed draft (with inline answers, the audit trail) lives at `chan:dev/doom/multiplayer-crate-design.md`; the grounding roadmap item is `chan-doom:team/roadmap/v0.80.0/doom-multiplayer.md`, whose protocol/transport analysis still stands.
+This document is the living specification for doomit's component boundaries, protocol strategy, constraints, and planned extensions.
 
-## The ask
+## Purpose
 
-Revive DOOM multiplayer in a standalone repo: a fork of the engine with the deleted netcode restored, plus a generalised Rust crate family that (a) lets any Rust program embed DOOM with the protocol wired, (b) is the multiplayer server (the server role is native Rust, not an in-WASM host tab), and (c) can later plug into chan as a library, with the SPA integration specced separately as a new chan roadmap item after this repo's work completes.
+doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer restored and a Rust crate family that separates room transport, protocol handling, and native embedding. The browser implementation is usable on its own; the crate boundaries also support a pure Rust server role, native Chocolate client interoperability, and embedding in Rust applications without making chan a dependency.
 
-## Decisions (from @@Alex review, 2026-07-27)
+## Design principles
 
-1. License posture: Apache-2.0 crates + GPL-2.0 engine kept as runtime data. Confirmed.
-2. Engine fork base: merged lineage — take the best of rojo2/wasm-doom (crispy engine, matches the shipped single-player build) and cloudflare/doom-wasm (restored chocolate netcode, `net_websockets.c`) and merge them into one clean tree that others can build upon. Fidelity and validated functionality first; hardening later. Native mod management (load/unload of PWADs) is a from-the-start requirement, validated against 2-3 mods picked from https://www.moddb.com/games/doom/mods.
-3. Repo: `fiorix/doomit`, code at `/home/fiorix/dev/github.com/fiorix/doomit`.
-4. Protocol: option A confirmed — keep the chocolate wire protocol; Rust reimplements the server role. Option D (wasm-embedded net_server) stays documented as the fallback.
-5. doom-embed (wasmtime native embedding + bot clients): IN scope for v1.
-6. Desktop interop: YES — native chocolate-doom clients joining Rust-hosted rooms over UDP is a supported goal.
-7. Game modes: co-op AND deathmatch flags from the start.
-8. Player ceiling: design the room layer for 8 (NET_MAXPLAYERS). Note Doom's in-game cap is 4 (MAXPLAYERS); the net layer and rooms size for 8, the engine enforces its own cap at game start.
-9. IWAD: shareware-only (pinned doom1.wad sha1 5b2e249b9c5133ec987b3ea77596381dc0d6bc1d), provided mods (PWADs on top) work.
-10. Keep the M1 in-WASM-host spike before the Rust server role.
-11. chan integration spec: a NEW chan roadmap item, written after this repo's work completes.
+- Preserve the Chocolate Doom wire protocol and engine behavior instead of creating a new game protocol.
+- Keep the GPL-2.0 engine and Apache-2.0 Rust crates separated by a runtime data boundary.
+- Keep room membership, packet routing, protocol state, and game simulation as distinct responsibilities.
+- Size the room layer for Chocolate's `NET_MAXPLAYERS` value of eight while respecting the engine's four-player in-game limit.
+- Treat the shareware Doom 1.9 IWAD as pinned runtime data and PWAD identity as part of multiplayer agreement.
+- Make deterministic behavior observable through independent input-history and simulation-state digests.
+- Keep chan integration outside this repository and expose narrow library boundaries that a consumer can adapt.
 
-## Verified ground (checked 2026-07-27, not assumed)
+## Current system
 
-- The shipped chan `doom.wasm` is built from rojo2/wasm-doom (Crispy Doom lineage, GPL-2.0) with ALL network code deleted; `d_loop.c` is gutted (`D_StartNetGame` forces one player, `GetLowTic` never waits). The surviving `D_ReceiveTic`/`TryRunTics`/BACKUPTICS machinery is the injection point.
-- rojo2/wasm-doom: live, GPL-2.0, dormant since 2019 (fork of lazarv/wasm-doom).
-- cloudflare/doom-wasm: live, GPL-2.0, pushed as recently as 2026-04. Chocolate Doom + restored netcode + one added transport file `src/net_websockets.c` (chocolate's net layer is a pluggable `net_module_t` vtable). The proven precedent and main de-risking anchor.
-- chan is Apache-2.0; the doom engine lineage is GPL-2.0. This sets the licensing boundary — the hardest constraint on "plug into chan as a library."
-- The chocolate dedicated server does NOT simulate the game. It is a relay: handshake, player/address table, GAMESTART broadcast, ticcmd window fan-out at 35 Hz, resend and timeout bookkeeping. That is the whole role Rust reproduces — no game logic.
-- emsdk is installed on this host at `~/dev/emsdk` (the chan bundle recipe uses it).
+The engine is a rojo2/wasm-doom Crispy lineage base with the matching Chocolate network layer restored. Browser builds use `net_websockets.c`; one browser engine runs Chocolate's client and server roles, and other browser engines connect as clients.
 
-## Licensing boundary (drives the whole shape)
+`doom-server` provides a sans-I/O `Registry` for named rooms with a maximum of eight connections, bounded FIFO outboxes, payload limits, and disconnect-on-overflow behavior. Its WebSocket binding owns Cloudflare-compatible route envelopes and route identity. The `doomd serve` CLI exposes that binding at `/ws/{room}`. It relays opaque Chocolate packets and contains no Chocolate game-server state machine.
 
-- `engine/` (the fork): GPL-2.0, public on publication, corresponding source shipped. Same posture as chan's `doom-v1` bundle (LICENSES.txt + build recipe).
-- Rust crates: Apache-2.0, written from scratch. The wire protocol is reimplemented for interoperability (formats/constants are not creative expression); no C code is ported line-by-line. This keeps the crates linkable into Apache-2.0 chan-server.
-- The engine WASM is always *data* to the Rust side: served/downloaded at runtime, never `include_bytes!`'d, never FFI-linked. The GPL boundary is a process/sandbox boundary (browser iframe, wasmtime instance).
+The browser loader validates the pinned shareware IWAD, manages ordered PWADs, normalizes Chocolate's merge-before-file precedence, fingerprints the effective mod configuration, and replaces the engine iframe when configuration changes. It can host or join a room, record a verification demo, and compare exit digests between two cooperating same-origin pages.
 
-## Repo shape
+The fixture set contains 102 curated native UDP datagrams from five Chocolate Doom 3.1.1 sessions. `doom-proto` verifies fixture membership, lengths, headers, and hashes; it exposes no packet codec. `doom-embed` is a buildable crate scaffold without a wasmtime host.
 
-```
+The CMake and single-command engine build routes are browser-only and require Emscripten. `src/net_sdl.c` is retained source, but no native engine target or Rust UDP binding is buildable from this tree.
+
+## Repository shape
+
+```text
 fiorix/doomit
-├── engine/                         # merged-lineage doom fork (GPL-2.0); the revival lands here
-│   └── docs/                       # build recipe + provenance (mirrors chan's bundle README)
+├── engine/                         # GPL-2.0 engine fork, browser loader, builds, tests
 ├── crates/
-│   ├── doom-proto/                 # wire codec: packets, ticcmd, GAMESTART — pure data, no I/O
-│   ├── doom-server/                # rooms + server role; sans-IO core + WS/UDP bindings + CLI
-│   └── doom-embed/                 # wasmtime host for the engine WASM (native clients, bots)
-├── fixtures/                       # golden packet captures from real chocolate sessions
+│   ├── doom-proto/                 # fixture checks and protocol-codec boundary
+│   ├── doom-server/                # room core, WebSocket binding, doomd CLI
+│   └── doom-embed/                 # native-host crate scaffold
+├── fixtures/                       # captured Chocolate packet evidence
 ├── docs/
-│   ├── protocol.md                 # the wire protocol, written down as an owned spec
-│   └── verification.md             # capture-replay fixtures + how they were recorded
-└── examples/                       # standalone server, two-client loopback demo
+│   ├── protocol.md                 # observed and source-grounded wire inventory
+│   ├── verification.md             # fixture capture and validation procedure
+│   └── mods.md                     # selected PWAD contract and provenance
+└── scripts/gate.sh                 # Rust formatting, lint, and test gate
 ```
 
-Nothing in `crates/` may depend on chan. chan is the first consumer, not a dependency.
+Nothing in `crates/` depends on chan.
 
-## Crate shape
+## Component contracts
 
-**`doom-proto`** — encode/decode for the chocolate wire format: packet header and `NET_PACKET_TYPE_*` family, connect/accept handshake, GAMESTART settings, full-ticcmd fan-out, keepalive/disconnect. Explicit big-endian reads/writes for Chocolate packet fields, no transmute, no C-layout structs. (The separate Cloudflare WebSocket route envelope is little-endian.) No I/O, no async. This is the piece that must be byte-exact, so it is the piece that is easiest to test: golden packets captured from real chocolate-doom ↔ chocolate-server sessions, plus fuzzing. (Small: the packet zoo is a few dozen variants; a ticcmd is ~8 bytes.)
+### Engine
 
-**`doom-server`** — the core deliverable. Two layers:
+The engine owns game simulation, Chocolate client and server behavior, browser input/audio/video, WAD loading, demo recording, and the exit-state serializer. The WebSocket transport is a `net_module_t` implementation and carries Chocolate packets without changing their bytes.
 
-1. Room layer (phase 1): `Registry` of rooms keyed by name; join/leave; per-connection bounded outbox with slow-consumer = disconnect (at 35 Hz lockstep you cannot buffer a stalled peer). Rooms size for NET_MAXPLAYERS = 8. Protocol-agnostic envelope relay — the Cloudflare Durable Object role, as a real library.
-2. Server-role state machine (phase 2): the native Rust NET_SV — handshake, player table, GAMESTART broadcast with agreed settings (co-op and deathmatch flags), ticcmd window fan-out (BACKUPTICS window, resend on sequence gaps, keepalive/timeout, disconnect). Zero game simulation.
+The engine emits two exit reports at the same `ga_completed` anchor before level teardown. The input report hashes the canonical recorded ticcmd stream. The state report serializes deterministic game state in the explicit `DCS1` format and hashes it. Presentation-only state and per-instance pointers are excluded. The loader displays an aggregate match only when both report types match for a reciprocally paired launch and the same exit identity.
 
-Shape discipline: the core is sans-IO — `handle(&mut self, from: PlayerId, bytes: &[u8], now: Instant) -> Vec<Action>` with `Action::{Send, Disconnect, ...}`. Transports are thin bindings: WebSocket (browsers; binary frames carrying packets with the 8-byte to/from envelope) AND UDP (native chocolate-doom clients — desktop interop is a supported goal, so the datagram envelope semantics stay first-class). A `doomd serve` CLI wraps both. Payoff of sans-IO: deterministic tests with no runtime, and chan later drives the same core from its own route handler with its own auth in front.
+### Room server
 
-**`doom-embed`** (in v1 scope) — wasmtime host that runs the engine WASM natively: host provides framebuffer/audio callbacks and input injection, and the engine's net module calls host imports mapped onto a `Transport`. Payoffs: (a) "embed DOOM in any Rust program" beyond the browser, (b) headless bot clients — the only sane way to run the 8-player soak without eight humans. Separate crate so wasmtime's weight is opt-in (chan-server never links it).
+The room core owns portable room names, membership, stable connection identifiers, bounded queues, FIFO relay, payload limits, and slow-consumer removal. The WebSocket adapter owns route parsing, source binding, room reset semantics, and frame encoding. These layers remain protocol-agnostic.
 
-**`engine/`** — the merged-lineage fork. Base: the crispy-doom tree that wasm-doom ships (continuity with the proven single-player build), with the cloudflare/doom-wasm netcode restoration merged in (chocolate lineage, adapted to the crispy vintage). Keep the tree clean, documented, and upstream-attributed so others can build on it. Revival patch set:
+The designed Chocolate server-role layer sits above packet codecs and below transport adapters. It owns handshake state, the player table, lobby settings, GAMESTART, ticcmd fan-out, resend windows, keepalive, timeout, and disconnect behavior. It never simulates the game.
 
-1. Restore `src/net_*.c`, `i_net.c`, `d_net.c` from the matching crispy/chocolate vintage, using cloudflare/doom-wasm as the reference implementation.
-2. Port `net_websockets.c` (the Cloudflare `net_module_t`) for the browser build; keep UDP via SDL_net or an equivalent for native builds.
-3. Un-stub `d_loop.c` (`D_StartNetGame`, `GetLowTic`).
-4. Keep the documented `v_trans.h` build fix and the existing emscripten build recipe; republish as a `doom-v2` bundle with sha-pinned provenance.
+### Protocol crate
 
-**Mod support (from the start, native)** — the engine and its hosts manage PWADs as first-class runtime data alongside the pinned shareware IWAD: enumerate, load, and unload mods without rebuilding or hand-editing command lines. The browser loader page and doom-embed's host API both expose it. Validated as we go against 2-3 mods picked from moddb (must be compatible with the shareware IWAD; shortlist raised as a host survey before adoption). Mod files ship under the same download-on-demand, provenance-recorded model as the IWAD.
+The protocol crate's intended public surface is explicit big-endian encoding and decoding for Chocolate packet fields, including packet headers, handshake messages, GAMESTART settings, ticcmd windows, reliable sequencing, resend, keepalive, and disconnect. The separate WebSocket route envelope uses little-endian route identifiers and is not part of the Chocolate packet format.
 
-## Protocol strategy
+The codec must use fixed-width field operations rather than C layout, transmute, or copied GPL implementation code. Captured packets and the source-grounded inventory in `protocol.md` define the interoperability evidence.
 
-- **A (chosen). Keep the chocolate wire protocol; Rust reimplements the server role.** Engine diff stays minimal (restored client code + transport files — the proven Cloudflare shape). The Rust server is the one real chunk of new code, and it is provable: replay recorded chocolate-server sessions against it byte-for-byte. Desktop interop (decision 6) requires this.
-- B. New owned protocol — rejected: re-solves resend/drift/lobby, doubles the engine diff, loses interop.
-- C. Dumb envelope router + in-WASM host tab forever — rejected as the end state (Rust is the server); retained as the M1 spike.
-- D. wasm-embedded net_server.c as the server role — documented fallback if A's fidelity proves elusive.
+### Native embedding
 
-Side benefit of A with a persistent Rust server: host migration dissolves — the server outlives every player, and a chan window-session leader (later) degrades to pure lobby authority.
+The native embedding boundary is designed as an optional wasmtime host for the engine WebAssembly artifact. Host callbacks provide framebuffer, audio, and input, while network imports map to a transport abstraction. Bot clients use the same boundary for scale and deterministic tests. Wasmtime remains isolated in this crate so consumers that only need the room server do not take the dependency.
 
-## Phasing
+## Protocol and transport strategy
 
-- **M0 — scaffold.** Workspace, three crates, local gate script (fmt, clippy `-D warnings`, test), engine/ imported with upstream commit pinned in `engine/docs/provenance.md`, single-player WASM builds with the documented recipe. Exit: clean gate; bundle parity vs the pinned recipe.
-- **M1 — transport spike.** Engine revival patch set; doom-server room layer; one browser tab runs the in-WASM host. Exit: two browser windows play co-op start-to-exit without desync (demo-recorded end states identical), with one mod load/unload smoke.
-- **M2 — Rust server role.** doom-proto codec + golden fixtures; server-role state machine behind the same room API; host tab removed; UDP binding lands so a native chocolate-doom client can join. Exit: same two-window co-op against the pure Rust server; capture-replay parity vs real chocolate-server; one native-client-over-UDP join; deathmatch flags exercised once.
-- **M3 — hardening + doom-embed.** doom-embed host + headless bot clients; 8-player 10-minute soak (bots padding to 8); stalled-client outbox-cap test; mod validation against the 2-3 picked mods; `docs/protocol.md` complete; `doom-v2` bundle published locally with recipe + LICENSES.txt.
-- **M4 — chan integration (separate spec, new chan roadmap item, after this work).** chan-server links doom-server as a library on a new `/api/doom/ws` route modeled on `routes/scene.rs` minus disk persistence; lobby UI in the DoomOverlay; the engine iframe opens its own WebSocket (iframe isolation survives; SPA↔iframe is lobby postMessage only). The seam this repo owes: the sans-IO core.
+Chocolate packets remain the game protocol. Browser engines add an asymmetric route envelope around each packet:
 
-## Verification (adversarial)
+- Engine to relay: destination route ID, source route ID, then the unchanged Chocolate packet.
+- Relay to engine: source route ID, then the unchanged Chocolate packet.
 
-- Golden capture-replay: build upstream chocolate-doom + chocolate-server natively, record real sessions (handshake, GAMESTART, mid-game ticcmd streams, resend-under-loss, disconnect), replay byte-for-byte against doom-proto and later doom-server. The Rust server is wrong until proven otherwise against these fixtures.
-- Codec fuzzing (proptest at minimum; cargo-fuzz target in-tree).
-- Desync canary: identical demo-recorded end state across clients over a full E1M1 clear, on both M1 and M2 servers.
-- Slow-client test: stall one connection, assert the outbox cap trips and the peer is disconnected with bounded memory — measured RSS, not just a green test.
-- 8-player soak, 10+ minutes, bots padding to capacity.
-- Mod smokes: load/unload the picked PWADs mid-session at each milestone from M1 on.
+The route IDs are little-endian u32 values. Chocolate packet fields remain big-endian. The current host browser runs Chocolate's server role; the relay only moves frames between route IDs.
+
+The pure Rust server role is the designed replacement for the host browser's server role. Browser clients reach it through the room/WebSocket boundary, and native Chocolate clients reach it through a UDP binding. Both transports feed the same packet and server-state interfaces.
+
+## Mod contract
+
+The pinned IWAD is shareware Doom 1.9: 4,196,020 bytes, SHA-1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, and SHA-256 `1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771`.
+
+Each PWAD identity contains its basename, SHA-256, load kind, and effective embedded-DEHACKED behavior. The multiplayer fingerprint contains the canonical effective order: all `merge` entries in declared relative order, then all `file` entries in declared relative order. Standalone DEH/BEX patches, unsafe basenames, duplicate names, and the reserved IWAD name are rejected.
+
+Changing the set restarts the engine instance. The loader does not claim hot unloading. No third-party PWAD binary is committed; source and rights metadata live in the mod catalog and provenance snapshot.
+
+## Licensing boundary
+
+- `engine/` is GPL-2.0. Distributing a built engine artifact requires corresponding source and preserved upstream attribution.
+- The Rust crates are Apache-2.0 and reimplement wire behavior from observed packets and public format evidence. They do not copy engine C code.
+- The engine WebAssembly artifact is runtime data. Rust crates neither link it nor include it in their binaries.
+- Browser iframes and a native WebAssembly instance are runtime isolation boundaries, not claims that every host uses a separate operating-system process.
+
+## Planned components
+
+### Rust protocol and server role
+
+Implement the byte-exact codec and the Chocolate server-role state machine behind the existing room interfaces. Verify behavior against captured native sessions and source-grounded packet layouts.
+
+### Native transport
+
+Make the engine buildable without browser-only Emscripten seams, enable the retained SDL_net transport, and add a Rust UDP adapter so native Chocolate clients and browser clients can join the same server role.
+
+### Embedding and scale validation
+
+Implement the wasmtime host and bot client boundary, then exercise eight-room capacity, sustained lockstep, stalled-peer removal, and deterministic mod behavior without requiring eight human players.
+
+### chan adapter
+
+Expose the sans-I/O room and server-role core through a chan-owned route and lobby UI. The chan SPA origin treats the browser canary as a cooperative desync aid, not as a security signal.
+
+## Verification model
+
+Implemented checks cover the Rust room relay, WebSocket route binding, fixture integrity, transport framing and ownership, ABI consistency, loader configuration, deterministic canary serialization, and multi-page verdict behavior. The browser build is pinned by exact artifact hashes under emsdk 6.0.3.
+
+Protocol and server-role implementation must add golden decode/encode parity, malformed-input rejection, reliable-sequence and resend coverage, and replay against native Chocolate sessions. Native transport must demonstrate a real Chocolate client join. Scale work must measure bounded memory while a peer stalls and exercise the full eight-connection room capacity.
+
+The end-to-end browser invariant is bilateral agreement at the same exit: both pages report matching input history and matching serialized simulation state. A missing digest, stale partner, unrelated page, malformed report, or one-sided match remains incomplete.
 
 ## Non-goals
 
-- No server-side game simulation, ever. The server relays inputs; the engines simulate.
-- No changes to chan in this repo. chan integration is M4, specced elsewhere.
-- No game-logic changes in the engine beyond the netcode revival and mod management.
-- No WS↔UDP relay to a native chocolate-server and no NAT traversal in v1 (UDP interop is LAN/loopback scope).
-- No publishing (crates.io, GitHub push, releases) until the host says so.
+- The server does not simulate DOOM game logic.
+- This repository does not modify chan.
+- The engine does not change gameplay beyond netcode restoration, deterministic verification, and mod management.
+- The design does not include NAT traversal.
+- The browser verdict does not authenticate same-origin pages and must not gate a security-sensitive action.
 
 ## References
 
-- `chan-doom:team/roadmap/v0.80.0/doom-multiplayer.md` — grounding + acceptance checks this design inherits.
-- `chan:crates/chan-server/resources/doom/README.md` (doom-overlay branch) — bundle build recipe + provenance model to mirror.
-- https://github.com/cloudflare/doom-wasm (GPL-2.0) + https://blog.cloudflare.com/doom-multiplayer-workers/ — the precedent.
-- https://github.com/rojo2/wasm-doom (GPL-2.0) — engine base.
-- https://www.moddb.com/games/doom/mods — mod shortlist source.
+- `chan-doom:team/roadmap/v0.80.0/doom-multiplayer.md`: grounding and acceptance analysis.
+- `chan:crates/chan-server/resources/doom/README.md`: bundle build and provenance model.
+- https://github.com/cloudflare/doom-wasm: browser multiplayer precedent.
+- https://blog.cloudflare.com/doom-multiplayer-workers/: room-router precedent.
+- https://github.com/rojo2/wasm-doom: engine base.
+- https://www.moddb.com/games/doom/mods: mod catalog source.
