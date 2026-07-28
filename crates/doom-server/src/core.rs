@@ -144,6 +144,10 @@ pub enum JoinError {
     /// The registry exhausted its stable identifier space.
     #[error("player identifier space is exhausted")]
     PlayerIdsExhausted,
+    /// The room is held only by undrained removal traffic; its lifetime
+    /// already ended and the next admission must start a fresh host.
+    #[error("room is draining removal traffic")]
+    RoomDraining,
 }
 
 /// Why a packet could not be relayed.

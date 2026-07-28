@@ -5,7 +5,7 @@
 //! mix; transport identity and address maps live here at the binding,
 //! never in the sans-I/O role.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -123,6 +123,13 @@ pub(crate) struct BindRoom {
     /// by the removed peer's own bounded outbox; drained by the
     /// listener that owns it.
     pub(crate) pending_udp: HashMap<ListenerId, VecDeque<(SocketAddr, Vec<u8>)>>,
+    /// Removed `(listener, address)` pairs whose bounded pending batch
+    /// has not yet been attempted by the listener. Not the live
+    /// identity mapping: re-admission waits for the drain attempt, and
+    /// each entry clears after it. Never rely on readiness ordering for
+    /// this; a ready SYN must not be admitted before the prior
+    /// terminal leaves the socket.
+    pub(crate) udp_draining: HashSet<(ListenerId, SocketAddr)>,
 }
 
 pub(crate) struct Connection {
@@ -166,6 +173,7 @@ impl BindRoom {
             udp_players: HashMap::new(),
             udp_addresses: HashMap::new(),
             pending_udp: HashMap::new(),
+            udp_draining: HashSet::new(),
         }
     }
 
@@ -187,10 +195,26 @@ impl BindRoom {
         }
     }
 
-    /// Whether the room holds nothing on any transport (the runtime
-    /// then drops it, so unbounded room names cannot retain hosts).
+    /// Whether the room holds nothing on any transport and owes no
+    /// undrained removal traffic (the runtime then drops it, so
+    /// unbounded room names cannot retain hosts). Pending datagrams
+    /// keep the room until their listener attempts the batch.
     pub(crate) fn is_empty(&self) -> bool {
-        self.host.is_empty() && self.connections.is_empty() && self.udp_players.is_empty()
+        self.host.is_empty()
+            && self.connections.is_empty()
+            && self.udp_players.is_empty()
+            && self.pending_udp.values().all(VecDeque::is_empty)
+    }
+
+    /// Whether the room is held only by undrained removal traffic: its
+    /// lifetime already ended, so no new session on any transport is
+    /// admitted into it. The listener's drain attempt drops the room,
+    /// and the next valid SYN then starts a fresh host.
+    pub(crate) fn is_draining(&self) -> bool {
+        self.host.is_empty()
+            && self.connections.is_empty()
+            && self.udp_players.is_empty()
+            && !self.pending_udp.values().all(VecDeque::is_empty)
     }
 
     /// Fold one reducer batch into transport state; the returned work
@@ -231,12 +255,20 @@ impl BindRoom {
                 effects.ws_waiters.push(Arc::clone(&connection.waiter));
             } else if let Some(peer) = self.udp_players.remove(&player) {
                 self.udp_addresses.remove(&(peer.listener, peer.address));
-                let pending = self.pending_udp.entry(peer.listener).or_default();
-                while let Some(packet) = self.host.pop_outbound(player) {
-                    pending.push_back((peer.address, packet.payload().to_vec()));
+                let mut captured = false;
+                {
+                    let pending = self.pending_udp.entry(peer.listener).or_default();
+                    while let Some(packet) = self.host.pop_outbound(player) {
+                        pending.push_back((peer.address, packet.payload().to_vec()));
+                        captured = true;
+                    }
+                    if let Some(terminal) = terminal {
+                        pending.push_back((peer.address, terminal));
+                        captured = true;
+                    }
                 }
-                if let Some(terminal) = terminal {
-                    pending.push_back((peer.address, terminal));
+                if captured {
+                    self.udp_draining.insert((peer.listener, peer.address));
                 }
                 notify_udp(&mut effects, peer.listener);
             }
@@ -273,6 +305,14 @@ impl Runtime {
             outbox_capacity,
             ..
         } = self;
+        // A room held only by undrained removal traffic admits no new
+        // session: the drain attempt drops it and the next connection
+        // starts a fresh host.
+        if let Some(room) = rooms.get(&room_name)
+            && room.is_draining()
+        {
+            return Err(JoinError::RoomDraining);
+        }
         let room = rooms
             .entry(room_name.clone())
             .or_insert_with(|| BindRoom::new(&room_name, *outbox_capacity));

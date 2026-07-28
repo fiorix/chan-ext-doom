@@ -117,13 +117,22 @@ impl Runtime {
 
         // Unknown address: decode with the room's authoritative width
         // (wide before GAMESTART; only SYN and QUERY matter here, and
-        // both are width-independent).
+        // both are width-independent). Admission is refused while this
+        // (listener, address) has an unattempted removal batch or the
+        // room is held only by undrained removal traffic; the client
+        // retransmits and is admitted after the drain attempt.
         let lowres = rooms
             .get(room_name)
             .map(|room| room.host.lowres_turn())
             .unwrap_or(false);
+        let admission_blocked = rooms.get(room_name).is_some_and(|room| {
+            room.udp_draining.contains(&(listener, from)) || room.is_draining()
+        });
         match ClientPacket::decode(payload, lowres) {
             Ok((header, packet @ ClientPacket::Syn(_))) => {
+                if admission_blocked {
+                    return Effects::default();
+                }
                 // A valid SYN is admitted registry-first and mapped
                 // atomically, then fed through the normal packet path.
                 let room = rooms
@@ -169,6 +178,9 @@ impl Runtime {
             }
             Err(_) => match classify_malformed(payload) {
                 MalformedClass::Syn { old_magic: true } => {
+                    if admission_blocked {
+                        return Effects::default();
+                    }
                     // Admission, classification, terminal REJECTED, and
                     // removal with unmapping in one reduction.
                     let room = rooms
@@ -203,7 +215,10 @@ impl Runtime {
 
     /// Drain every owed datagram for one listener of a room: its
     /// pending removal traffic first (terminal last per removed peer),
-    /// then each of its mapped peers' outboxes FIFO. An outbound
+    /// then each of its mapped peers' outboxes FIFO. Capturing the
+    /// pending batch for the send attempt clears this listener's
+    /// removal tombstones, and a room left empty afterwards is dropped
+    /// here, so pending traffic is part of room lifetime. An outbound
     /// datagram over the 1500-byte ceiling is a distinct producer
     /// error: it is never truncated, split, silently dropped, or sent
     /// through the slow-consumer path, and it isolates exactly its
@@ -238,6 +253,11 @@ impl Runtime {
                     out.push((address, bytes));
                 }
             }
+            // This listener's pending batch is captured above for the
+            // send attempt that follows the lock release, so its
+            // removal tombstones clear and re-admission opens.
+            room.udp_draining
+                .retain(|(candidate, _)| *candidate != listener);
             let players: Vec<(PlayerId, SocketAddr)> = room
                 .udp_players
                 .iter()
@@ -267,6 +287,11 @@ impl Runtime {
                 let effect = room.host.leave(now, player);
                 room.apply(effect, udp_notifiers);
             }
+        }
+        // Final empty-room cleanup: a room whose last batch this drain
+        // attempted now drops, and the next valid SYN starts fresh.
+        if rooms.get(room_name).is_some_and(BindRoom::is_empty) {
+            rooms.remove(room_name);
         }
         out
     }
