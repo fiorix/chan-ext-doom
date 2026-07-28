@@ -220,10 +220,10 @@
 
       <fieldset>
         <legend>Desync verdict</legend>
-        <div id="verdict-aggregate" class="verdict pending">PENDING</div>
+        <div id="verdict-aggregate" class="verdict pending">M1 CANARY PENDING</div>
         <table>
-          <tr><td>input history</td><td id="verdict-input">PENDING</td></tr>
-          <tr><td>exit state</td><td id="verdict-state">PENDING</td></tr>
+          <tr><td>input history</td><td id="verdict-input">INPUT PENDING</td></tr>
+          <tr><td>exit state</td><td id="verdict-state">STATE PENDING</td></tr>
         </table>
         <div id="verdict-note" class="hash">Play to the level exit in both windows.</div>
       </fieldset>
@@ -245,8 +245,8 @@
       } from "./mod_order.js";
       import { classifyMessage, GATE } from "./message_gate.js";
       import {
-        parseCanaryLine, channelName, runKey, isComplete, compareReports,
-        acceptsReport, VERDICT,
+        parseCanaryLine, channelName, isComplete, compareReports,
+        acceptsReport, classifyArm, addCanaryLine, LABEL, ARM, VERDICT,
       } from "./canary_verdict.js";
 
       const el = (id) => document.getElementById(id);
@@ -324,7 +324,9 @@
           w.textContent = "rejected: " + verdict.reason;
           const want = document.createElement("div");
           want.className = "hash";
-          want.textContent = `expected ${IWAD_PIN.size} bytes, sha256 ${IWAD_PIN.sha256}`;
+          want.textContent =
+            `expected ${IWAD_PIN.size} bytes, sha256 ${IWAD_PIN.sha256}, ` +
+            `sha1 ${IWAD_PIN.sha1}`;
           el("iwad-info").append(w, want);
           log("IWAD rejected: " + verdict.reason, "warn");
         } else {
@@ -334,7 +336,12 @@
           const h = document.createElement("div");
           h.className = "hash";
           h.textContent = "sha256 " + candidate.hash;
-          el("iwad-info").append(n, h);
+          // sha-1 is how this WAD is conventionally identified, so it is
+          // shown beside the pin that is actually enforced.
+          const h1 = document.createElement("div");
+          h1.className = "hash";
+          h1.textContent = "sha1 " + IWAD_PIN.sha1;
+          el("iwad-info").append(n, h, h1);
         }
 
         refresh();
@@ -519,10 +526,16 @@
       }
 
       // One report per launch, published to the room's channel once both
-      // canary lines have been seen. The peer id is regenerated per launch so
-      // a result from a previous run can never be attributed to this one.
+      // canary lines have been seen.
+      //
+      // Correlation is a reciprocal session, not the exit tuple: each launch
+      // takes a fresh session id and announces it, and a report only counts
+      // once both pages hold each other's current session. Keying on the exit
+      // alone let a page holding a stale report answer a peer's fresh run,
+      // because two different runs can reach the same exit on the same tic.
       let canaryChannel = null;
-      let selfPeer = null;
+      let session = null;
+      let partner = null;
       let myReport = null;
       let peerReport = null;
 
@@ -530,9 +543,9 @@
         const v = compareReports(myReport, peerReport);
         const cls = { MATCH: "match", MISMATCH: "mismatch", PENDING: "pending" };
 
-        el("verdict-input").textContent = v.input;
-        el("verdict-state").textContent = v.state;
-        el("verdict-aggregate").textContent = v.aggregate;
+        el("verdict-input").textContent = v.labels.input;
+        el("verdict-state").textContent = v.labels.state;
+        el("verdict-aggregate").textContent = v.labels.aggregate;
         el("verdict-aggregate").className = "verdict " + cls[v.aggregate];
 
         let note;
@@ -540,7 +553,9 @@
           note = "Both peers agree on the input history and the exit state.";
         } else if (v.aggregate === VERDICT.MISMATCH) {
           note = "The peers disagree. This run desynced.";
-        } else if (!myReport || !isComplete(myReport)) {
+        } else if (!partner) {
+          note = "Waiting for the other window to join this room.";
+        } else if (!isComplete(myReport)) {
           note = "Play to the level exit in both windows.";
         } else {
           note = "Waiting for the other window's result.";
@@ -548,28 +563,64 @@
         el("verdict-note").textContent = note;
 
         window.__doomVerdict = v;
+        window.__doomPairing = {
+          session, partner,
+          mine: isComplete(myReport), peer: isComplete(peerReport),
+          channel: !!canaryChannel,
+        };
+      }
+
+      function announceArm() {
+        if (!canaryChannel || !session) return;
+        canaryChannel.postMessage({ type: "arm", session });
       }
 
       function publishReport() {
-        if (!canaryChannel || !isComplete(myReport)) return;
-        canaryChannel.postMessage({ peer: selfPeer, ...myReport });
+        // Addressed to the current partner. An unpartnered page has nobody to
+        // address, so it publishes nothing rather than broadcasting a report
+        // any stale page could pick up.
+        if (!canaryChannel || !partner || !isComplete(myReport)) return;
+        canaryChannel.postMessage({
+          type: "report", session, partner,
+          input: myReport.input, state: myReport.state,
+        });
       }
 
       // A line that passed the message gate is still only text. It becomes a
-      // result only if it parses strictly as one, so an ordinary log line
-      // cannot be mistaken for evidence.
+      // result only if it parses strictly as one, so ordinary engine output
+      // and the armed line cannot be mistaken for evidence.
       function considerCanaryLine(text) {
         const parsed = parseCanaryLine(text);
         if (!parsed) return;
 
-        myReport = myReport || {};
-        myReport[parsed.kind] = parsed;
+        const before = myReport;
+        myReport = addCanaryLine(myReport, parsed);
 
-        if (isComplete(myReport)) {
-          publishReport();
+        // A second exit within one launch starts a fresh report, so a peer
+        // never sees a new input paired with the previous exit's state.
+        if (before && isComplete(before) && !isComplete(myReport)) {
+          peerReport = null;
         }
+
+        if (isComplete(myReport)) publishReport();
         renderVerdict();
       }
+
+      function adoptPartner(theirSession) {
+        // A new pairing invalidates everything from the old one on this side,
+        // including our own report: it was produced against a run the other
+        // page is no longer in.
+        partner = theirSession;
+        peerReport = null;
+        myReport = null;
+        announceArm();
+        renderVerdict();
+      }
+
+      // Publishing is driven by our own state changing, never by receiving a
+      // peer report. Answering a report with a report makes the two pages
+      // trade messages forever, and the storm was enough to starve the arm
+      // handling that a relaunch depends on.
 
       function openCanaryChannel(room) {
         if (canaryChannel) {
@@ -581,14 +632,22 @@
 
         canaryChannel = new BroadcastChannel(channelName(room));
         canaryChannel.onmessage = (e) => {
-          if (!acceptsReport(e.data, { selfPeer, runKey: runKey(myReport) })) {
+          const data = e.data;
+
+          const armVerdict = classifyArm(data, { session, partner });
+          if (armVerdict === ARM.ADOPT) {
+            adoptPartner(data.session);
             return;
           }
-          peerReport = e.data;
-          // Answer so whichever peer finished first still learns the result.
-          publishReport();
+          if (armVerdict !== ARM.IGNORE_INVALID) return;
+
+          if (!acceptsReport(data, { session, partner })) return;
+
+          peerReport = data;
           renderVerdict();
         };
+
+        announceArm();
       }
 
       let frame = null;
@@ -647,9 +706,10 @@
         // Everything about the previous run is discarded here, which is what
         // makes a stale result impossible: a new peer id, no report of our
         // own, nothing remembered from the other window, and a fresh channel.
-        selfPeer = (crypto.randomUUID
+        session = (crypto.randomUUID
           ? crypto.randomUUID()
-          : String(currentRun) + ":" + Math.random());
+          : String(currentRun) + ":" + Math.random() + ":" + performance.now());
+        partner = null;
         myReport = null;
         peerReport = null;
         openCanaryChannel(mode() === "single" ? "" : el("room").value.trim());

@@ -1,20 +1,23 @@
-// Automatic MATCH/MISMATCH for the two exit canaries.
+// Automatic verdict over the two exit canaries.
 //
-// The point is that no human compares hex strings. Two peers each print an
-// input-history digest and a state digest at the shared exit anchor; each
-// page publishes its own on a same-origin channel keyed by the room, picks up
-// the other's, and renders a verdict.
+// No human compares hex strings. Two peers each print an input-history digest
+// and a state digest at the shared exit anchor; each page publishes its own on
+// a same-origin channel keyed by the room, picks up the other's, and renders a
+// literal outcome.
 //
-// The comparison is here rather than in the page so it can be tested without
-// two browsers. That matters more than usual: a verdict that reads MATCH when
-// the peers disagree is worse than no verdict at all, because it is evidence
-// someone will trust.
+// The comparison lives here rather than in the page so it can be tested
+// without two browsers. That matters more than usual: a verdict reading MATCH
+// while the peers disagree is worse than no verdict, because it is evidence
+// someone acts on.
 //
-// Correlation uses the room plus the exit itself (episode, map, exit gametic)
-// rather than a negotiated session id. The exit is a simulation event that
-// fires on the same gametic on every peer, so it identifies the run without
-// either side having to agree on anything first. See acceptsReport for what
-// that does and does not guarantee across a relaunch.
+// Correlation is a reciprocal per-launch session, not the exit tuple. An
+// earlier version keyed on episode/map/gametic and claimed identical keys
+// implied identical histories. That is false, and it opened a real hole: two
+// different runs can reach the same map exit on the same tic, so a page
+// holding a stale report would compare it against a peer's fresh run and
+// report a verdict for a pairing that never existed. Both pages must now have
+// armed with each other's current launch before any report is comparable, and
+// either side relaunching breaks the pairing on both sides.
 
 export const VERDICT = {
   MATCH: "MATCH",
@@ -22,13 +25,38 @@ export const VERDICT = {
   PENDING: "PENDING",
 };
 
+// The literal strings the page renders. Defined here so the contract is one
+// definition rather than markup that drifts away from the tests.
+export const LABEL = {
+  input: {
+    MATCH: "INPUT MATCH",
+    MISMATCH: "INPUT MISMATCH",
+    PENDING: "INPUT PENDING",
+  },
+  state: {
+    MATCH: "STATE MATCH",
+    MISMATCH: "STATE MISMATCH",
+    PENDING: "STATE PENDING",
+  },
+  aggregate: {
+    MATCH: "M1 CANARY MATCH",
+    MISMATCH: "M1 CANARY MISMATCH",
+    PENDING: "M1 CANARY PENDING",
+  },
+};
+
+export function labelFor(component, verdict) {
+  const set = LABEL[component];
+  return (set && set[verdict]) || null;
+}
+
 // Both canaries print at the same anchor, in a fixed shape:
 //
 //   DEMO CANARY: exit bytes=<n> sha256=<64 hex>
 //   STATE CANARY: exit episode=<e> map=<m> gametic=<t> bytes=<n> sha256=<hex>
 //
-// Anything else, including the "armed" line and the short-recording notice,
-// is not a result and must not be parsed into one.
+// Anything else, including the armed line and either "no digest" notice, is
+// not a result and must not be parsed into one.
 export function parseCanaryLine(text) {
   if (typeof text !== "string") return null;
 
@@ -54,9 +82,6 @@ export function parseCanaryLine(text) {
   return null;
 }
 
-// Trailing slashes and case in the scheme/host are not meaningful, but the
-// room path is. Two peers that typed the same room differently must land on
-// the same channel, and two different rooms must not.
 export function normalizeRoomUrl(url) {
   if (typeof url !== "string" || url.trim() === "") return "";
 
@@ -66,8 +91,7 @@ export function normalizeRoomUrl(url) {
     parsed.hash = "";
     out = parsed.toString();
   } catch {
-    // Not parseable as a URL; compare what was typed, minus surrounding
-    // whitespace, rather than guessing at it.
+    // Not parseable as a URL; compare what was typed rather than guessing.
   }
 
   return out.replace(/\/+$/, "");
@@ -77,19 +101,89 @@ export function channelName(roomUrl) {
   return "doomit-canary:" + normalizeRoomUrl(roomUrl);
 }
 
-// Identifies one exit. Peers that reached the same exit of the same map on
-// the same gametic are comparing the same thing.
-export function runKey(report) {
-  if (!report || !report.state) return null;
-  const s = report.state;
-  return `${s.episode}:${s.map}:${s.gametic}`;
-}
-
-// A report is only complete once both canaries have been seen. Comparing on
-// one of them would let a page announce MATCH while the other half was still
-// unknown.
 export function isComplete(report) {
   return !!(report && report.input && report.state);
+}
+
+//
+// Validation of anything arriving on the channel.
+//
+// A structured-clone object from any same-origin page reaches this channel.
+// Being on it is not evidence of anything, so every field is checked before
+// it can influence a verdict.
+//
+
+function isSessionId(v) {
+  return typeof v === "string" && v.length > 0 && v.length <= 128;
+}
+
+function isDigest(v) {
+  return typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+}
+
+function isCount(v) {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+}
+
+function isTic(v) {
+  return typeof v === "number" && Number.isSafeInteger(v);
+}
+
+export function isValidReport(r) {
+  if (!r || typeof r !== "object") return false;
+  if (r.type !== "report") return false;
+  if (!isSessionId(r.session) || !isSessionId(r.partner)) return false;
+
+  const i = r.input;
+  const s = r.state;
+  if (!i || typeof i !== "object" || i.kind !== "input") return false;
+  if (!isCount(i.bytes) || !isDigest(i.sha256)) return false;
+
+  if (!s || typeof s !== "object" || s.kind !== "state") return false;
+  if (!isCount(s.bytes) || !isDigest(s.sha256)) return false;
+  if (!isCount(s.episode) || !isCount(s.map) || !isTic(s.gametic)) return false;
+
+  return true;
+}
+
+export function isValidArm(a) {
+  return !!a && typeof a === "object" && a.type === "arm" &&
+    isSessionId(a.session);
+}
+
+//
+// Reciprocal correlation.
+//
+// A report counts only when it was sent by the partner we are currently armed
+// with AND was addressed to our current session. One-sided knowledge is not
+// enough: that is exactly what let a stale page answer a fresh run.
+//
+
+export function acceptsReport(received, ctx) {
+  if (!isValidReport(received)) return false;
+  if (!isSessionId(ctx.session) || !isSessionId(ctx.partner)) return false;
+  if (received.session === ctx.session) return false;   // our own echo
+  if (received.session !== ctx.partner) return false;   // not our partner
+  if (received.partner !== ctx.session) return false;   // not addressed to us
+  return true;
+}
+
+// How a page should react to an arm. Returning an explicit action keeps the
+// page from re-deriving the rules and lets the tests name them.
+export const ARM = {
+  IGNORE_INVALID: "arm:invalid",
+  IGNORE_SELF: "arm:self",
+  IGNORE_KNOWN: "arm:already-partnered",
+  ADOPT: "arm:adopt",
+};
+
+export function classifyArm(received, ctx) {
+  if (!isValidArm(received)) return ARM.IGNORE_INVALID;
+  if (received.session === ctx.session) return ARM.IGNORE_SELF;
+  // A repeat from the partner we already hold must not re-clear state or
+  // trigger another reply, or two pages ping-pong forever.
+  if (received.session === ctx.partner) return ARM.IGNORE_KNOWN;
+  return ARM.ADOPT;
 }
 
 function compareOne(mine, theirs) {
@@ -98,10 +192,8 @@ function compareOne(mine, theirs) {
     ? VERDICT.MATCH : VERDICT.MISMATCH;
 }
 
-// The aggregate is deliberately pessimistic: it is MATCH only when both
-// components are MATCH, and MISMATCH as soon as either one is, even if the
-// other has not arrived. A disagreement on one canary is a real result and
-// should not wait on the other to be reported.
+// Pessimistic by design: MATCH only when both components match, MISMATCH as
+// soon as either does even if the other is still unknown, PENDING otherwise.
 export function compareReports(mine, theirs) {
   const input = compareOne(mine && mine.input, theirs && theirs.input);
   const state = compareOne(mine && mine.state, theirs && theirs.state);
@@ -115,26 +207,26 @@ export function compareReports(mine, theirs) {
     aggregate = VERDICT.PENDING;
   }
 
-  return { input, state, aggregate };
+  return {
+    input,
+    state,
+    aggregate,
+    labels: {
+      input: LABEL.input[input],
+      state: LABEL.state[state],
+      aggregate: LABEL.aggregate[aggregate],
+    },
+  };
 }
 
-// Whether a received report should be compared against ours.
-//
-// Rejects our own echo, incomplete reports, and reports from a different
-// exit. A launch id is deliberately NOT part of this: it is generated per
-// peer, so the other side's value carries no meaning here and comparing the
-// two would reject every genuine report.
-//
-// Staleness after a relaunch is handled by the caller clearing what it has
-// stored and taking a new peer id, so nothing received before the current
-// launch survives into it. The residual is narrow and worth stating: two
-// separate runs that reach the same map and exit on the same gametic produce
-// the same key, and would be compared against each other. That is harmless,
-// because identical keys mean identical simulated histories to that point,
-// which is exactly what the digests measure.
-export function acceptsReport(received, ctx) {
-  if (!received || typeof received !== "object") return false;
-  if (received.peer === undefined || received.peer === ctx.selfPeer) return false;
-  if (!isComplete(received)) return false;
-  return runKey(received) === ctx.runKey;
+// One engine launch can reach more than one exit. Pairing a later exit's
+// input digest with an earlier exit's state digest would publish a report
+// describing no single moment, so a complete report is closed and the next
+// input line starts a fresh one.
+export function addCanaryLine(report, parsed) {
+  if (!parsed) return report;
+  if (isComplete(report)) {
+    return parsed.kind === "input" ? { input: parsed } : { ...report };
+  }
+  return { ...(report || {}), [parsed.kind]: parsed };
 }

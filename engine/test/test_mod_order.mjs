@@ -182,6 +182,12 @@ function buildWad(lumpNames) {
   check(!validateIwad(null).ok, "no IWAD is rejected");
   check(!validateIwad({ size: IWAD_PIN.size, hash: "unavailable" }).ok,
         "an unavailable hash is not a pass");
+
+  // The sha-1 is shown to the operator but must never gate the launch.
+  check(IWAD_PIN.sha1 === "5b2e249b9c5133ec987b3ea77596381dc0d6bc1d",
+        "the displayed sha-1 is the shareware value");
+  check(!validateIwad({ size: IWAD_PIN.size, hash: IWAD_PIN.sha1 }).ok,
+        "the sha-1 is not accepted in place of the enforced sha-256");
 }
 
 // --- fingerprint -----------------------------------------------------------

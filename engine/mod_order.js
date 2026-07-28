@@ -21,6 +21,10 @@ export const IWAD_PIN = {
   name: "doom1.wad",
   size: 4196020,
   sha256: "1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771",
+  // Displayed, not enforced. sha-1 is how this WAD is conventionally
+  // identified, so showing it lets a human recognise the file; the sha-256
+  // above is what actually gates the launch.
+  sha1: "5b2e249b9c5133ec987b3ea77596381dc0d6bc1d",
 };
 
 // The path the IWAD occupies in the Emscripten FS. A PWAD may not take it.
