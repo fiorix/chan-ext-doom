@@ -25,6 +25,10 @@ pub struct HostEffect {
     /// Peers to close, each with the optional terminal server frame
     /// (encoded) owed as the final binary message before the close.
     pub disconnects: Vec<(PlayerId, Option<Vec<u8>>)>,
+    /// Packets still owed to each removed peer at reduction time (its
+    /// remaining outbox, FIFO), captured before the registry dropped
+    /// it: the binding delivers them first and the terminal last.
+    pub removal_owed: Vec<(PlayerId, Vec<Vec<u8>>)>,
     /// The role returned the room to waiting-for-launch during this
     /// batch; the room itself persists and must not be duplicated.
     pub game_ended: bool,
@@ -34,6 +38,7 @@ impl HostEffect {
     fn merge(&mut self, other: HostEffect) {
         self.wakes.extend(other.wakes);
         self.disconnects.extend(other.disconnects);
+        self.removal_owed.extend(other.removal_owed);
         self.game_ended |= other.game_ended;
     }
 }
@@ -274,6 +279,23 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                     Action::Disconnect {
                         player, terminal, ..
                     } => {
+                        // Capture every already-owed packet before the
+                        // registry drops the outbox: the binding
+                        // delivers them first and the terminal last.
+                        // Registry-level (slow-consumer) removals never
+                        // take this path and never flush a backlog.
+                        let mut owed = Vec::new();
+                        while let Some(packet) = self.registry.pop_outbound(player) {
+                            owed.push(packet.payload().to_vec());
+                        }
+                        if !owed.is_empty()
+                            && !effect
+                                .removal_owed
+                                .iter()
+                                .any(|(candidate, _)| *candidate == player)
+                        {
+                            effect.removal_owed.push((player, owed));
+                        }
                         self.registry.leave(player);
                         let terminal = terminal.map(|boxed| {
                             let (header, packet) = *boxed;

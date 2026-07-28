@@ -34,7 +34,7 @@ pub(crate) struct SharedState(pub(crate) Arc<Mutex<Runtime>>);
 
 /// One configured UDP listener's future: it resolves only when its
 /// socket fails or closes, which must end the shared service.
-type ListenerFuture =
+pub(crate) type ListenerFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
 
 /// The composition root: one shared runtime, one bounded timer, the
@@ -220,14 +220,22 @@ impl BindRoom {
     /// Fold one reducer batch into transport state; the returned work
     /// is performed only after the mutex is released. WebSocket
     /// terminal packets ride their connection as the final frame; UDP
-    /// removals capture every already-owed datagram first and the
-    /// terminal last into the bounded pending queue, drop the address
-    /// mapping in the same batch, and wake the listener to send.
+    /// removals deliver every already-owed datagram captured by the
+    /// reduction first and the terminal last through the bounded
+    /// pending queue, drop the address mapping in the same batch, and
+    /// wake the listener to send.
     pub(crate) fn apply(
         &mut self,
         effect: HostEffect,
         udp_notifiers: &HashMap<ListenerId, Arc<Notify>>,
     ) -> Effects {
+        let HostEffect {
+            wakes,
+            disconnects,
+            removal_owed,
+            ..
+        } = effect;
+        let mut owed: HashMap<PlayerId, Vec<Vec<u8>>> = removal_owed.into_iter().collect();
         let mut effects = Effects::default();
         let notify_udp = |effects: &mut Effects, listener: ListenerId| {
             if let Some(notifier) = udp_notifiers.get(&listener)
@@ -236,7 +244,7 @@ impl BindRoom {
                 effects.udp_waiters.push(Arc::clone(notifier));
             }
         };
-        for player in effect.wakes {
+        for player in wakes {
             if let Some(connection) = self.connections.get(&player) {
                 effects.ws_waiters.push(Arc::clone(&connection.waiter));
             }
@@ -244,7 +252,7 @@ impl BindRoom {
                 notify_udp(&mut effects, peer.listener);
             }
         }
-        for (player, terminal) in effect.disconnects {
+        for (player, terminal) in disconnects {
             if let Some(connection) = self.connections.get_mut(&player) {
                 if let Some(terminal) = terminal {
                     let mut frame = Vec::with_capacity(4 + terminal.len());
@@ -256,16 +264,17 @@ impl BindRoom {
             } else if let Some(peer) = self.udp_players.remove(&player) {
                 self.udp_addresses.remove(&(peer.listener, peer.address));
                 let mut captured = false;
-                {
+                if let Some(packets) = owed.remove(&player) {
                     let pending = self.pending_udp.entry(peer.listener).or_default();
-                    while let Some(packet) = self.host.pop_outbound(player) {
-                        pending.push_back((peer.address, packet.payload().to_vec()));
+                    for bytes in packets {
+                        pending.push_back((peer.address, bytes));
                         captured = true;
                     }
-                    if let Some(terminal) = terminal {
-                        pending.push_back((peer.address, terminal));
-                        captured = true;
-                    }
+                }
+                if let Some(terminal) = terminal {
+                    let pending = self.pending_udp.entry(peer.listener).or_default();
+                    pending.push_back((peer.address, terminal));
+                    captured = true;
                 }
                 if captured {
                     self.udp_draining.insert((peer.listener, peer.address));
