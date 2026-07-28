@@ -2246,3 +2246,164 @@ fn rejection_terminal_stays_final_before_close_in_the_reducer() {
     assert!(host.closed.contains(&stranger));
     assert!(!host.closed.contains(&bystander));
 }
+
+#[test]
+fn established_old_magic_rejects_without_removing() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    h.syn(alice, "Alice");
+    h.syn(bob, "Bob");
+    h.launch(alice);
+    assert_eq!(h.role.state(), ServerState::WaitingStart);
+
+    let actions = h.role.handle(
+        T0,
+        Input::Malformed {
+            player: alice,
+            class: MalformedClass::Syn { old_magic: true },
+        },
+    );
+
+    // Exactly one plain non-terminal REJECTED to the controller, with the
+    // full source-shaped reason.
+    assert_eq!(actions.len(), 1);
+    match &actions[0] {
+        Action::Send {
+            player,
+            header,
+            packet: ServerPacket::Rejected { reason },
+        } => {
+            assert_eq!(*player, alice);
+            assert_eq!(header.reliable_seq, None);
+            let expected = format!(
+                "You are using an old client version that is not supported by this server. This server is running {}.",
+                String::from_utf8_lossy(super::SERVER_VERSION)
+            );
+            assert_eq!(reason.as_slice(), expected.as_bytes());
+        }
+        other => panic!("expected a plain REJECTED, got {other:?}"),
+    }
+
+    // Both peers, the controller, readiness, and the room state survive;
+    // no Disconnect, console message, or GameEnded follows.
+    assert_eq!(h.role.peer_count(), 2);
+    assert_eq!(h.role.controller(), Some(alice));
+    assert_eq!(h.role.state(), ServerState::WaitingStart);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Disconnect { .. }))
+    );
+    assert!(!actions.iter().any(|a| matches!(a, Action::GameEnded)));
+    assert!(!actions.iter().any(|a| matches!(
+        a,
+        Action::Send {
+            packet: ServerPacket::ConsoleMessage { .. },
+            ..
+        }
+    )));
+
+    // The game still starts afterwards.
+    h.ack(alice, 1);
+    h.ack(bob, 1);
+    h.gamestart(alice, 1, 0);
+    h.gamestart(bob, 0, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+}
+
+#[test]
+fn presyn_old_magic_uses_terminal_close_with_exact_reason() {
+    let mut h = Harness::new();
+    let stranger = h.join("s");
+    let actions = h.role.handle(
+        T0,
+        Input::Malformed {
+            player: stranger,
+            class: MalformedClass::Syn { old_magic: true },
+        },
+    );
+
+    assert_eq!(actions.len(), 1);
+    match &actions[0] {
+        Action::Disconnect {
+            player,
+            terminal: Some(terminal),
+            ..
+        } => {
+            assert_eq!(*player, stranger);
+            match &terminal.1 {
+                ServerPacket::Rejected { reason } => {
+                    let expected = format!(
+                        "You are using an old client version that is not supported by this server. This server is running {}.",
+                        String::from_utf8_lossy(super::SERVER_VERSION)
+                    );
+                    assert_eq!(reason.as_slice(), expected.as_bytes());
+                }
+                other => panic!("expected a terminal REJECTED, got {other:?}"),
+            }
+        }
+        other => panic!("expected a terminal Disconnect, got {other:?}"),
+    }
+    assert_eq!(h.role.peer_count(), 0);
+    assert!(!actions.iter().any(|a| matches!(a, Action::GameEnded)));
+}
+
+#[test]
+fn presyn_leave_lone_member_is_exact_and_quiet() {
+    let mut h = Harness::new();
+    let ghost = h.join("g");
+    let actions: Vec<Action> = h.role.handle(T0, Input::Leave { player: ghost });
+
+    assert_eq!(actions.len(), 1);
+    match &actions[0] {
+        Action::Disconnect {
+            player,
+            reason,
+            terminal,
+        } => {
+            assert_eq!(*player, ghost);
+            assert_eq!(*reason, DisconnectReason::Remote);
+            assert_eq!(*terminal, None);
+        }
+        other => panic!("expected exactly one remote Disconnect, got {other:?}"),
+    }
+    assert_eq!(h.role.peer_count(), 0);
+}
+
+#[test]
+fn presyn_leave_beside_a_connected_player_changes_nothing_else() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let ghost = h.join("g");
+    h.syn(alice, "Alice");
+
+    let actions: Vec<Action> = h.role.handle(T0, Input::Leave { player: ghost });
+    assert_eq!(actions.len(), 1);
+    match &actions[0] {
+        Action::Disconnect {
+            player,
+            reason,
+            terminal,
+        } => {
+            assert_eq!(*player, ghost);
+            assert_eq!(*reason, DisconnectReason::Remote);
+            assert_eq!(*terminal, None);
+        }
+        other => panic!("expected exactly one remote Disconnect, got {other:?}"),
+    }
+
+    // The connected player's identity, controller role, and state are
+    // unchanged, and no broadcast or GameEnded fired.
+    assert_eq!(h.role.peer_count(), 1);
+    assert_eq!(h.role.controller(), Some(alice));
+    assert_eq!(h.role.peers.get(&alice).expect("alice").name, b"Alice");
+    assert!(!actions.iter().any(|a| matches!(a, Action::GameEnded)));
+    assert!(!actions.iter().any(|a| matches!(
+        a,
+        Action::Send {
+            packet: ServerPacket::ConsoleMessage { .. },
+            ..
+        }
+    )));
+}

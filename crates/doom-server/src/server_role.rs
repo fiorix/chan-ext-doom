@@ -79,10 +79,12 @@ pub enum Input {
         header: WireHeader,
         packet: ClientPacket,
     },
-    /// Bytes that did not decode. The classification distinguishes a
-    /// malformed SYN from an established peer's packet; `old_magic` marks
-    /// the one malformed case with a source-backed REJECT (a pre-3.0
-    /// client). Everything else is dropped by default.
+    /// Bytes that did not decode. The caller classifies the BYTES (a
+    /// SYN-shaped packet, possibly from a pre-3.0 client, versus anything
+    /// else); the role then decides by PEER STATE what the pinned source
+    /// does with them: a pre-SYN member is rejected and removed, an
+    /// established peer is rejected but retained, and every other class
+    /// is dropped by default.
     Malformed {
         player: PlayerId,
         class: MalformedClass,
@@ -91,10 +93,15 @@ pub enum Input {
     Timer,
 }
 
-/// Malformed-byte classification supplied by the caller.
+/// Malformed-byte classification supplied by the caller. This classifies
+/// the bytes only; peer state responsibilities (retain versus remove)
+/// are the role's, per pinned `NET_SV_ParseSYN`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MalformedClass {
+    /// A SYN-shaped packet; `old_magic` marks the pre-3.0 magic value,
+    /// the one malformed case with a source-backed REJECT.
     Syn { old_magic: bool },
+    /// Anything else from an established peer.
     Established,
 }
 
@@ -793,14 +800,32 @@ impl ServerRole {
     fn on_malformed(&mut self, player: PlayerId, class: MalformedClass) -> Vec<Action> {
         match class {
             MalformedClass::Syn { old_magic: true } => {
-                let mut actions = Vec::new();
-                self.reject(
-                    &mut actions,
-                    player,
-                    b"You are using an old client version that is not supported by this server."
-                        .to_vec(),
-                );
-                actions
+                // Pinned `NET_SV_ParseSYN` old-magic arm: REJECTED goes
+                // out either way, and what happens to the peer depends on
+                // whether it is an active client yet.
+                match self.peers.get(&player).map(|peer| peer.syn) {
+                    // An established peer is retained with a plain,
+                    // non-terminal rejection; controller, room state,
+                    // readiness, and every other member are untouched.
+                    Some(true) => {
+                        vec![self.emit(
+                            player,
+                            plain(),
+                            ServerPacket::Rejected {
+                                reason: old_client_reason(),
+                            },
+                        )]
+                    }
+                    // A pre-SYN member is removed with the terminal
+                    // close, through the never-connected path.
+                    Some(false) => {
+                        let mut actions = Vec::new();
+                        self.reject(&mut actions, player, old_client_reason());
+                        actions
+                    }
+                    // Nothing is held for an unknown member.
+                    None => Vec::new(),
+                }
             }
             _ => Vec::new(),
         }
@@ -1196,6 +1221,18 @@ impl ServerRole {
 /// A plain (non-reliable) frame.
 fn plain() -> WireHeader {
     WireHeader { reliable_seq: None }
+}
+
+/// The full source-shaped old-client reason, including the server
+/// version sentence, bounded for the wire.
+fn old_client_reason() -> Vec<u8> {
+    let mut reason =
+        b"You are using an old client version that is not supported by this server. This server is running "
+            .to_vec();
+    reason.extend_from_slice(SERVER_VERSION);
+    reason.push(b'.');
+    reason.truncate(256);
+    reason
 }
 
 /// `D_ValidGameMode` (d_mode.c): valid mission/mode pairs.
