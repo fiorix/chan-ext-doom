@@ -106,6 +106,21 @@ fn reliable_type_s2c(type_id: u16) -> bool {
     matches!(type_id, 0 | 5 | 12 | 15) // SYN accept, GAMESTART, CONSOLE_MESSAGE, LAUNCH
 }
 
+/// The type numbers each direction supports. An unsupported number
+/// (deprecated ACK, NAT_HOLE_PUNCH, wrong family, or out of range)
+/// must classify as `UnsupportedType` regardless of its reliable bit,
+/// so this check precedes the framing matrix.
+fn supported_type_c2s(type_id: u16) -> bool {
+    matches!(type_id, 0 | 3 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 13 | 15)
+}
+
+fn supported_type_s2c(type_id: u16) -> bool {
+    matches!(
+        type_id,
+        0 | 2 | 3 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 | 14 | 15
+    )
+}
+
 fn printable(bytes: &[u8]) -> bool {
     bytes
         .iter()
@@ -747,6 +762,9 @@ impl ClientPacket {
     pub fn decode(bytes: &[u8], lowres_turn: bool) -> Result<(WireHeader, Self), DecodeError> {
         let mut r = Reader::new(bytes);
         let (type_id, header) = split_header(&mut r)?;
+        if !supported_type_c2s(type_id) {
+            return Err(DecodeError::UnsupportedType { type_id });
+        }
         check_framing(type_id, header, true)?;
         let packet = match type_id {
             0 => {
@@ -934,6 +952,9 @@ impl ServerPacket {
     pub fn decode(bytes: &[u8], lowres_turn: bool) -> Result<(WireHeader, Self), DecodeError> {
         let mut r = Reader::new(bytes);
         let (type_id, header) = split_header(&mut r)?;
+        if !supported_type_s2c(type_id) {
+            return Err(DecodeError::UnsupportedType { type_id });
+        }
         check_framing(type_id, header, false)?;
         let packet = match type_id {
             0 => {

@@ -516,6 +516,16 @@ fn gamedata_tic_count_boundaries() {
         latency: 0,
         players: vec![(0, TiccmdDiff::default())],
     };
+    let server_max = ServerPacket::GameData(GameDataServer {
+        start: 0,
+        tics: vec![full.clone(); 255],
+    });
+    let bytes = server_max
+        .encode(NO_RELIABLE, false)
+        .expect("255 server tics");
+    let (_, decoded) = ServerPacket::decode(&bytes, false).expect("decode");
+    assert_eq!(decoded, server_max);
+
     let server_over = ServerPacket::GameData(GameDataServer {
         start: 0,
         tics: vec![full; 256],
@@ -523,6 +533,55 @@ fn gamedata_tic_count_boundaries() {
     assert!(matches!(
         server_over.encode(NO_RELIABLE, false),
         Err(EncodeError::CountOutOfRange { .. })
+    ));
+}
+
+#[test]
+fn unsupported_types_classify_regardless_of_reliable_bit() {
+    // A fully formed reliable header on an unknown type must still be
+    // UnsupportedType, not a framing error, in both directions.
+    let unknown_reliable = [0x80, 0x63, 0x00];
+    assert!(matches!(
+        ClientPacket::decode(&unknown_reliable, false),
+        Err(DecodeError::UnsupportedType { type_id: 99 })
+    ));
+    assert!(matches!(
+        ServerPacket::decode(&unknown_reliable, false),
+        Err(DecodeError::UnsupportedType { type_id: 99 })
+    ));
+
+    // Deprecated ACK with a reliable frame classifies the same way.
+    let ack_reliable = [0x80, 0x01, 0x00];
+    assert!(matches!(
+        ClientPacket::decode(&ack_reliable, false),
+        Err(DecodeError::UnsupportedType { type_id: 1 })
+    ));
+    assert!(matches!(
+        ServerPacket::decode(&ack_reliable, false),
+        Err(DecodeError::UnsupportedType { type_id: 1 })
+    ));
+
+    // A wrong-family type with a reliable frame is UnsupportedType,
+    // not a framing error: REJECTED is s2c-only, QUERY is c2s-only.
+    let rejected_reliable = [0x80, 0x02, 0x00, b'x', 0];
+    assert!(matches!(
+        ClientPacket::decode(&rejected_reliable, false),
+        Err(DecodeError::UnsupportedType { type_id: 2 })
+    ));
+    let query_reliable = [0x80, 0x0d, 0x00];
+    assert!(matches!(
+        ServerPacket::decode(&query_reliable, false),
+        Err(DecodeError::UnsupportedType { type_id: 13 })
+    ));
+
+    // A truncated reliable header still classifies as truncated.
+    assert!(matches!(
+        ClientPacket::decode(&[0x80, 0x63], false),
+        Err(DecodeError::Truncated { .. })
+    ));
+    assert!(matches!(
+        ServerPacket::decode(&[0x80, 0x63], false),
+        Err(DecodeError::Truncated { .. })
     ));
 }
 
