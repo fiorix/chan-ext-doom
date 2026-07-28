@@ -37,6 +37,22 @@ const NET_MAX_PLAYERS: usize = 8;
 const MAX_NAME_LEN: usize = 30;
 const MODE_INDETERMINED: u8 = 4;
 
+/// In-game window size (`BACKUPTICS`).
+const BACKUPTICS: usize = 128;
+/// `NET_ExpandTicNum` wrap boundaries.
+const EXPAND_LOW: i64 = 0x40;
+const EXPAND_HIGH: i64 = 0xb0;
+/// A client further than this ahead of the minimum acknowledgement is not
+/// pumped (pinned 40-tic stall guard).
+const STALL_TICS: i64 = 40;
+/// With no other player's tic present, the server stays at most this far
+/// ahead of the receive window (pinned single-player limit).
+const SINGLE_PLAYER_AHEAD: i64 = 10;
+/// Missing tics are re-requested only after strictly more than this.
+const RESEND_AFTER_MS: u64 = 300;
+/// No accepted in-range game data for this long triggers deadlock recovery.
+const DEADLOCK_MS: u64 = 1_000;
+
 /// Reliable FIFO cap per peer. The 65th enqueue removes the peer.
 const RELIABLE_CAP: usize = 64;
 /// Silence after which a connected peer is dropped (CONNECTION_TIMEOUT_LEN).
@@ -180,6 +196,84 @@ struct ReliableEntry {
     last_retry: Option<Milliseconds>,
 }
 
+/// Pinned `NET_ExpandTicNum`: expand the low byte of a tic number against
+/// a reference (the receive window start), wrapping at the 0x40/0xb0
+/// boundaries. Computed in i64 so nothing underflows; out-of-range
+/// results are discarded by the window checks, never aliased.
+fn expand_tic(relative: u32, low: u8) -> i64 {
+    let high = (relative & !0xff) as i64;
+    let low_part = (relative & 0xff) as i64;
+    let byte = low as i64;
+    let mut result = high | byte;
+    if low_part < EXPAND_LOW && byte > EXPAND_HIGH {
+        result -= 0x100;
+    }
+    if low_part > EXPAND_HIGH && byte < EXPAND_LOW {
+        result += 0x100;
+    }
+    result
+}
+
+/// One receive-window slot for one player: a received tic, its latency,
+/// and the last time a resend was requested for it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RecvEntry {
+    active: bool,
+    latency: i16,
+    diff: doom_proto::TiccmdDiff,
+    resend_time: Option<Milliseconds>,
+}
+
+/// The shared bounded receive window. Slot `i` always means absolute tic
+/// `start + i`; absolute identity is preserved by construction as the
+/// window shifts, and every stored tic is verified in range before use.
+#[derive(Clone, Debug)]
+struct RecvWindow {
+    start: u32,
+    entries: Box<[[RecvEntry; NET_MAX_PLAYERS]; BACKUPTICS]>,
+}
+
+impl RecvWindow {
+    fn new(start: u32) -> Self {
+        RecvWindow {
+            start,
+            entries: Box::new(std::array::from_fn(|_| {
+                std::array::from_fn(|_| RecvEntry::default())
+            })),
+        }
+    }
+}
+
+/// One queued fan-out tic with its absolute identity, so a stale or
+/// spoofed resend request cannot alias an overwritten slot.
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedTic {
+    seq: u32,
+    tic: doom_proto::FullTic,
+}
+
+/// A connected peer's in-game send state.
+#[derive(Clone, Debug)]
+struct PeerGame {
+    sendseq: u32,
+    acknowledged: u32,
+    /// Updated only when an upload stores at least one tic in range
+    /// (pinned deadlock-clock semantics).
+    last_gamedata: Milliseconds,
+    sendqueue: Box<[Option<QueuedTic>; BACKUPTICS]>,
+}
+
+impl PeerGame {
+    fn new(now: Milliseconds) -> Self {
+        PeerGame {
+            sendseq: 0,
+            acknowledged: 0,
+            last_gamedata: now,
+            sendqueue: Box::new([const { None }; BACKUPTICS]),
+        }
+    }
+}
+
 /// Per-peer protocol state.
 #[derive(Clone, Debug)]
 struct Peer {
@@ -209,6 +303,9 @@ struct Peer {
     last_recv: Milliseconds,
     last_send: Milliseconds,
     last_waitdata: Milliseconds,
+    /// In-game state, initialized exactly once at game start and cleared
+    /// on removal or game end so nothing stale reaches a later game.
+    game: Option<PeerGame>,
 }
 
 impl Peer {
@@ -234,6 +331,7 @@ impl Peer {
             last_recv: now,
             last_send: now,
             last_waitdata: now,
+            game: None,
         }
     }
 
@@ -260,6 +358,8 @@ pub struct ServerRole {
     next_order: u64,
     /// The time of the input currently being handled.
     clock: Milliseconds,
+    /// The shared receive window, present only in game.
+    recv: Option<RecvWindow>,
 }
 
 impl Default for ServerRole {
@@ -279,6 +379,7 @@ impl ServerRole {
             peers: BTreeMap::new(),
             next_order: 0,
             clock: Milliseconds(0),
+            recv: None,
         }
     }
 
@@ -429,6 +530,10 @@ impl ServerRole {
         self.state = ServerState::WaitingLaunch;
         self.gamemode = None;
         self.settings = None;
+        self.recv = None;
+        for peer in self.peers.values_mut() {
+            peer.game = None;
+        }
 
         let survivors: Vec<PlayerId> = self.peers.keys().copied().collect();
         for survivor in survivors {
@@ -585,10 +690,14 @@ impl ServerRole {
                 let packet = self.query_response();
                 actions.push(self.emit(player, plain(), packet));
             }
-            ClientPacket::GameData(_)
-            | ClientPacket::GameDataAck { .. }
-            | ClientPacket::GameDataResend { .. } => {
-                // Tic windows are the next slice; accepted and ignored here.
+            ClientPacket::GameData(data) => {
+                actions.extend(self.on_upload(player, data, now));
+            }
+            ClientPacket::GameDataAck { ack } => {
+                self.on_gamedata_ack(player, ack);
+            }
+            ClientPacket::GameDataResend { start, count } => {
+                actions.extend(self.on_resend_request(player, start, count));
             }
         }
 
@@ -793,8 +902,205 @@ impl ServerRole {
             }
         }
 
+        // Every window, acknowledgement, send sequence, and game-data
+        // clock initializes exactly once here.
+        let now = self.clock;
+        self.recv = Some(RecvWindow::new(0));
+        for (_, peer) in self.peers.iter_mut().filter(|(_, peer)| peer.connected()) {
+            peer.game = Some(PeerGame::new(now));
+        }
+
         self.state = ServerState::InGame;
         actions
+    }
+
+    // --- in-game receive, acknowledgement, and retransmission ------------
+
+    /// The slot-order index of a connected player, or 8 for a drone
+    /// (drones never occupy a receive slot because they never upload).
+    fn recv_player_index(&self, player: PlayerId) -> Option<usize> {
+        let index = self.player_index(player);
+        (index >= 0).then_some(index as usize)
+    }
+
+    /// Pinned `NET_SV_ParseGameData`: accept uploads only in game and
+    /// only from connected non-drone players. Expand both low bytes
+    /// against the receive window, store only in-range tics with their
+    /// diff and latency, raise the sender's acknowledgement
+    /// monotonically, and request any newly revealed missing run behind
+    /// the fresh data without duplicating a live request.
+    fn on_upload(
+        &mut self,
+        player: PlayerId,
+        data: doom_proto::GameDataClient,
+        now: Milliseconds,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        if self.state != ServerState::InGame {
+            return actions;
+        }
+        let Some(index) = self.recv_player_index(player) else {
+            return actions;
+        };
+        let Some(recv) = self.recv.as_mut() else {
+            return actions;
+        };
+        let Some(peer) = self.peers.get(&player) else {
+            return actions;
+        };
+        if !peer.is_player() {
+            return actions;
+        }
+
+        let ack_expanded = expand_tic(recv.start, data.ack);
+        let start_expanded = expand_tic(recv.start, data.start);
+
+        for (offset, tic) in data.tics.iter().enumerate() {
+            let slot = start_expanded + offset as i64 - recv.start as i64;
+            if !(0..BACKUPTICS as i64).contains(&slot) {
+                continue;
+            }
+            let slot = slot as usize;
+            recv.entries[slot][index].active = true;
+            recv.entries[slot][index].diff = tic.diff.clone();
+            recv.entries[slot][index].latency = tic.latency;
+            // The deadlock clock resets only when at least one tic is
+            // actually stored (pinned semantics).
+            if let Some(game) = self
+                .peers
+                .get_mut(&player)
+                .and_then(|peer| peer.game.as_mut())
+            {
+                game.last_gamedata = now;
+            }
+        }
+
+        if let Some(game) = self
+            .peers
+            .get_mut(&player)
+            .and_then(|peer| peer.game.as_mut())
+            && ack_expanded > game.acknowledged as i64
+        {
+            game.acknowledged = ack_expanded as u32;
+        }
+
+        // Missing-run discovery behind the new data: scan down for the
+        // first unreceived, not-yet-requested entry and request the run.
+        // Upstream clamps the scan to BACKUPTICS - 1, so the top slot of
+        // the window is never part of a discovered run.
+        let resend_end = (start_expanded - recv.start as i64).min(BACKUPTICS as i64 - 1);
+        if resend_end > 0 {
+            let mut run_start = resend_end;
+            let mut slot = resend_end - 1;
+            while slot >= 0 {
+                let entry = &recv.entries[slot as usize][index];
+                if entry.active || entry.resend_time.is_some() {
+                    break;
+                }
+                run_start = slot;
+                slot -= 1;
+            }
+            if run_start < resend_end {
+                let recv = self.recv.as_mut().expect("window checked above");
+                for stamp in run_start..resend_end {
+                    recv.entries[stamp as usize][index].resend_time = Some(now);
+                }
+                let start = recv.start + run_start as u32;
+                actions.push(self.emit(
+                    player,
+                    plain(),
+                    ServerPacket::GameDataResend {
+                        start,
+                        count: (resend_end - run_start) as u8,
+                    },
+                ));
+            }
+        }
+
+        actions
+    }
+
+    /// Pinned `NET_SV_ParseGameDataACK`: the same monotonic expanded
+    /// acknowledgement update, from any connected client including
+    /// drones (pinned: drones acknowledge).
+    fn on_gamedata_ack(&mut self, player: PlayerId, ack: u8) {
+        if self.state != ServerState::InGame {
+            return;
+        }
+        let Some(recv) = &self.recv else {
+            return;
+        };
+        let ack_expanded = expand_tic(recv.start, ack);
+        let Some(peer) = self.peers.get_mut(&player) else {
+            return;
+        };
+        if !peer.connected() {
+            return;
+        }
+        if let Some(game) = peer.game.as_mut()
+            && ack_expanded > game.acknowledged as i64
+        {
+            game.acknowledged = ack_expanded as u32;
+        }
+    }
+
+    /// Pinned `NET_SV_ParseResendRequest`, atomic: the whole request is
+    /// honored only if every requested absolute tic still matches its
+    /// queued slot exactly; otherwise it is ignored as stale or spoofed.
+    /// A zero count asks for nothing and is ignored (upstream emits an
+    /// empty packet there; nothing meaningful travels, so we drop it
+    /// instead, the one deliberate divergence here).
+    fn on_resend_request(&mut self, player: PlayerId, start: u32, count: u8) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if self.state != ServerState::InGame || count == 0 {
+            return actions;
+        }
+        let Some(peer) = self.peers.get(&player) else {
+            return actions;
+        };
+        if !peer.connected() {
+            return actions;
+        }
+        let Some(game) = &peer.game else {
+            return actions;
+        };
+
+        let end = start as u64 + count as u64 - 1;
+        for tic in start as u64..=end {
+            match &game.sendqueue[(tic as usize) % BACKUPTICS] {
+                Some(queued) if queued.seq as u64 == tic => {}
+                _ => return actions,
+            }
+        }
+
+        actions.extend(self.send_tics(player, start, end));
+        actions
+    }
+
+    /// Emit a fan-out span from a peer's send queue. Every entry is
+    /// verified by absolute identity before encoding.
+    fn send_tics(&mut self, player: PlayerId, start: u32, end: u64) -> Vec<Action> {
+        let mut tics: Vec<doom_proto::FullTic> = Vec::new();
+        let Some(peer) = self.peers.get(&player) else {
+            return Vec::new();
+        };
+        let Some(game) = &peer.game else {
+            return Vec::new();
+        };
+        for tic in start as u64..=end {
+            if let Some(queued) = &game.sendqueue[(tic as usize) % BACKUPTICS]
+                && queued.seq as u64 == tic
+            {
+                tics.push(queued.tic.clone());
+            }
+        }
+
+        let packet = ServerPacket::GameData(doom_proto::GameDataServer {
+            start: (start & 0xff) as u8,
+            tics,
+        });
+        vec![self.emit(player, plain(), packet)]
     }
 
     fn on_malformed(&mut self, player: PlayerId, class: MalformedClass) -> Vec<Action> {
@@ -958,6 +1264,311 @@ impl ServerRole {
                     peer.last_waitdata = now;
                 }
             }
+
+            // In-game per-client work (pinned RunClient in game).
+            if connected && self.state == ServerState::InGame {
+                actions.extend(self.pump(player));
+                actions.extend(self.check_deadlock(player));
+            }
+        }
+
+        // State-level in-game work (pinned NET_SV_Run): advance the
+        // receive window, then re-request expired missing runs per player.
+        if self.state == ServerState::InGame {
+            self.advance_window();
+            for player in self.established_players() {
+                actions.extend(self.check_resends(player));
+            }
+        }
+
+        actions
+    }
+
+    /// Pinned `NET_SV_LatestAcknowledged`: the minimum acknowledgement
+    /// across connected clients, drones included.
+    fn latest_acknowledged(&self) -> Option<i64> {
+        self.peers
+            .values()
+            .filter(|peer| peer.connected())
+            .filter_map(|peer| peer.game.as_ref().map(|game| game.acknowledged as i64))
+            .min()
+    }
+
+    /// Pinned `NET_SV_AdvanceWindow`: advance only up to the minimum
+    /// acknowledgement and only while the first tic is complete for
+    /// every connected non-drone player. Disconnected or draining peers
+    /// and drones never hold advancement. Absolute identity is preserved
+    /// by construction while shifting.
+    fn advance_window(&mut self) {
+        let Some(min_ack) = self.latest_acknowledged() else {
+            return;
+        };
+        let players = self.established_players();
+        if players.is_empty() {
+            return;
+        }
+        let indices: Vec<usize> = players
+            .iter()
+            .map(|player| self.player_index(*player) as usize)
+            .collect();
+        let Some(recv) = self.recv.as_mut() else {
+            return;
+        };
+
+        while (recv.start as i64) < min_ack {
+            let complete = indices.iter().all(|index| recv.entries[0][*index].active);
+            if !complete {
+                break;
+            }
+            for slot in 0..BACKUPTICS - 1 {
+                recv.entries[slot] = recv.entries[slot + 1].clone();
+            }
+            recv.entries[BACKUPTICS - 1] = Default::default();
+            recv.start += 1;
+        }
+    }
+
+    /// Pinned `NET_SV_PumpSendQueue`: pump each connected client
+    /// independently. Skip when more than 40 tics ahead of the minimum
+    /// acknowledgement; require the current tic from every other
+    /// connected player; exclude the recipient's own command; merge
+    /// active diffs in stable ascending order with the maximum latency;
+    /// emit covering `sendseq - extratics .. sendseq` clamped at zero;
+    /// then advance `sendseq`. The pinned single-player limit allows at
+    /// most 10 tics ahead of the window. Drones receive full fan-out
+    /// with no exclusion, since they hold no receive slot.
+    fn pump(&mut self, player: PlayerId) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        let Some(min_ack) = self.latest_acknowledged() else {
+            return actions;
+        };
+        let Some(recv) = &self.recv else {
+            return actions;
+        };
+        let Some(peer) = self.peers.get(&player) else {
+            return actions;
+        };
+        let Some(game) = &peer.game else {
+            return actions;
+        };
+
+        if game.sendseq as i64 - min_ack > STALL_TICS {
+            return actions;
+        }
+
+        let recv_index = game.sendseq as i64 - recv.start as i64;
+        if !(0..BACKUPTICS as i64).contains(&recv_index) {
+            return actions;
+        }
+        let recv_index = recv_index as usize;
+
+        let players = self.established_players();
+        let recipient_index = players.iter().position(|candidate| *candidate == player);
+
+        // The current tic must be present from every other connected
+        // player (the recipient relies on its own command already).
+        let mut others = 0usize;
+        for (index, _) in players.iter().enumerate() {
+            if Some(index) == recipient_index {
+                continue;
+            }
+            if !recv.entries[recv_index][index].active {
+                return actions;
+            }
+            others += 1;
+        }
+
+        if others == 0 && game.sendseq as i64 > recv.start as i64 + SINGLE_PLAYER_AHEAD {
+            return actions;
+        }
+
+        // Merge: every active player's diff, ascending index, max latency.
+        let mut merged = doom_proto::FullTic {
+            latency: 0,
+            players: Vec::new(),
+        };
+        for (index, _) in players.iter().enumerate() {
+            if Some(index) == recipient_index {
+                continue;
+            }
+            let entry = &recv.entries[recv_index][index];
+            if !entry.active {
+                continue;
+            }
+            merged.latency = merged.latency.max(entry.latency);
+            merged.players.push((index as u8, entry.diff.clone()));
+        }
+
+        let sendseq = game.sendseq;
+        let Some(game) = self
+            .peers
+            .get_mut(&player)
+            .and_then(|peer| peer.game.as_mut())
+        else {
+            return actions;
+        };
+        game.sendqueue[(sendseq as usize) % BACKUPTICS] = Some(QueuedTic {
+            seq: sendseq,
+            tic: merged,
+        });
+
+        let settings = self.settings.clone().unwrap_or_else(|| GameSettings {
+            ticdup: 1,
+            extratics: 0,
+            deathmatch: 0,
+            nomonsters: 0,
+            fast_monsters: 0,
+            respawn_monsters: 0,
+            episode: 1,
+            map: 1,
+            skill: 2,
+            gameversion: 5,
+            lowres_turn: 0,
+            new_sync: 1,
+            timelimit: 0,
+            loadgame: -1,
+            random: 0,
+            consoleplayer: 0,
+            player_classes: Vec::new(),
+        });
+        // The emitted count never exceeds 255, the codec's bound.
+        let span = (settings.extratics as u32).min(254);
+        let start = sendseq.saturating_sub(span);
+        actions.extend(self.send_tics(player, start, sendseq as u64));
+
+        if let Some(game) = self
+            .peers
+            .get_mut(&player)
+            .and_then(|peer| peer.game.as_mut())
+        {
+            game.sendseq = game.sendseq.wrapping_add(1);
+        }
+
+        actions
+    }
+
+    /// Pinned `NET_SV_CheckResends`: contiguous runs of missing entries
+    /// whose last request is strictly more than 300 ms old are
+    /// re-requested and re-stamped. Requests never duplicate a live one.
+    fn check_resends(&mut self, player: PlayerId) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let now = self.clock;
+        let Some(index) = self.recv_player_index(player) else {
+            return actions;
+        };
+        // Collect expired contiguous runs first; emitting borrows again.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        {
+            let Some(recv) = self.recv.as_mut() else {
+                return actions;
+            };
+            let mut run_start: Option<usize> = None;
+            for slot in 0..BACKUPTICS {
+                let entry = &recv.entries[slot][index];
+                let expired = !entry.active
+                    && entry
+                        .resend_time
+                        .is_some_and(|time| now.0 > time.0 + RESEND_AFTER_MS);
+                if expired {
+                    if run_start.is_none() {
+                        run_start = Some(slot);
+                    }
+                } else if let Some(start) = run_start.take() {
+                    runs.push((start, slot - 1));
+                }
+            }
+            if let Some(start) = run_start.take() {
+                runs.push((start, BACKUPTICS - 1));
+            }
+        }
+        for (start, end) in runs {
+            actions.extend(self.emit_resend(player, index, start, end));
+        }
+
+        actions
+    }
+
+    /// Emit one bounded resend request and stamp only the in-range
+    /// missing entries it covers.
+    fn emit_resend(
+        &mut self,
+        player: PlayerId,
+        index: usize,
+        start_slot: usize,
+        end_slot: usize,
+    ) -> Vec<Action> {
+        let now = self.clock;
+        let Some(recv) = self.recv.as_mut() else {
+            return Vec::new();
+        };
+        for slot in start_slot..=end_slot {
+            recv.entries[slot][index].resend_time = Some(now);
+        }
+        let start = recv.start + start_slot as u32;
+        vec![self.emit(
+            player,
+            plain(),
+            ServerPacket::GameDataResend {
+                start,
+                count: (end_slot - start_slot + 1) as u8,
+            },
+        )]
+    }
+
+    /// Pinned `NET_SV_CheckDeadlock`: strictly more than 1000 ms without
+    /// accepted in-range game data from a connected non-drone player
+    /// triggers a resend request for the first missing tic plus five and
+    /// a replay of that client's exact unacknowledged send queue. The
+    /// clock resets only on the triggering event, so recovery cannot
+    /// amplify. Drones are excluded, as pinned.
+    fn check_deadlock(&mut self, player: PlayerId) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let now = self.clock;
+
+        let Some(index) = self.recv_player_index(player) else {
+            return actions;
+        };
+        let Some(recv) = &self.recv else {
+            return actions;
+        };
+        let Some(peer) = self.peers.get(&player) else {
+            return actions;
+        };
+        if !peer.is_player() {
+            return actions;
+        }
+        let Some(game) = &peer.game else {
+            return actions;
+        };
+        if now.0.saturating_sub(game.last_gamedata.0) <= DEADLOCK_MS {
+            return actions;
+        }
+
+        // The first missing tic for this player, plus five.
+        let missing = (0..BACKUPTICS).find(|slot| !recv.entries[*slot][index].active);
+        let Some(first) = missing else {
+            return actions;
+        };
+        actions.extend(self.emit_resend(player, index, first, (first + 5).min(BACKUPTICS - 1)));
+
+        // Replay the client's exact unacknowledged queue.
+        let (acknowledged, sendseq) = {
+            let Some(game) = self.peers.get(&player).and_then(|peer| peer.game.as_ref()) else {
+                return actions;
+            };
+            (game.acknowledged, game.sendseq)
+        };
+        if sendseq > acknowledged {
+            actions.extend(self.send_tics(player, acknowledged, sendseq as u64 - 1));
+        }
+
+        if let Some(game) = self
+            .peers
+            .get_mut(&player)
+            .and_then(|peer| peer.game.as_mut())
+        {
+            game.last_gamedata = now;
         }
 
         actions
