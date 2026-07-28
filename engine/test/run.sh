@@ -68,6 +68,11 @@ node test/test_mod_order.mjs
 # able to inject a log line could forge acceptance evidence.
 node test/test_message_gate.mjs
 
+# The automatic MATCH/MISMATCH verdict. A verdict that reads MATCH when the
+# peers disagree is worse than no verdict, so the missing/stale/half-known
+# cases get the most attention.
+node test/test_canary_verdict.mjs
+
 # Address ownership contract, guarded mechanically because getting it wrong
 # is silent: NET_RecvPacket in net_io.c takes the one reference consumers
 # release, so a transport module that also references leaks one refcount per

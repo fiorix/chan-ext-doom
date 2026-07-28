@@ -153,6 +153,17 @@
         white-space: pre-wrap;
       }
       .warn { color: #e0a030; }
+      .verdict {
+        font-size: 15px;
+        letter-spacing: .14em;
+        text-align: center;
+        padding: 7px;
+        border-radius: 3px;
+        margin-bottom: 8px;
+      }
+      .verdict.pending  { background: #2b2320; color: var(--muted); }
+      .verdict.match    { background: #1d3a1d; color: #7fd07f; }
+      .verdict.mismatch { background: #4a1a17; color: #ff8a7a; }
     </style>
   </head>
   <body>
@@ -207,6 +218,16 @@
         <div id="fingerprint" class="hash">(no mods)</div>
       </fieldset>
 
+      <fieldset>
+        <legend>Desync verdict</legend>
+        <div id="verdict-aggregate" class="verdict pending">PENDING</div>
+        <table>
+          <tr><td>input history</td><td id="verdict-input">PENDING</td></tr>
+          <tr><td>exit state</td><td id="verdict-state">PENDING</td></tr>
+        </table>
+        <div id="verdict-note" class="hash">Play to the level exit in both windows.</div>
+      </fieldset>
+
       <div id="blocked" class="empty"></div>
       <button id="launch" disabled>Launch</button>
     </div>
@@ -223,6 +244,10 @@
         createSelectionGuard, iwadArgv, IWAD_PIN, IWAD_PATH,
       } from "./mod_order.js";
       import { classifyMessage, GATE } from "./message_gate.js";
+      import {
+        parseCanaryLine, channelName, runKey, isComplete, compareReports,
+        acceptsReport, VERDICT,
+      } from "./canary_verdict.js";
 
       const el = (id) => document.getElementById(id);
       const state = { iwad: null, pwads: [] };
@@ -493,6 +518,79 @@
         el("launch").textContent = frame ? "Relaunch" : "Launch";
       }
 
+      // One report per launch, published to the room's channel once both
+      // canary lines have been seen. The peer id is regenerated per launch so
+      // a result from a previous run can never be attributed to this one.
+      let canaryChannel = null;
+      let selfPeer = null;
+      let myReport = null;
+      let peerReport = null;
+
+      function renderVerdict() {
+        const v = compareReports(myReport, peerReport);
+        const cls = { MATCH: "match", MISMATCH: "mismatch", PENDING: "pending" };
+
+        el("verdict-input").textContent = v.input;
+        el("verdict-state").textContent = v.state;
+        el("verdict-aggregate").textContent = v.aggregate;
+        el("verdict-aggregate").className = "verdict " + cls[v.aggregate];
+
+        let note;
+        if (v.aggregate === VERDICT.MATCH) {
+          note = "Both peers agree on the input history and the exit state.";
+        } else if (v.aggregate === VERDICT.MISMATCH) {
+          note = "The peers disagree. This run desynced.";
+        } else if (!myReport || !isComplete(myReport)) {
+          note = "Play to the level exit in both windows.";
+        } else {
+          note = "Waiting for the other window's result.";
+        }
+        el("verdict-note").textContent = note;
+
+        window.__doomVerdict = v;
+      }
+
+      function publishReport() {
+        if (!canaryChannel || !isComplete(myReport)) return;
+        canaryChannel.postMessage({ peer: selfPeer, ...myReport });
+      }
+
+      // A line that passed the message gate is still only text. It becomes a
+      // result only if it parses strictly as one, so an ordinary log line
+      // cannot be mistaken for evidence.
+      function considerCanaryLine(text) {
+        const parsed = parseCanaryLine(text);
+        if (!parsed) return;
+
+        myReport = myReport || {};
+        myReport[parsed.kind] = parsed;
+
+        if (isComplete(myReport)) {
+          publishReport();
+        }
+        renderVerdict();
+      }
+
+      function openCanaryChannel(room) {
+        if (canaryChannel) {
+          canaryChannel.close();
+          canaryChannel = null;
+        }
+
+        if (!room || typeof BroadcastChannel !== "function") return;
+
+        canaryChannel = new BroadcastChannel(channelName(room));
+        canaryChannel.onmessage = (e) => {
+          if (!acceptsReport(e.data, { selfPeer, runKey: runKey(myReport) })) {
+            return;
+          }
+          peerReport = e.data;
+          // Answer so whichever peer finished first still learns the result.
+          publishReport();
+          renderVerdict();
+        };
+      }
+
       let frame = null;
       // Identifies one launch. A frame torn down mid-run keeps its own id, so
       // anything it sends afterwards is discarded rather than attributed to
@@ -524,6 +622,7 @@
           pending = null;
         } else if (verdict === GATE.ACCEPT_LOG) {
           log(msg.text, msg.stream === "err" ? "warn" : null);
+          considerCanaryLine(msg.text);
         }
 
         // Everything else is ignored, and the reason is available for the
@@ -544,6 +643,17 @@
         const argv = buildArgv();
         const dehlump = el("dehlump").checked;
         currentRun += 1;
+
+        // Everything about the previous run is discarded here, which is what
+        // makes a stale result impossible: a new peer id, no report of our
+        // own, nothing remembered from the other window, and a fresh channel.
+        selfPeer = (crypto.randomUUID
+          ? crypto.randomUUID()
+          : String(currentRun) + ":" + Math.random());
+        myReport = null;
+        peerReport = null;
+        openCanaryChannel(mode() === "single" ? "" : el("room").value.trim());
+        renderVerdict();
 
         // Relaunch is a teardown. Removing the iframe takes the instance, its
         // main loop, its audio graph and its FS with it, which is the only
