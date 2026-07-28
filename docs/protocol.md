@@ -84,7 +84,7 @@ Type is the low 15 bits of the header word. `[observed]` marks sessions where th
 |---:|---|---|---|---|
 | 0 | SYN | c2s request, s2c accept | s2c only | [observed] handshake-keepalive, gamestart-gamedata, drone-disconnect |
 | 1 | ACK | (deprecated) | (unused in 3.x) | `[reference]` only |
-| 2 | REJECTED | s2c | no | `[unknown]` (no mismatch scenario captured; layout in section 4) |
+| 2 | REJECTED | s2c | no | [observed] rejected-in-game, rejected-game-mismatch |
 | 3 | KEEPALIVE | both | no | [observed] all sessions, both directions |
 | 4 | WAITING_DATA | s2c | no | [observed] all lobby sessions |
 | 5 | GAMESTART | both | yes | [observed] gamestart-gamedata, both directions |
@@ -139,7 +139,12 @@ Observed `handshake-keepalive/001-s2c-client1-syn.bin` (41 B):
 24  str  negotiated protocol "CHOCOLATE_DOOM_0"
 ```
 
-A rejection instead sends REJECTED (2): `u16 type` then `str reason`. `[reference]` only; no rejection scenario is captured.
+A rejection instead sends REJECTED (2): `u16 type` then `str reason`. `[observed, reference]`. Two distinct refusal causes are committed:
+
+- Join after GAMESTART (`rejected-in-game/273-…`, 48 B): a client connecting while the server is in game receives "Server is not currently accepting connections". Captured with two unmodified clients.
+- Mismatched game mode/mission (`rejected-game-mismatch/011-…`, 74 B): a lobby SYN advertising `gamemode = 2` (commercial) and `gamemission = 1` (doom2) against a doom/shareware lobby receives "Game mismatch: server is doom (shareware), client is doom2 (commercial)". The triggering SYN was crafted at the documented layout (capture provenance in the session file); the server response is unmodified chocolate-server output.
+
+Other rejection paths in the pinned source (old magic number, no common protocol, server full) remain `[reference]` only: they are not in committed evidence.
 
 ### WAITING_DATA (4) s2c, lobby state, re-sent every 1 s
 
@@ -296,7 +301,7 @@ This repository's `doomd` implements the same envelope `[integration]`: the asym
 
 ## 8. Current boundaries
 
-- REJECTED is not in any committed capture: producing it needs a version, mission, or capacity mismatch, and none of those is producible with a single shareware IWAD and unmodified binaries. Its layout in section 4 is `[reference]` only.
+- REJECTED is observed for two causes (join after GAMESTART, game mode/mission mismatch). The remaining rejection paths in the pinned source (old magic number, no common protocol, server full) are `[reference]` only.
 - Clean client-initiated DISCONNECT (menu quit) is not captured: it requires UI input, which the headless rig cannot produce. The same applies to NAT_HOLE_PUNCH, which needs real NAT.
 - Rich ticcmd diffs (movement and buttons), ticdup above 1, extratics, and deathmatch flags in GAMESTART are not covered: every committed fixture is an idle single-player co-op run.
 - Multi-player GAMESTART (`num_players > 1`, per-client `consoleplayer`) is not covered: committed fixtures carry single-player GAMESTART only.

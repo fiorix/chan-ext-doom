@@ -140,9 +140,28 @@ python3 fixtures/rig/capture.py run --name query \
   --description "server status query" \
   --server-bin $S --client-bin $C --iwad $W --out $O/query \
   "--client-extra=-query 127.0.0.1" --signal none --duration 6
+
+# REJECTED evidence, two causes. Cause 1 needs no crafted input: a real
+# client joining while the server is in game is refused.
+python3 fixtures/rig/capture.py run --name rejected-in-game \
+  --description "client2 joins while the server is in game; REJECTED 'not currently accepting connections'" \
+  --server-bin $S --client-bin $C --iwad $W --out $O/rejected-in-game \
+  "--client-extra=-nodes 1" "--client2-extra=" --client2-delay 6 --duration 12 --sigterm-at 10
+
+# Cause 2 is a mismatched game mode/mission, which no two shareware
+# clients can produce; the rig crafts a documented SYN differing from a
+# real one only in gamemode/gamemission and injects it on a schedule.
+python3 fixtures/rig/capture.py craft --kind syn --gamemode 2 --gamemission 1 \
+  --checksums-from fixtures/handshake-keepalive/000-c2s-client1-syn.bin \
+  --out /tmp/doom-capture/crafted-syn.bin
+python3 fixtures/rig/capture.py run --name rejected-game-mismatch \
+  --description "crafted doom2/commercial SYN against a doom/shareware lobby; REJECTED 'Game mismatch'" \
+  --server-bin $S --client-bin $C --iwad $W --out $O/rejected-game-mismatch \
+  --signal none --duration 8 \
+  --inject "3:/tmp/doom-capture/crafted-syn.bin:crafted SYN per docs/protocol.md section 4 with only gamemode=2 and gamemission=1 changed; wad/deh sha1 reused from the real client SYN (handshake-keepalive/000)"
 ```
 
-Expected packet counts (timing-dependent, plus or minus a few): handshake-keepalive about 25, gamestart-gamedata about 550, drone-disconnect about 180, console-message about 315, query exactly 2.
+Expected packet counts (timing-dependent, plus or minus a few): handshake-keepalive about 25, gamestart-gamedata about 550, drone-disconnect about 180, console-message about 315, query exactly 2, rejected-in-game about 560, rejected-game-mismatch about 27.
 
 ### 3.6 Curate fixtures and regenerate the manifest
 
@@ -170,9 +189,11 @@ python3 fixtures/rig/capture.py export --session $O/gamestart-gamedata --fixture
 python3 fixtures/rig/capture.py export --session $O/drone-disconnect  --fixtures-dir fixtures --range 0:12,174:180
 python3 fixtures/rig/capture.py export --session $O/console-message   --fixtures-dir fixtures --range 269:281
 python3 fixtures/rig/capture.py export --session $O/query             --fixtures-dir fixtures
+python3 fixtures/rig/capture.py export --session $O/rejected-in-game  --fixtures-dir fixtures --range 8:12,272:274
+python3 fixtures/rig/capture.py export --session $O/rejected-game-mismatch --fixtures-dir fixtures --range 0:3,10:12
 ```
 
-`--range` accepts comma-separated `START:END` windows. For `drone-disconnect`, pick the two handshakes plus the last keepalives through the DISCONNECT_ACK; for `console-message`, the window around the CONSOLE_MESSAGE broadcast. Then re-run the checks from section 2.
+`--range` accepts comma-separated `START:END` windows. For `drone-disconnect`, pick the two handshakes plus the last keepalives through the DISCONNECT_ACK; for `console-message`, the window around the CONSOLE_MESSAGE broadcast; for `rejected-in-game`, the client1 GAMESTART block for state provenance plus the client2 SYN and REJECTED; for `rejected-game-mismatch`, the lobby handshake plus the injected SYN and REJECTED. Then re-run the checks from section 2.
 
 ## 4. Determinism expectations
 
