@@ -99,10 +99,16 @@ pub(crate) async fn listener(
             }
             _ = notifier.notified() => {}
         }
-        let datagrams = {
+        let (datagrams, effects) = {
             let mut runtime = state.0.lock().await;
             runtime.drain_udp(listener_id, &room_name)
         };
+        for waiter in effects.ws_waiters {
+            waiter.notify_one();
+        }
+        for waiter in effects.udp_waiters {
+            waiter.notify_one();
+        }
         for (address, bytes) in datagrams {
             // Send failures are isolated and bounded: the datagram is
             // dropped, role state is untouched, no queue is retained.
@@ -262,12 +268,15 @@ impl Runtime {
     /// cannot be adapted is a distinct producer error, never truncated,
     /// split, silently dropped, or sent through the slow-consumer path,
     /// isolating exactly its intended recipient through the normal
-    /// removal path while every other peer continues.
+    /// removal path while every other peer continues. The effects of
+    /// that isolation (survivor wakeups, the isolated peer's own
+    /// terminal capture) ride the returned `Effects` through the same
+    /// post-lock delivery path as every other reduction.
     pub(crate) fn drain_udp(
         &mut self,
         listener: ListenerId,
         room_name: &RoomName,
-    ) -> Vec<(SocketAddr, Vec<u8>)> {
+    ) -> (Vec<(SocketAddr, Vec<u8>)>, Effects) {
         let now = self.now();
         let Self {
             rooms,
@@ -275,10 +284,11 @@ impl Runtime {
             ..
         } = self;
         let mut out = Vec::new();
+        let mut effects = Effects::default();
         let mut oversized: Vec<(PlayerId, usize)> = Vec::new();
         {
             let Some(room) = rooms.get_mut(room_name) else {
-                return out;
+                return (out, effects);
             };
             let lowres = room.host.lowres_turn();
             if let Some(pending) = room.pending_udp.get_mut(&listener) {
@@ -336,7 +346,7 @@ impl Runtime {
         for (player, _) in oversized {
             if let Some(room) = rooms.get_mut(room_name) {
                 let effect = room.host.leave(now, player);
-                room.apply(effect, udp_notifiers);
+                effects.merge(room.apply(effect, udp_notifiers));
             }
         }
         // Final empty-room cleanup: a room whose last batch this drain
@@ -344,6 +354,6 @@ impl Runtime {
         if rooms.get(room_name).is_some_and(BindRoom::is_empty) {
             rooms.remove(room_name);
         }
-        out
+        (out, effects)
     }
 }
