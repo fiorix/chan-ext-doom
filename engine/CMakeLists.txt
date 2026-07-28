@@ -41,14 +41,43 @@ endif()
 
 project(doomit-engine C)
 
-# The pre-project check reads the toolchain the caller asked for. This one
-# reads what the toolchain actually configured, so a file named like
-# Emscripten.cmake that is not one still cannot reach the source list.
+# The pre-project check reads the toolchain the caller asked for, which is
+# enough to turn away an ordinary native configure quickly but is not a
+# verification of anything. Both signals it reads are caller-controlled
+# strings: -DCMAKE_SYSTEM_NAME=Emscripten sets them with any compiler at all,
+# and a file merely named Emscripten.cmake can select gcc. CMake's own
+# EMSCRIPTEN variable is no better, because the platform module stamps it from
+# the system name without consulting the compiler.
+#
+# So ask the compiler what it is. __EMSCRIPTEN__ is defined by emcc and by
+# nothing else, and a spoofed configuration fails here with this project's own
+# diagnostic rather than later on a raw Emscripten-only flag.
+#
+# This runs before the engine target exists, so a rejected toolchain never
+# reaches the source list or the flags.
 
-if(NOT EMSCRIPTEN)
+include(CheckCSourceCompiles)
+
+check_c_source_compiles(
+    "#ifndef __EMSCRIPTEN__
+     #error the configured compiler is not emcc
+     #endif
+     int main(void) { return 0; }"
+    DOOMIT_COMPILER_IS_EMSCRIPTEN)
+
+if(NOT DOOMIT_COMPILER_IS_EMSCRIPTEN)
     message(FATAL_ERROR
-        "doomit-engine: browser-only build; the loaded toolchain did not "
-        "produce an Emscripten target.")
+        "doomit-engine: browser-only build; the configured C compiler is not "
+        "an Emscripten compiler.\n"
+        "\n"
+        "    CMAKE_C_COMPILER = ${CMAKE_C_COMPILER}\n"
+        "\n"
+        "It does not define __EMSCRIPTEN__. Setting CMAKE_SYSTEM_NAME to "
+        "Emscripten, or pointing CMAKE_TOOLCHAIN_FILE at a file named like "
+        "Emscripten.cmake, does not make a native compiler into emcc. "
+        "Configure through emsdk instead:\n"
+        "    source ~/dev/emsdk/emsdk_env.sh\n"
+        "    emcmake cmake -S engine -B <build-dir>")
 endif()
 
 # This mirrors the single-emcc recipe in docs/provenance.md, which is the
