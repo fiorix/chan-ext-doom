@@ -1236,21 +1236,30 @@ mod tests {
         let mut runtime = state.0.lock().await;
         let room = runtime.rooms.get_mut(&room()).expect("room");
         let mut gamedata = 0;
+        let mut resends = 0;
+        let mut keepalives = 0;
+        let mut retries = 0;
         while let Some(packet) = room.host.pop_outbound(player) {
-            if let ServerPacket::GameData(_) = ServerPacket::decode(packet.payload(), false)
+            match ServerPacket::decode(packet.payload(), false)
                 .expect("decodes")
                 .1
             {
-                gamedata += 1;
+                ServerPacket::GameData(_) => gamedata += 1,
+                ServerPacket::GameDataResend { .. } => resends += 1,
+                ServerPacket::Keepalive => keepalives += 1,
+                ServerPacket::GameStart(_) => retries += 1,
+                other => panic!("unexpected packet {other:?}"),
             }
         }
-        // Skip: one collapsed pass (one pump plus the one deadlock
-        // replay). Burst: one pass per missed tick — eleven pump
-        // emissions to the single-player cap plus the replay.
-        assert!(
-            gamedata <= 4,
-            "a 10 s jump produced {gamedata} fan-out packets: a catch-up burst, not a skip"
-        );
+        // Skip: exactly one collapsed pass — one pump emission plus one
+        // deadlock replay. The deadlock request, the keepalive, and the
+        // reliable retry exist only because the role clock saw the real
+        // monotonic 10 s jump: a fake collapsed clock would produce
+        // none of them.
+        assert_eq!(gamedata, 2, "one collapsed pass, not a burst");
+        assert_eq!(resends, 1, "the deadlock threshold saw the jump");
+        assert_eq!(keepalives, 1, "the send-idle threshold saw the jump");
+        assert_eq!(retries, 1, "the reliable retry saw the jump");
     }
 
     #[tokio::test]
