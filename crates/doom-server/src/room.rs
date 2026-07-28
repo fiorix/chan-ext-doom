@@ -107,7 +107,15 @@ impl<Metadata: Clone> RoomHost<Metadata> {
     /// Transport hangup, binding rejection after admission, or any
     /// other binding-initiated removal: exactly one `Input::Leave`,
     /// reduced until quiescent, so no protocol peer survives the batch.
+    /// When the role has already removed the peer itself (a
+    /// role-originated `Action::Disconnect`, whose registry removal
+    /// rode its action batch), the later transport cleanup is inert by
+    /// construction: zero `Input::Leave`, the initiator contract every
+    /// binding relies on.
     pub fn leave(&mut self, now: Milliseconds, player: PlayerId) -> HostEffect {
+        if !self.registry.contains(player) {
+            return HostEffect::default();
+        }
         let actions = self.role.handle(now, Input::Leave { player });
         let effect = self.reduce(now, Vec::new(), actions);
         self.registry.leave(player);

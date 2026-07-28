@@ -45,12 +45,17 @@ pub async fn serve(listener: TcpListener, outbox_capacity: NonZeroUsize) -> io::
         outbox_capacity,
         started: Instant::now(),
     })));
-    tokio::spawn(timer_loop(state.clone()));
     let router = Router::new()
         .route("/ws/{room}", get(upgrade))
-        .with_state(state);
+        .with_state(state.clone());
 
-    axum::serve(listener, router).await
+    // The timer's lifetime is the serve future's: neither future is
+    // detached, so aborting or dropping `serve` drops both.
+    let server = axum::serve(listener, router).into_future();
+    tokio::select! {
+        result = server => result,
+        () = timer_loop(state) => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -231,23 +236,19 @@ impl Runtime {
         self.rooms.get(room_name)?.routes.get(&destination).copied()
     }
 
-    /// Transport hangup or binding-initiated removal: exactly one
-    /// `Leave` into the role, reduced until quiescent; the room is
-    /// dropped once it holds neither members nor connections. When the
-    /// role has already removed the peer itself (a role-originated
-    /// `Action::Disconnect`, whose registry removal rides its action
-    /// batch), the later socket cleanup is inert: zero `Leave` calls,
-    /// exactly as the clarified initiator rule requires.
+    /// Transport hangup or binding-initiated removal: the room host's
+    /// own initiator contract decides between exactly one `Leave` and
+    /// an inert cleanup; this method only removes the transport state
+    /// around it, and the room is dropped once it holds neither members
+    /// nor connections.
     fn leave(&mut self, room_name: &RoomName, player_id: PlayerId) -> Vec<Arc<Notify>> {
         let mut waiters = Vec::new();
         let now = self.now();
         let Some(room) = self.rooms.get_mut(room_name) else {
             return waiters;
         };
-        if room.host.contains(player_id) {
-            let effect = room.host.leave(now, player_id);
-            waiters.extend(room.apply(effect));
-        }
+        let effect = room.host.leave(now, player_id);
+        waiters.extend(room.apply(effect));
         if let Some(connection) = room.connections.remove(&player_id) {
             if let Some(route) = connection.route {
                 room.routes.remove(&route);
@@ -433,7 +434,6 @@ async fn write_loop(
             continue;
         }
         if !connected {
-            eprintln!("DBG write_loop disconnect path player={player_id:?}");
             // The terminal packet is the final binary frame, delivered
             // before the close even though the peer is already gone.
             let terminal = {
@@ -1182,6 +1182,31 @@ mod tests {
         client.close(None).await.expect("client closes");
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_serve_stops_the_runtime_timer() {
+        let (address, server) = spawn_server().await;
+        let room_url = format!("ws://{address}/ws/cancel");
+        let (mut client, _) = connect_async(&room_url).await.expect("client connects");
+        send(&mut client, 1, 20, &syn_packet("Alice", 0, 0, 0)).await;
+        let (_, accept) = next_decoded(&mut client, false).await;
+        assert!(matches!(accept, ServerPacket::SynAccept(_)));
+        let (_, data) = next_decoded(&mut client, false).await;
+        assert!(matches!(data, ServerPacket::WaitingData(_)));
+
+        // The reliable head is never acknowledged and the initial
+        // traffic is drained. With the timer coupled to the serve
+        // future, cancelling the server silences the retry and cadence
+        // that a detached timer would keep driving.
+        server.abort();
+        let retry = timeout(Duration::from_millis(1_500), next_binary(&mut client)).await;
+        assert!(
+            retry.is_err(),
+            "no timer-driven retry after cancellation: {retry:?}"
+        );
+
+        client.close(None).await.expect("client closes");
     }
 
     #[tokio::test]

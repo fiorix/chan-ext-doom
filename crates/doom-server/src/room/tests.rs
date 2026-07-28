@@ -345,6 +345,32 @@ fn terminal_rejection_rides_the_disconnect_effect_not_the_outbox() {
 }
 
 #[test]
+fn cleanup_after_a_role_originated_removal_is_inert() {
+    let mut h = host(8);
+    let player = join(&mut h);
+
+    // The role removes the pre-SYN member itself, the terminal riding
+    // the removal; the registry member goes with the same batch.
+    let effect = h.malformed(T0, player, MalformedClass::Syn { old_magic: true });
+    assert_eq!(effect.disconnects.len(), 1);
+    assert!(!h.contains(player));
+
+    // The later transport cleanup is inert by contract: a default
+    // effect, zero additional Leaves.
+    assert_eq!(h.leave(T0, player), HostEffect::default());
+
+    // The contract is structural, not the role's tolerance of unknown
+    // leaves: with the registry member gone first (as a binding's own
+    // cleanup ordering could leave behind), a guarded leave still
+    // never reaches the role, so the live role peer is untouched.
+    let live = join(&mut h);
+    assert_eq!(h.role.peer_count(), 1);
+    h.registry.leave(live);
+    assert_eq!(h.leave(T0, live), HostEffect::default());
+    assert_eq!(h.role.peer_count(), 1, "the role peer is untouched");
+}
+
+#[test]
 fn transport_leave_mid_startup_aborts_with_game_ended_and_room_persists() {
     let mut h = host(8);
     let alice = join(&mut h);
