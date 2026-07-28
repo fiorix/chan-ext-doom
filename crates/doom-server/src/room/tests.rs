@@ -98,15 +98,20 @@ fn reliable(seq: u8) -> WireHeader {
     }
 }
 
-fn launch(host: &mut RoomHost<u32>, player: PlayerId) -> HostEffect {
+fn launch(host: &mut RoomHost<u32>, player: PlayerId) -> HostEffect<u32> {
     host.packet(T0, player, reliable(0), ClientPacket::Launch)
 }
 
-fn ack(host: &mut RoomHost<u32>, player: PlayerId, next_seq: u8) -> HostEffect {
+fn ack(host: &mut RoomHost<u32>, player: PlayerId, next_seq: u8) -> HostEffect<u32> {
     host.packet(T0, player, plain(), ClientPacket::ReliableAck { next_seq })
 }
 
-fn gamestart(host: &mut RoomHost<u32>, player: PlayerId, seq: u8, deathmatch: u8) -> HostEffect {
+fn gamestart(
+    host: &mut RoomHost<u32>,
+    player: PlayerId,
+    seq: u8,
+    deathmatch: u8,
+) -> HostEffect<u32> {
     host.packet(
         T0,
         player,
@@ -577,4 +582,87 @@ fn relay_slow_consumer_feeds_leave_into_the_role_once() {
     // herself.
     h.tick(Milliseconds(T0.0 + 1_001));
     assert_eq!(pop_waiting_data(&mut h, alice).players.len(), 1);
+}
+
+// The removal effect preserves the exact queued prefix, FIFO, with
+// each packet's binding metadata and codec tag, then the terminal
+// (proto followup-lead-server-23 addenda 3-5). A mutation that removes
+// the player from the registry before the capture must fail this.
+#[test]
+fn removal_effect_carries_the_owed_prefix_with_metadata_and_tags() {
+    let mut h = host(16);
+    let alice = join(&mut h);
+    let target = join(&mut h);
+
+    // Queue, in order, for the still pre-SYN target: one opaque relay
+    // from a non-server route, then two distinguishable host
+    // QUERY_RESPONSE packets (the room gains a connected player
+    // between them, so the reported count changes).
+    let relay_payload = b"relay-through-route-20";
+    let (outcome, _) = h
+        .relay(T0, alice, target, 20, relay_payload)
+        .expect("relay queues");
+    assert_eq!(outcome, RelayOutcome::Queued(target));
+    let first_query = h.packet(T0, target, plain(), ClientPacket::Query);
+    assert!(first_query.wakes.contains(&target));
+    h.packet(T0, alice, plain(), syn("Alice"));
+    let second_query = h.packet(T0, target, plain(), ClientPacket::Query);
+    assert!(second_query.wakes.contains(&target));
+
+    // The old-magic classification is a terminal REJECTED removal for
+    // the pre-SYN target.
+    let effect = h.malformed(T0, target, MalformedClass::Syn { old_magic: true });
+
+    // The target is already absent from membership, and the effect
+    // still carries its exact owed prefix.
+    assert!(!h.contains(target));
+    let owed = effect
+        .removal_owed
+        .iter()
+        .find(|(player, _)| *player == target)
+        .map(|(_, packets)| packets)
+        .expect("the owed prefix is captured");
+    assert_eq!(owed.len(), 3);
+    // The relay keeps its non-server route and no codec context.
+    assert_eq!(owed[0].metadata(), &20);
+    assert_eq!(owed[0].payload(), relay_payload);
+    assert_eq!(owed[0].lowres(), None);
+    // The two host responses keep the server route and their
+    // production-time (pre-gamestart, wide) codec tag.
+    assert_eq!(owed[1].metadata(), &1);
+    assert_eq!(owed[1].lowres(), Some(false));
+    assert_eq!(owed[2].metadata(), &1);
+    assert_eq!(owed[2].lowres(), Some(false));
+    let (_, ServerPacket::QueryResponse(first)) =
+        ServerPacket::decode(owed[1].payload(), false).expect("first decodes")
+    else {
+        panic!("query response")
+    };
+    let (_, ServerPacket::QueryResponse(second)) =
+        ServerPacket::decode(owed[2].payload(), false).expect("second decodes")
+    else {
+        panic!("query response")
+    };
+    assert_eq!(first.num_players, 0);
+    assert_eq!(second.num_players, 1);
+    assert_ne!(
+        owed[1].payload(),
+        owed[2].payload(),
+        "the prefix packets are distinguishable"
+    );
+    // The terminal REJECTED rides the removal, after the prefix.
+    let terminal = effect
+        .disconnects
+        .iter()
+        .find(|(player, _)| *player == target)
+        .and_then(|(_, terminal)| terminal.as_ref())
+        .expect("the terminal rides the removal");
+    assert!(matches!(
+        ServerPacket::decode(terminal, false)
+            .expect("terminal decodes")
+            .1,
+        ServerPacket::Rejected { .. }
+    ));
+    // Nothing further can be sent to the removed target.
+    assert!(h.pop_outbound(target).is_none());
 }

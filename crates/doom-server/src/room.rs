@@ -5,6 +5,7 @@
 //! apply the returned effects, so no WebSocket-specific protocol state
 //! exists here that a later UDP binding would duplicate.
 
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 
 use doom_proto::{ClientPacket, WireHeader};
@@ -16,9 +17,45 @@ use crate::{
     RelayOutcome, RoomName,
 };
 
+/// One outbound packet owed to a peer: the opaque payload, the binding
+/// metadata stamped at queue time (the server route for host sends,
+/// the sender's route for relays), and for host-produced packets the
+/// codec context authoritative at production time. Relay packets carry
+/// no codec context: their payload is opaque and must never be
+/// decoded for width.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwedPacket<Metadata> {
+    metadata: Metadata,
+    payload: Vec<u8>,
+    lowres: Option<bool>,
+}
+
+impl<Metadata> OwedPacket<Metadata> {
+    /// Returns the transport-owned metadata.
+    pub const fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Returns the opaque packet bytes.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// The production-time codec width for host-produced packets;
+    /// `None` for opaque relay payloads.
+    pub const fn lowres(&self) -> Option<bool> {
+        self.lowres
+    }
+
+    /// Consumes the packet and returns its payload bytes.
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+}
+
 /// What the binding must apply after one consistent reduction batch.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct HostEffect {
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostEffect<Metadata> {
     /// Peers whose writers should wake: new host-originated outbound
     /// packets are queued for them.
     pub wakes: Vec<PlayerId>,
@@ -26,16 +63,28 @@ pub struct HostEffect {
     /// (encoded) owed as the final binary message before the close.
     pub disconnects: Vec<(PlayerId, Option<Vec<u8>>)>,
     /// Packets still owed to each removed peer at reduction time (its
-    /// remaining outbox, FIFO), captured before the registry dropped
-    /// it: the binding delivers them first and the terminal last.
-    pub removal_owed: Vec<(PlayerId, Vec<Vec<u8>>)>,
+    /// remaining outbox, FIFO, with each packet's binding metadata and
+    /// codec tag), captured before the registry dropped it: the
+    /// binding delivers them first and the terminal last.
+    pub removal_owed: Vec<(PlayerId, Vec<OwedPacket<Metadata>>)>,
     /// The role returned the room to waiting-for-launch during this
     /// batch; the room itself persists and must not be duplicated.
     pub game_ended: bool,
 }
 
-impl HostEffect {
-    fn merge(&mut self, other: HostEffect) {
+impl<Metadata> Default for HostEffect<Metadata> {
+    fn default() -> Self {
+        Self {
+            wakes: Vec::new(),
+            disconnects: Vec::new(),
+            removal_owed: Vec::new(),
+            game_ended: false,
+        }
+    }
+}
+
+impl<Metadata> HostEffect<Metadata> {
+    fn merge(&mut self, other: HostEffect<Metadata>) {
         self.wakes.extend(other.wakes);
         self.disconnects.extend(other.disconnects);
         self.removal_owed.extend(other.removal_owed);
@@ -52,9 +101,17 @@ pub struct RoomHost<Metadata> {
     registry: Registry<Metadata>,
     role: ServerRole,
     server_metadata: Metadata,
+    /// Per-player FIFO of the codec widths the host stamped on each
+    /// host-produced packet it queued, aligned with the registry
+    /// outbox: relay packets interleave freely (they are opaque) and
+    /// every removal drops the player's queue wholesale. This is what
+    /// lets a drained or captured packet be decoded later with the
+    /// width that was authoritative when it was produced, never the
+    /// live room width.
+    widths: HashMap<PlayerId, VecDeque<bool>>,
 }
 
-impl<Metadata: Clone> RoomHost<Metadata> {
+impl<Metadata: Clone + PartialEq> RoomHost<Metadata> {
     /// Creates the host for one room with the given outbox bound and
     /// the metadata stamped on every host-originated send.
     pub fn new(
@@ -67,6 +124,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
             role: ServerRole::new(),
             room_name,
             server_metadata,
+            widths: HashMap::new(),
         }
     }
 
@@ -80,9 +138,30 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         self.registry.contains(player)
     }
 
-    /// Removes and returns the oldest pending packet for a player.
-    pub fn pop_outbound(&mut self, player: PlayerId) -> Option<OutboundPacket<Metadata>> {
-        self.registry.pop_outbound(player)
+    /// Removes and returns the oldest pending packet for a player,
+    /// tagged with its binding metadata and, for host-produced
+    /// packets, its production-time codec width.
+    pub fn pop_outbound(&mut self, player: PlayerId) -> Option<OwedPacket<Metadata>> {
+        let packet = self.registry.pop_outbound(player)?;
+        Some(self.tag(player, packet))
+    }
+
+    /// Pair one registry packet with its codec tag: host-produced
+    /// packets (stamped with the server metadata) pop their width in
+    /// outbox order; relay packets stay opaque with no context.
+    fn tag(&mut self, player: PlayerId, packet: OutboundPacket<Metadata>) -> OwedPacket<Metadata> {
+        let lowres = if *packet.metadata() == self.server_metadata {
+            let lowres = self.widths.get_mut(&player).and_then(VecDeque::pop_front);
+            debug_assert!(lowres.is_some(), "host packet missing its codec tag");
+            lowres
+        } else {
+            None
+        };
+        OwedPacket {
+            metadata: packet.metadata().clone(),
+            payload: packet.payload().to_vec(),
+            lowres,
+        }
     }
 
     /// The room's authoritative `lowres_turn` codec context.
@@ -103,7 +182,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         &mut self,
         now: Milliseconds,
         addr_label: impl FnOnce(PlayerId) -> Vec<u8>,
-    ) -> Result<(PlayerId, HostEffect), JoinError> {
+    ) -> Result<(PlayerId, HostEffect<Metadata>), JoinError> {
         let player = self.registry.join(self.room_name.clone())?;
         let actions = self.role.handle(
             now,
@@ -124,13 +203,14 @@ impl<Metadata: Clone> RoomHost<Metadata> {
     /// rode its action batch), the later transport cleanup is inert by
     /// construction: zero `Input::Leave`, the initiator contract every
     /// binding relies on.
-    pub fn leave(&mut self, now: Milliseconds, player: PlayerId) -> HostEffect {
+    pub fn leave(&mut self, now: Milliseconds, player: PlayerId) -> HostEffect<Metadata> {
         if !self.registry.contains(player) {
             return HostEffect::default();
         }
         let actions = self.role.handle(now, Input::Leave { player });
         let effect = self.reduce(now, Vec::new(), actions);
         self.registry.leave(player);
+        self.widths.remove(&player);
         effect
     }
 
@@ -141,7 +221,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         player: PlayerId,
         header: WireHeader,
         packet: ClientPacket,
-    ) -> HostEffect {
+    ) -> HostEffect<Metadata> {
         let actions = self.role.handle(
             now,
             Input::Packet {
@@ -159,13 +239,13 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         now: Milliseconds,
         player: PlayerId,
         class: MalformedClass,
-    ) -> HostEffect {
+    ) -> HostEffect<Metadata> {
         let actions = self.role.handle(now, Input::Malformed { player, class });
         self.reduce(now, Vec::new(), actions)
     }
 
     /// The runtime timer: all cadence, retry, resend, and in-game work.
-    pub fn tick(&mut self, now: Milliseconds) -> HostEffect {
+    pub fn tick(&mut self, now: Milliseconds) -> HostEffect<Metadata> {
         let actions = self.role.handle(now, Input::Timer);
         self.reduce(now, Vec::new(), actions)
     }
@@ -180,7 +260,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         recipient: PlayerId,
         metadata: Metadata,
         payload: &[u8],
-    ) -> Result<(RelayOutcome, HostEffect), RelayError> {
+    ) -> Result<(RelayOutcome, HostEffect<Metadata>), RelayError> {
         let outcome = self.registry.relay(sender, recipient, metadata, payload)?;
         let mut effect = HostEffect::default();
         match outcome {
@@ -191,6 +271,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                 }
             }
             RelayOutcome::SlowConsumerDisconnected(player) => {
+                self.widths.remove(&player);
                 let actions = self.role.handle(now, Input::Leave { player });
                 effect.merge(self.reduce(now, vec![player], actions));
             }
@@ -211,7 +292,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         now: Milliseconds,
         removals: Vec<PlayerId>,
         actions: Vec<Action>,
-    ) -> HostEffect {
+    ) -> HostEffect<Metadata> {
         // One reduction is one atomic producer batch: consumer backlog
         // is measured at this moment, never per packet inside the
         // batch, so a valid burst (for example 64 contiguous expired
@@ -237,8 +318,13 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                         header,
                         packet,
                     } => {
+                        // The codec context is stamped at production
+                        // time: the bytes and their width tag travel
+                        // together through the outbox and any removal
+                        // capture, never re-read from the live role.
+                        let lowres = self.role.lowres_turn();
                         let bytes = packet
-                            .encode(header, self.role.lowres_turn())
+                            .encode(header, lowres)
                             .expect("role outputs always encode");
                         {
                             let position = produced
@@ -262,11 +348,13 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                             .queue_host(player, self.server_metadata.clone(), &bytes)
                         {
                             Ok(HostOutcome::Queued(_)) => {
+                                self.widths.entry(player).or_default().push_back(lowres);
                                 if !effect.wakes.contains(&player) {
                                     effect.wakes.push(player);
                                 }
                             }
                             Ok(HostOutcome::SlowConsumerDisconnected(_)) => {
+                                self.widths.remove(&player);
                                 removals.push(player);
                                 next.extend(self.role.handle(now, Input::Leave { player }));
                             }
@@ -279,15 +367,18 @@ impl<Metadata: Clone> RoomHost<Metadata> {
                     Action::Disconnect {
                         player, terminal, ..
                     } => {
-                        // Capture every already-owed packet before the
-                        // registry drops the outbox: the binding
-                        // delivers them first and the terminal last.
-                        // Registry-level (slow-consumer) removals never
-                        // take this path and never flush a backlog.
+                        // Capture every already-owed packet with its
+                        // metadata and codec tag before the registry
+                        // drops the outbox: the binding delivers the
+                        // exact queued prefix first and the terminal
+                        // last. Registry-level (slow-consumer) removals
+                        // never take this path and never flush a
+                        // backlog.
                         let mut owed = Vec::new();
                         while let Some(packet) = self.registry.pop_outbound(player) {
-                            owed.push(packet.payload().to_vec());
+                            owed.push(self.tag(player, packet));
                         }
+                        self.widths.remove(&player);
                         if !owed.is_empty()
                             && !effect
                                 .removal_owed
@@ -317,6 +408,7 @@ impl<Metadata: Clone> RoomHost<Metadata> {
             pending = next;
         }
         for player in removals {
+            self.widths.remove(&player);
             if !effect
                 .disconnects
                 .iter()

@@ -286,18 +286,21 @@ async fn write_loop(
             continue;
         }
         if !connected {
-            // The terminal packet is the final binary frame, delivered
-            // before the close even though the peer is already gone.
-            let terminal = {
+            // Every already-owed frame is delivered FIFO before the
+            // close even though the peer is already gone: the captured
+            // prefix with its own source routes, then the terminal.
+            let pending = {
                 let mut runtime = state.0.lock().await;
                 runtime
                     .rooms
                     .get_mut(&room_name)
                     .and_then(|room| room.connections.get_mut(&player_id))
-                    .and_then(|connection| connection.terminal.take())
+                    .map(|connection| std::mem::take(&mut connection.pending))
             };
-            if let Some(terminal) = terminal {
-                let _ = sink.send(Message::Binary(terminal.into())).await;
+            if let Some(mut pending) = pending {
+                while let Some(frame) = pending.pop_front() {
+                    let _ = sink.send(Message::Binary(frame.into())).await;
+                }
             }
             let _ = sink.send(Message::Close(None)).await;
             return;
@@ -349,7 +352,7 @@ fn decode_inbound(frame: &[u8]) -> Result<WireEnvelope<'_>, DecodeError> {
     })
 }
 
-fn encode_outbound(packet: crate::OutboundPacket<RouteId>) -> Vec<u8> {
+fn encode_outbound(packet: crate::room::OwedPacket<RouteId>) -> Vec<u8> {
     let mut frame = Vec::with_capacity(OUTBOUND_HEADER_LEN + packet.payload().len());
     frame.extend_from_slice(&packet.metadata().get().to_le_bytes());
     frame.extend_from_slice(packet.payload());
@@ -1283,6 +1286,120 @@ mod tests {
         assert_eq!(next_binary(&mut other).await, server_frame(33, b"alive"));
 
         other.close(None).await.expect("other closes");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn removal_prefix_reaches_the_connection_frames_fifo() {
+        fn feed(runtime: &mut Runtime, target: PlayerId, payload: &[u8]) {
+            let effect = {
+                let now = runtime.now();
+                let bind_room = runtime.rooms.get_mut(&room()).expect("room");
+                bind_room.server_payload(now, target, payload)
+            };
+            let Runtime {
+                rooms,
+                udp_notifiers,
+                ..
+            } = runtime;
+            rooms
+                .get_mut(&room())
+                .expect("room")
+                .apply(effect, udp_notifiers);
+        }
+
+        let mut runtime = test_runtime();
+        let (target, _) = runtime
+            .join(room(), Arc::new(Notify::new()))
+            .expect("target joins");
+        let sender = join(&mut runtime);
+
+        // Queue for the still pre-SYN target, in order: one opaque
+        // relay from a non-server route, then two distinguishable host
+        // QUERY_RESPONSE packets (a connected player arrives between
+        // them).
+        {
+            let now = runtime.now();
+            let bind_room = runtime.rooms.get_mut(&room()).expect("room");
+            let (outcome, _) = bind_room
+                .host
+                .relay(now, sender, target, route(20), b"relay-through-route-20")
+                .expect("relay queues");
+            assert_eq!(outcome, crate::RelayOutcome::Queued(target));
+        }
+        let query = ClientPacket::Query.encode(plain(), false).expect("encodes");
+        feed(&mut runtime, target, &query);
+        let syn = syn_packet("Alice", 0, 0, 0);
+        feed(&mut runtime, sender, &syn);
+        feed(&mut runtime, target, &query);
+
+        // The old-magic classification is a terminal REJECTED removal.
+        let mut old_syn = vec![0x00, 0x00];
+        old_syn.extend_from_slice(&PINNED_OLD_MAGIC.to_be_bytes());
+        feed(&mut runtime, target, &old_syn);
+
+        // The target is absent from membership, and its connection
+        // carries the exact FIFO frames: the relay with its own route,
+        // the two responses with the server route, then the terminal.
+        let bind_room = runtime.rooms.get(&room()).expect("room");
+        assert!(!bind_room.host.contains(target));
+        let pending = &bind_room.connections[&target].pending;
+        assert_eq!(pending.len(), 4);
+        assert_eq!(pending[0], server_frame(20, b"relay-through-route-20"));
+        for frame in pending.iter().skip(1) {
+            assert_eq!(frame[..4], SERVER_ROUTE.to_le_bytes());
+        }
+        let (_, ServerPacket::QueryResponse(first)) =
+            ServerPacket::decode(&pending[1][OUTBOUND_HEADER_LEN..], false).expect("decodes")
+        else {
+            panic!("query response")
+        };
+        let (_, ServerPacket::QueryResponse(second)) =
+            ServerPacket::decode(&pending[2][OUTBOUND_HEADER_LEN..], false).expect("decodes")
+        else {
+            panic!("query response")
+        };
+        assert_eq!(first.num_players, 0);
+        assert_eq!(second.num_players, 1);
+        assert!(matches!(
+            ServerPacket::decode(&pending[3][OUTBOUND_HEADER_LEN..], false)
+                .expect("decodes")
+                .1,
+            ServerPacket::Rejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wire_order_is_owed_prefix_then_terminal_then_close() {
+        let (address, server) = spawn_server().await;
+        let room_url = format!("ws://{address}/ws/order");
+        let (mut client, _) = connect_async(&room_url).await.expect("client connects");
+
+        // Two pre-SYN member QUERYs queue two host responses; the
+        // old-magic SYN then removes the client with a terminal
+        // REJECTED.
+        let query = ClientPacket::Query.encode(plain(), false).expect("encodes");
+        send(&mut client, 1, 20, &query).await;
+        send(&mut client, 1, 20, &query).await;
+        let mut old_syn = vec![0x00, 0x00];
+        old_syn.extend_from_slice(&PINNED_OLD_MAGIC.to_be_bytes());
+        send(&mut client, 1, 20, &old_syn).await;
+
+        // The wire shows exactly the two responses, then the REJECTED,
+        // then the close, all from the server route.
+        for _ in 0..2 {
+            let (from, packet) = next_decoded(&mut client, false).await;
+            assert_eq!(from, SERVER_ROUTE);
+            assert!(matches!(packet, ServerPacket::QueryResponse(_)));
+        }
+        let (from, packet) = next_decoded(&mut client, false).await;
+        assert_eq!(from, SERVER_ROUTE);
+        assert!(matches!(packet, ServerPacket::Rejected { .. }));
+        assert!(matches!(
+            next_message(&mut client).await,
+            Some(Ok(ClientMessage::Close(_))) | None
+        ));
         server.abort();
         let _ = server.await;
     }

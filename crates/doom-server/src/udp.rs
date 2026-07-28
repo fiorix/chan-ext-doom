@@ -305,7 +305,6 @@ impl Runtime {
                 !room.udp_inflight.contains(&listener),
                 "one in-flight batch per listener"
             );
-            let lowres = room.host.lowres_turn();
             // The tombstones this batch answers for, snapshotted before
             // any new removal can add its own: finishing clears exactly
             // these, never state created after the take.
@@ -316,18 +315,24 @@ impl Runtime {
                 .copied()
                 .collect();
             if let Some(pending) = room.pending_udp.get_mut(&listener) {
-                while let Some((address, bytes)) = pending.pop_front() {
-                    if bytes.len() > MAX_DATAGRAM_LEN {
-                        match adapt_gamedata(&bytes, lowres) {
+                while let Some((address, owed)) = pending.pop_front() {
+                    if owed.bytes.len() > MAX_DATAGRAM_LEN {
+                        // Only host-produced packets carry a codec tag
+                        // and may adapt; anything else over the ceiling
+                        // is the producer-error path.
+                        match owed
+                            .lowres
+                            .and_then(|lowres| adapt_gamedata(&owed.bytes, lowres))
+                        {
                             Some(adapted) => out.push((address, adapted)),
                             None => eprintln!(
                                 "doomd udp: producer error: {} bytes exceeds the 1500-byte datagram ceiling for {address}; discarded with its removed peer",
-                                bytes.len()
+                                owed.bytes.len()
                             ),
                         }
                         continue;
                     }
-                    out.push((address, bytes));
+                    out.push((address, owed.bytes));
                 }
             }
             let players: Vec<(PlayerId, SocketAddr)> = room
@@ -341,10 +346,15 @@ impl Runtime {
                     let bytes = packet.payload();
                     if bytes.len() > MAX_DATAGRAM_LEN {
                         // Input-reachable oversize (a three-player
-                        // extratics=127 GAMEDATA span) is adapted, never
-                        // isolated; only the impossible non-GAMEDATA or
-                        // one-tic case takes the producer-error path.
-                        if let Some(adapted) = adapt_gamedata(bytes, lowres) {
+                        // extratics=127 GAMEDATA span) is adapted at
+                        // the packet's own production-time width, never
+                        // the live room width; only the impossible
+                        // non-GAMEDATA or one-tic case takes the
+                        // producer-error path.
+                        if let Some(adapted) = packet
+                            .lowres()
+                            .and_then(|lowres| adapt_gamedata(bytes, lowres))
+                        {
                             out.push((address, adapted));
                             continue;
                         }
@@ -469,10 +479,10 @@ mod tests {
             .expect("syn encodes")
     }
 
-    fn settings_bytes(seq: u8, deathmatch: u8) -> Vec<u8> {
+    fn settings_bytes_ext(seq: u8, deathmatch: u8, extratics: u8) -> Vec<u8> {
         ClientPacket::GameStart(GameSettings {
             ticdup: 1,
-            extratics: 1,
+            extratics,
             deathmatch,
             nomonsters: 0,
             fast_monsters: 0,
@@ -496,6 +506,10 @@ mod tests {
             false,
         )
         .expect("gamestart encodes")
+    }
+
+    fn settings_bytes(seq: u8, deathmatch: u8) -> Vec<u8> {
+        settings_bytes_ext(seq, deathmatch, 1)
     }
 
     fn launch_bytes(seq: u8) -> Vec<u8> {
@@ -1008,66 +1022,146 @@ mod tests {
         assert!(relayed.contains(&&lowres));
     }
 
+    /// One step of simulated play at `extratics=127`: the clock moves
+    /// one gametic, every player uploads its newest full-diff tic and
+    /// acknowledges the server's stream (keeping the stall guard
+    /// quiet), then one shared timer pass runs.
+    fn play_step(
+        rt: &mut Runtime,
+        listener: ListenerId,
+        addrs: &[SocketAddr; 3],
+        lowres: u8,
+        step: usize,
+    ) {
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_millis(29))
+            .expect("backdate one gametic");
+        let upload = ClientPacket::GameData(doom_proto::GameDataClient {
+            ack: step as u8,
+            start: step as u8,
+            tics: vec![doom_proto::ClientTic {
+                latency: step as i16,
+                diff: full_diff(),
+            }],
+        })
+        .encode(WireHeader { reliable_seq: None }, lowres != 0)
+        .expect("upload encodes");
+        for address in addrs {
+            rt.udp_datagram(listener, &room(), *address, &upload);
+        }
+        rt.tick();
+    }
+
+    /// Drive three UDP peers on one listener into an in-game state with
+    /// controller `extratics=127` and play `steps` gametics, draining
+    /// after each so no outbox overflows. With two full diffs per tic
+    /// per recipient (19 bytes wide, 17 lowres), the pump's 128-tic
+    /// spans are oversize once `sendseq` passes the boundary.
+    fn drive_three_player_ingame(
+        rt: &mut Runtime,
+        listener: ListenerId,
+        lowres: u8,
+        steps: usize,
+    ) -> [SocketAddr; 3] {
+        let addrs: [SocketAddr; 3] = [
+            "127.0.0.1:24001".parse().expect("valid addr"),
+            "127.0.0.1:24002".parse().expect("valid addr"),
+            "127.0.0.1:24003".parse().expect("valid addr"),
+        ];
+        for (index, address) in addrs.iter().enumerate() {
+            let name = format!("p{index}");
+            rt.udp_datagram(listener, &room(), *address, &syn_bytes(&name, 0, 0, lowres));
+        }
+        for address in addrs {
+            rt.udp_datagram(listener, &room(), address, &ack_bytes(1));
+        }
+        rt.udp_datagram(listener, &room(), addrs[0], &launch_bytes(0));
+        for address in addrs {
+            rt.udp_datagram(listener, &room(), address, &ack_bytes(2));
+        }
+        rt.udp_datagram(listener, &room(), addrs[0], &settings_bytes_ext(1, 0, 127));
+        rt.udp_datagram(listener, &room(), addrs[1], &settings_bytes(0, 0));
+        rt.udp_datagram(listener, &room(), addrs[2], &settings_bytes(0, 0));
+        for step in 0..steps {
+            play_step(rt, listener, &addrs, lowres, step);
+            drain(rt, listener, &room());
+        }
+        addrs
+    }
+
     #[test]
     fn drain_adapts_oversize_gamedata_and_retains_the_peer() {
         let mut rt = runtime();
         let (listener, _notifier) = rt.register_listener();
-        let from = addr();
-        rt.udp_datagram(listener, &room(), from, &fixture_syn());
-        let player = rt.rooms[&room()].udp_addresses[&(listener, from)];
-
-        // The input-reachable worst case: a 128-tic wide span at 2436
-        // bytes, injected into the UDP peer's outbox.
-        let (bytes, original) = gamedata(250, 128, false);
-        assert_eq!(bytes.len(), 2436);
-        let now = rt.now();
-        let bind_room = rt.rooms.get_mut(&room()).expect("room");
-        let (other, _) = bind_room
-            .host
-            .join(now, |_| b"ws:relay".to_vec())
-            .expect("member joins");
-        let route = crate::runtime::RouteId::new(11).expect("nonzero");
-        bind_room
-            .host
-            .relay(now, other, player, route, &bytes)
-            .expect("fits the room-core bound");
+        // The input-reachable construction: a 128-tic wide span with
+        // two full diffs per tic is 4 + 128 x 19 = 2436 bytes.
+        let addrs = drive_three_player_ingame(&mut rt, listener, 0, 130);
+        // One final span, undrained.
+        play_step(&mut rt, listener, &addrs, 0, 130);
 
         let (datagrams, effects) = drain(&mut rt, listener, &room());
-        let adapted_bytes = datagrams
-            .iter()
-            .map(|(_, bytes)| bytes)
-            .find(|bytes| {
-                matches!(
-                    ServerPacket::decode(bytes, false),
-                    Ok((_, ServerPacket::GameData(_)))
-                )
-            })
-            .expect("the adapted gamedata is emitted");
-        assert!(adapted_bytes.len() <= MAX_DATAGRAM_LEN);
-        assert_eq!(adapted_bytes.len(), 1486);
-        let (_, ServerPacket::GameData(adapted)) =
-            ServerPacket::decode(adapted_bytes, false).expect("the suffix decodes")
-        else {
-            unreachable!()
-        };
-        // Start advanced by the omitted 50 across the u8 wrap (250 ->
-        // 44), the original newest tic last, content exact.
-        assert_eq!(adapted.tics.len(), 78);
-        assert_eq!(adapted.start, 44);
-        assert_eq!(adapted.tics.as_slice(), &original.tics[50..]);
-        assert_eq!(adapted.tics.last(), original.tics.last());
-        // The peer is retained, never isolated: mapping and membership
-        // survive and the drain produced no removal effects.
-        assert!(
-            rt.rooms[&room()]
-                .udp_addresses
-                .contains_key(&(listener, from))
-        );
-        assert!(rt.rooms[&room()].host.contains(player));
+        let mut adapted = 0;
+        for bytes in datagrams.iter().map(|(_, bytes)| bytes) {
+            assert!(bytes.len() <= MAX_DATAGRAM_LEN);
+            if let ServerPacket::GameData(data) = decode_server(bytes, false) {
+                assert_eq!(data.tics.len(), 78, "the 78-tic newest suffix");
+                assert_eq!(bytes.len(), 1486);
+                adapted += 1;
+            }
+        }
+        assert_eq!(adapted, 3, "every recipient got the adapted span");
+        // Every peer is retained, never isolated, and the drain
+        // produced no removal effects.
+        for address in addrs {
+            assert!(
+                rt.rooms[&room()]
+                    .udp_addresses
+                    .contains_key(&(listener, address)),
+                "the recipient is retained"
+            );
+        }
         assert!(effects.ws_waiters.is_empty());
         assert!(effects.udp_waiters.is_empty());
     }
 
+    #[test]
+    fn lowres_gamedata_keeps_its_width_tag_across_a_role_reset() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        // A 128-tic lowres span is 4 + 128 x 17 = 2180 bytes; the
+        // largest fitting suffix is exactly 88 tics at 1500.
+        let addrs = drive_three_player_ingame(&mut rt, listener, 1, 130);
+        // One final span, undrained.
+        play_step(&mut rt, listener, &addrs, 1, 130);
+
+        // Every player leaves: the game ends and the role resets its
+        // settings, and with them the live codec width, while the
+        // captured lowres fan-out is still owed to each removed peer.
+        for address in addrs {
+            let player = rt.rooms[&room()].udp_addresses[&(listener, address)];
+            rt.leave(&room(), player);
+        }
+        let bind_room = rt.rooms.get(&room()).expect("pending retains it");
+        assert!(!bind_room.host.lowres_turn(), "the role reset to wide");
+
+        let (datagrams, _) = drain(&mut rt, listener, &room());
+        let mut adapted = 0;
+        for bytes in datagrams.iter().map(|(_, bytes)| bytes) {
+            assert!(bytes.len() <= MAX_DATAGRAM_LEN);
+            if let ServerPacket::GameData(data) = decode_server(bytes, true) {
+                assert_eq!(data.tics.len(), 88, "the lowres 88-tic suffix");
+                assert_eq!(bytes.len(), 1500);
+                adapted += 1;
+            }
+        }
+        assert_eq!(
+            adapted, 3,
+            "each removed peer's captured span adapted by its lowres tag"
+        );
+        // A live-width lookup would fail to decode the lowres bytes as
+        // wide and drop the owed batch on the producer-error path.
+    }
     // --- H4: pending traffic in room lifetime ------------------------------
 
     /// The draining-room refusals that must hold from the removal
@@ -1229,6 +1323,43 @@ mod tests {
         assert!(datagrams.iter().all(|(address, _)| *address == second));
         rt.finish_udp(listener, &room(), taken);
         assert!(!rt.rooms.contains_key(&room()));
+    }
+
+    #[test]
+    fn udp_removal_prefix_is_byte_exact_fifo() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+
+        // With the accept/waiting never drained, the timeout removal
+        // captures exactly them (plus anything the same tick still owed
+        // the peer), FIFO and unaltered.
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(31))
+            .expect("backdate the clock past the receive timeout");
+        rt.tick();
+        let (datagrams, _, taken) = rt.take_udp(listener, &room());
+        rt.finish_udp(listener, &room(), taken);
+        assert!(datagrams.len() >= 2, "the owed prefix is preserved");
+        assert!(datagrams.iter().all(|(address, _)| *address == from));
+        assert!(matches!(
+            decode_server(&datagrams[0].1, false),
+            ServerPacket::SynAccept(_)
+        ));
+        assert!(matches!(
+            decode_server(&datagrams[1].1, false),
+            ServerPacket::WaitingData(_)
+        ));
+        for (_, bytes) in &datagrams {
+            let (header, packet) = ServerPacket::decode(bytes, false).expect("decodes");
+            assert_eq!(
+                &packet.encode(header, false).expect("re-encodes"),
+                bytes,
+                "the captured datagram is byte-exact"
+            );
+        }
     }
 
     // --- H5: isolation effects delivered -----------------------------------

@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use doom_proto::RELIABLE_BIT;
 
-use crate::room::{HostEffect, RoomHost};
+use crate::room::{HostEffect, OwedPacket, RoomHost};
 use crate::server_role::{MalformedClass, Milliseconds};
 use crate::{JoinError, PlayerId, RoomName};
 
@@ -141,7 +141,7 @@ pub(crate) struct BindRoom {
     /// socket sends exactly its own peers' traffic. Bounded per removal
     /// by the removed peer's own bounded outbox; taken by the listener
     /// that owns it.
-    pub(crate) pending_udp: HashMap<ListenerId, VecDeque<(SocketAddr, Vec<u8>)>>,
+    pub(crate) pending_udp: HashMap<ListenerId, VecDeque<(SocketAddr, PendingUdp)>>,
     /// Removed `(listener, address)` pairs whose bounded pending batch
     /// has not yet been SENT by the listener. Not the live identity
     /// mapping: re-admission waits for the send attempt, and each entry
@@ -158,8 +158,19 @@ pub(crate) struct BindRoom {
 pub(crate) struct Connection {
     pub(crate) route: Option<RouteId>,
     pub(crate) waiter: Arc<Notify>,
-    /// The final binary frame owed to this peer before its close.
-    pub(crate) terminal: Option<Vec<u8>>,
+    /// Full binary frames still owed to this peer before its close:
+    /// the already-owed prefix (each frame with its own source route),
+    /// then the optional terminal frame, FIFO.
+    pub(crate) pending: VecDeque<Vec<u8>>,
+}
+
+/// One datagram owed to a removed UDP peer: the encoded bytes and,
+/// for host-produced packets, the production-time codec width the
+/// newest-suffix adaptation decodes with. Relay payloads and terminal
+/// packets carry no context and are never adapted.
+pub(crate) struct PendingUdp {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) lowres: Option<bool>,
 }
 
 /// The work a reduction batch produced, per transport, to perform
@@ -210,7 +221,7 @@ impl BindRoom {
         now: Milliseconds,
         player: PlayerId,
         payload: &[u8],
-    ) -> HostEffect {
+    ) -> HostEffect<RouteId> {
         match doom_proto::ClientPacket::decode(payload, self.host.lowres_turn()) {
             Ok((header, packet)) => self.host.packet(now, player, header, packet),
             Err(_) => self
@@ -246,14 +257,15 @@ impl BindRoom {
 
     /// Fold one reducer batch into transport state; the returned work
     /// is performed only after the mutex is released. WebSocket
-    /// terminal packets ride their connection as the final frame; UDP
-    /// removals deliver every already-owed datagram captured by the
-    /// reduction first and the terminal last through the bounded
-    /// pending queue, drop the address mapping in the same batch, and
-    /// wake the listener to send.
+    /// removals build the peer's final frame sequence from the
+    /// captured prefix (each packet keeping its own source route) and
+    /// the terminal; UDP removals deliver every already-owed datagram
+    /// captured by the reduction first and the terminal last through
+    /// the bounded pending queue, drop the address mapping in the same
+    /// batch, and wake the listener to send.
     pub(crate) fn apply(
         &mut self,
-        effect: HostEffect,
+        effect: HostEffect<RouteId>,
         udp_notifiers: &HashMap<ListenerId, Arc<Notify>>,
     ) -> Effects {
         let HostEffect {
@@ -262,7 +274,8 @@ impl BindRoom {
             removal_owed,
             ..
         } = effect;
-        let mut owed: HashMap<PlayerId, Vec<Vec<u8>>> = removal_owed.into_iter().collect();
+        let mut owed: HashMap<PlayerId, Vec<OwedPacket<RouteId>>> =
+            removal_owed.into_iter().collect();
         let mut effects = Effects::default();
         let notify_udp = |effects: &mut Effects, listener: ListenerId| {
             if let Some(notifier) = udp_notifiers.get(&listener)
@@ -281,11 +294,19 @@ impl BindRoom {
         }
         for (player, terminal) in disconnects {
             if let Some(connection) = self.connections.get_mut(&player) {
+                if let Some(packets) = owed.remove(&player) {
+                    for packet in packets {
+                        let mut frame = Vec::with_capacity(4 + packet.payload().len());
+                        frame.extend_from_slice(&packet.metadata().get().to_le_bytes());
+                        frame.extend_from_slice(packet.payload());
+                        connection.pending.push_back(frame);
+                    }
+                }
                 if let Some(terminal) = terminal {
                     let mut frame = Vec::with_capacity(4 + terminal.len());
                     frame.extend_from_slice(&SERVER_ROUTE.to_le_bytes());
                     frame.extend_from_slice(&terminal);
-                    connection.terminal = Some(frame);
+                    connection.pending.push_back(frame);
                 }
                 effects.ws_waiters.push(Arc::clone(&connection.waiter));
             } else if let Some(peer) = self.udp_players.remove(&player) {
@@ -293,14 +314,27 @@ impl BindRoom {
                 let mut captured = false;
                 if let Some(packets) = owed.remove(&player) {
                     let pending = self.pending_udp.entry(peer.listener).or_default();
-                    for bytes in packets {
-                        pending.push_back((peer.address, bytes));
+                    for packet in packets {
+                        let lowres = packet.lowres();
+                        pending.push_back((
+                            peer.address,
+                            PendingUdp {
+                                bytes: packet.into_payload(),
+                                lowres,
+                            },
+                        ));
                         captured = true;
                     }
                 }
                 if let Some(terminal) = terminal {
                     let pending = self.pending_udp.entry(peer.listener).or_default();
-                    pending.push_back((peer.address, terminal));
+                    pending.push_back((
+                        peer.address,
+                        PendingUdp {
+                            bytes: terminal,
+                            lowres: None,
+                        },
+                    ));
                     captured = true;
                 }
                 if captured {
@@ -360,7 +394,7 @@ impl Runtime {
             Connection {
                 route: None,
                 waiter,
-                terminal: None,
+                pending: VecDeque::new(),
             },
         );
         Ok((player, room.apply(effect, udp_notifiers)))
