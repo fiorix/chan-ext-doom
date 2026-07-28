@@ -9,6 +9,7 @@ license.workspace = true
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4.5", features = ["derive"] }
+doom-proto = { path = "../doom-proto" }
 futures-util = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
