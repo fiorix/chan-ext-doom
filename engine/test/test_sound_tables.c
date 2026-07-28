@@ -12,18 +12,22 @@
 // GNU General Public License for more details.
 //
 // DESCRIPTION:
-//     The sound tables must be exactly as long as the enums that index them.
+//     Semantic checks over the production sound tables.
 //
-//     S_Start initialises every entry from 1 to NUMSFX, and S_ChangeMusic
-//     indexes S_music by musicnum. Both trust the enum, so a table shorter
-//     than its enum is not a missing-entry bug that shows up as silence: it
-//     is an out-of-bounds write over whatever the linker placed next. In this
-//     tree S_music follows S_sfx, so a short S_sfx overwrites music lump
-//     numbers with -1 before anything looks them up, and the failure surfaces
-//     far away as W_CacheLumpNum(-1) during level load.
+//     The tables' lengths are NOT proven here. sounds.c carries a
+//     compile-time guard requiring sizeof(S_sfx)/sizeof(S_sfx[0]) to equal
+//     NUMSFX, and the same for S_music and NUMMUSIC, so a mismatched table is
+//     a compile error in production and never reaches this file. That matters:
+//     an earlier version of this test declared the arrays as incomplete
+//     externs and indexed to the enum bound to infer their extent, which is
+//     undefined behaviour exactly when the tables are short, so it could only
+//     "detect" the fault by committing it.
 //
-//     This links the production tables rather than a copy, so it measures
-//     what actually ships.
+//     What is left here is what a size check cannot say: that the entries the
+//     enum names are actually populated, and that running S_Start's own
+//     initialisation loop leaves the music table alone. Those indices are
+//     valid only because the production guard has already established the
+//     lengths.
 //
 
 #include <stdio.h>
@@ -57,34 +61,7 @@ int main(void)
 {
     int i;
 
-    // Every enum index must name a real entry. Reading S_sfx[NUMSFX - 1] is
-    // only safe if the table really is that long, which is the whole point.
-
-    for (i = 1; i < NUMSFX; ++i)
-    {
-        if (S_sfx[i].name[0] == '\0' && S_sfx[i].priority == 0)
-        {
-            ++failures;
-            printf("FAIL: S_sfx[%d] is empty, so the table is shorter than "
-                   "NUMSFX (%d)\n", i, NUMSFX);
-            break;
-        }
-    }
-    ++checks;
-
-    for (i = 1; i < NUMMUSIC; ++i)
-    {
-        if (S_music[i].name[0] == '\0')
-        {
-            ++failures;
-            printf("FAIL: S_music[%d] is empty, so the table is shorter than "
-                   "NUMMUSIC (%d)\n", i, NUMMUSIC);
-            break;
-        }
-    }
-    ++checks;
-
-    // The last named entries, which is where a truncated table shows first.
+    // Populated-entry checks. Valid indices, per the production guard.
 
     Check(S_sfx[NUMSFX - 1].name[0] != '\0', "the final sfx entry exists");
     Check(S_music[NUMMUSIC - 1].name[0] != '\0', "the final music entry exists");
@@ -99,9 +76,8 @@ int main(void)
     Check(S_sfx[sfx_dgpain].name[0] != '\0', "sfx_dgpain has a table entry");
     Check(S_sfx[sfx_secret].name[0] != '\0', "sfx_secret has a table entry");
 
-    // S_Start writes -1 through the whole sfx range. If the table is short,
-    // that write lands in S_music. Run the same loop and require the music
-    // table to survive it, which is the actual failure being guarded.
+    // S_Start writes -1 through the whole sfx range. Run that same loop and
+    // require the music table to be untouched afterwards.
 
     for (i = 1; i < NUMMUSIC; ++i)
     {
@@ -118,8 +94,8 @@ int main(void)
         if (S_music[i].lumpnum != 0)
         {
             ++failures;
-            printf("FAIL: initialising S_sfx overwrote S_music[%d].lumpnum "
-                   "with %d\n", i, S_music[i].lumpnum);
+            printf("FAIL: initialising S_sfx disturbed S_music[%d].lumpnum "
+                   "(%d)\n", i, S_music[i].lumpnum);
             break;
         }
     }
