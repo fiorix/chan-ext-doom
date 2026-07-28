@@ -1858,7 +1858,10 @@ impl ServerRole {
         }
     }
 
-    fn query_response(&self) -> ServerPacket {
+    /// The stateless query answer for this room's current state. The
+    /// binding answers a QUERY from an unmapped address with exactly
+    /// this, without admitting a peer or allocating any identity.
+    pub fn query_response(&self) -> ServerPacket {
         ServerPacket::QueryResponse(doom_proto::QueryData {
             version: SERVER_VERSION.to_vec(),
             server_state: match self.state {

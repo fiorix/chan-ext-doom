@@ -1,15 +1,12 @@
-//! WebSocket binding: named rooms over `/ws/{room}`, each backed by one
-//! transport-neutral [`RoomHost`] with its authoritative Rust server
-//! role. Route 1 is permanently owned by the Rust server in every room;
-//! the old in-band reset marker is deleted, not disabled.
+//! WebSocket binding: named rooms over `/ws/{room}`, sharing one
+//! [`crate::runtime::Runtime`] with every other transport. Route 1 is
+//! permanently owned by the Rust server in every room; the old in-band
+//! reset marker is deleted, not disabled.
 
 use std::collections::HashMap;
 use std::io;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
-
-use tokio::time::Instant;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -19,37 +16,38 @@ use axum::routing::get;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
-use doom_proto::{ClientPacket, RELIABLE_BIT};
+use crate::runtime::{Effects, Runtime, SharedState, timer_loop};
+use crate::{MAX_PAYLOAD_LEN, PlayerId, RelayError, RoomName};
 
-use crate::room::{HostEffect, RoomHost};
-use crate::server_role::{MalformedClass, Milliseconds};
-use crate::{JoinError, MAX_PAYLOAD_LEN, PlayerId, RelayError, RoomName};
+pub(crate) use crate::runtime::{RouteId, SERVER_ROUTE};
+
+#[cfg(test)]
+pub(crate) use crate::runtime::{OLD_SYN_MAGIC, classify_malformed};
+#[cfg(test)]
+pub(crate) use crate::server_role::MalformedClass;
+#[cfg(test)]
+pub(crate) use tokio::sync::Mutex;
+#[cfg(test)]
+pub(crate) use tokio::time::Instant;
 
 const INBOUND_HEADER_LEN: usize = 8;
 const OUTBOUND_HEADER_LEN: usize = 4;
-/// Route 1 is permanently owned by the Rust server in every room.
-const SERVER_ROUTE: u32 = 1;
-/// The pre-3.0 SYN magic: the one malformed case with a source-backed
-/// rejection.
-const OLD_SYN_MAGIC: u32 = 3_436_803_284;
-/// The runtime timer period driving every live room role.
-const TIMER_PERIOD: Duration = Duration::from_millis(50);
 
 /// Maximum accepted WebSocket binary-frame size.
 pub const MAX_INBOUND_FRAME_LEN: usize = INBOUND_HEADER_LEN + MAX_PAYLOAD_LEN;
 
+type ServerState = SharedState;
+
 /// Serves named rooms at `/ws/{room}` until the listener shuts down.
 pub async fn serve(listener: TcpListener, outbox_capacity: NonZeroUsize) -> io::Result<()> {
-    let state = ServerState(Arc::new(Mutex::new(Runtime {
+    let state = SharedState(Arc::new(tokio::sync::Mutex::new(Runtime {
         rooms: HashMap::new(),
         outbox_capacity,
-        started: Instant::now(),
+        started: tokio::time::Instant::now(),
     })));
-    let router = Router::new()
-        .route("/ws/{room}", get(upgrade))
-        .with_state(state.clone());
+    let router = router(state.clone());
 
     // The timer's lifetime is the serve future's: neither future is
     // detached, so aborting or dropping `serve` drops both.
@@ -60,149 +58,14 @@ pub async fn serve(listener: TcpListener, outbox_capacity: NonZeroUsize) -> io::
     }
 }
 
-#[derive(Clone)]
-struct ServerState(Arc<Mutex<Runtime>>);
-
-struct Runtime {
-    rooms: HashMap<RoomName, WsRoom>,
-    outbox_capacity: NonZeroUsize,
-    started: Instant,
-}
-
-struct WsRoom {
-    host: RoomHost<RouteId>,
-    connections: HashMap<PlayerId, Connection>,
-    routes: HashMap<RouteId, PlayerId>,
-}
-
-struct Connection {
-    route: Option<RouteId>,
-    waiter: Arc<Notify>,
-    /// The final binary frame owed to this peer before its close.
-    terminal: Option<Vec<u8>>,
-}
-
-impl WsRoom {
-    /// Fold one reducer batch into connection state; the returned
-    /// waiters are notified only after the mutex is released.
-    fn apply(&mut self, effect: HostEffect) -> Vec<Arc<Notify>> {
-        let mut waiters = Vec::new();
-        for player in effect.wakes {
-            if let Some(connection) = self.connections.get(&player) {
-                waiters.push(Arc::clone(&connection.waiter));
-            }
-        }
-        for (player, terminal) in effect.disconnects {
-            if let Some(connection) = self.connections.get_mut(&player) {
-                if let Some(terminal) = terminal {
-                    let mut frame = Vec::with_capacity(OUTBOUND_HEADER_LEN + terminal.len());
-                    frame.extend_from_slice(&SERVER_ROUTE.to_le_bytes());
-                    frame.extend_from_slice(&terminal);
-                    connection.terminal = Some(frame);
-                }
-                waiters.push(Arc::clone(&connection.waiter));
-            }
-        }
-        waiters
-    }
+/// The WebSocket router over the shared runtime state.
+pub(crate) fn router(state: SharedState) -> Router {
+    Router::new()
+        .route("/ws/{room}", get(upgrade))
+        .with_state(state)
 }
 
 impl Runtime {
-    fn now(&self) -> Milliseconds {
-        Milliseconds(self.started.elapsed().as_millis() as u64)
-    }
-
-    fn join(
-        &mut self,
-        room_name: RoomName,
-        waiter: Arc<Notify>,
-    ) -> Result<(PlayerId, Vec<Arc<Notify>>), JoinError> {
-        let capacity = self.outbox_capacity;
-        let now = self.now();
-        let room = self
-            .rooms
-            .entry(room_name)
-            .or_insert_with_key(|room_name| WsRoom {
-                host: RoomHost::new(
-                    room_name.clone(),
-                    capacity,
-                    RouteId::new(SERVER_ROUTE).expect("the server route is nonzero"),
-                ),
-                connections: HashMap::new(),
-                routes: HashMap::new(),
-            });
-        let (player, effect) = room
-            .host
-            .join(now, |player| format!("ws:{}", player.get()).into_bytes())?;
-        room.connections.insert(
-            player,
-            Connection {
-                route: None,
-                waiter,
-                terminal: None,
-            },
-        );
-        Ok((player, room.apply(effect)))
-    }
-
-    fn handle_envelope(
-        &mut self,
-        room_name: &RoomName,
-        player_id: PlayerId,
-        envelope: WireEnvelope<'_>,
-    ) -> Result<Vec<Arc<Notify>>, BindingError> {
-        // Route 1 is permanently server-owned: a client source of 1 is
-        // rejected before any route, packet, or third-party effect, and
-        // only that connection closes. The exact old reset marker is
-        // nothing more than this forbidden source.
-        if envelope.from.get() == SERVER_ROUTE {
-            return Err(BindingError::ServerRoute);
-        }
-        self.bind_source(room_name, player_id, envelope.from)?;
-        let Some(destination) = envelope.to else {
-            // Registration-only traffic never reaches the role.
-            return Ok(Vec::new());
-        };
-        if destination.get() == SERVER_ROUTE {
-            return Ok(self.server_payload(room_name, player_id, envelope.payload));
-        }
-
-        let Some(recipient) = self.recipient(room_name, destination) else {
-            return Ok(Vec::new());
-        };
-        let now = self.now();
-        let room = self
-            .rooms
-            .get_mut(room_name)
-            .ok_or(BindingError::UnknownPlayer)?;
-        let (_, effect) =
-            room.host
-                .relay(now, player_id, recipient, envelope.from, envelope.payload)?;
-        Ok(room.apply(effect))
-    }
-
-    /// One payload addressed to the room's server: decode only as a
-    /// client packet with the room's authoritative width; undecodable
-    /// bytes are classified narrowly and the role decides by peer state.
-    fn server_payload(
-        &mut self,
-        room_name: &RoomName,
-        player_id: PlayerId,
-        payload: &[u8],
-    ) -> Vec<Arc<Notify>> {
-        let now = self.now();
-        let Some(room) = self.rooms.get_mut(room_name) else {
-            return Vec::new();
-        };
-        let effect = match ClientPacket::decode(payload, room.host.lowres_turn()) {
-            Ok((header, packet)) => room.host.packet(now, player_id, header, packet),
-            Err(_) => room
-                .host
-                .malformed(now, player_id, classify_malformed(payload)),
-        };
-        room.apply(effect)
-    }
-
     fn bind_source(
         &mut self,
         room_name: &RoomName,
@@ -238,68 +101,45 @@ impl Runtime {
         self.rooms.get(room_name)?.routes.get(&destination).copied()
     }
 
-    /// Transport hangup or binding-initiated removal: the room host's
-    /// own initiator contract decides between exactly one `Leave` and
-    /// an inert cleanup; this method only removes the transport state
-    /// around it, and the room is dropped once it holds neither members
-    /// nor connections.
-    fn leave(&mut self, room_name: &RoomName, player_id: PlayerId) -> Vec<Arc<Notify>> {
-        let mut waiters = Vec::new();
-        let now = self.now();
-        let Some(room) = self.rooms.get_mut(room_name) else {
-            return waiters;
+    fn handle_envelope(
+        &mut self,
+        room_name: &RoomName,
+        player_id: PlayerId,
+        envelope: WireEnvelope<'_>,
+    ) -> Result<Effects, BindingError> {
+        // Route 1 is permanently server-owned: a client source of 1 is
+        // rejected before any route, packet, or third-party effect, and
+        // only that connection closes. The exact old reset marker is
+        // nothing more than this forbidden source.
+        if envelope.from.get() == SERVER_ROUTE {
+            return Err(BindingError::ServerRoute);
+        }
+        self.bind_source(room_name, player_id, envelope.from)?;
+        let Some(destination) = envelope.to else {
+            // Registration-only traffic never reaches the role.
+            return Ok(Effects::default());
         };
-        let effect = room.host.leave(now, player_id);
-        waiters.extend(room.apply(effect));
-        if let Some(connection) = room.connections.remove(&player_id) {
-            if let Some(route) = connection.route {
-                room.routes.remove(&route);
-            }
-            waiters.push(connection.waiter);
+        if destination.get() == SERVER_ROUTE {
+            let now = self.now();
+            let Some(room) = self.rooms.get_mut(room_name) else {
+                return Ok(Effects::default());
+            };
+            let effect = room.server_payload(now, player_id, envelope.payload);
+            return Ok(room.apply(effect));
         }
-        if room.host.is_empty() && room.connections.is_empty() {
-            self.rooms.remove(room_name);
-        }
-        waiters
-    }
 
-    /// One bounded timer drives every live room role with monotonic
-    /// elapsed milliseconds, through the same reducer and notifier path
-    /// as packet actions.
-    fn tick(&mut self) -> Vec<Arc<Notify>> {
-        let now = self.now();
-        let mut waiters = Vec::new();
-        let mut empty = Vec::new();
-        for (room_name, room) in &mut self.rooms {
-            let effect = room.host.tick(now);
-            waiters.extend(room.apply(effect));
-            if room.host.is_empty() && room.connections.is_empty() {
-                empty.push(room_name.clone());
-            }
-        }
-        for room_name in empty {
-            self.rooms.remove(&room_name);
-        }
-        waiters
-    }
-}
-
-async fn timer_loop(state: ServerState) {
-    let mut interval = tokio::time::interval(TIMER_PERIOD);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Executor starvation or a suspended process must not become an
-    // unbounded catch-up burst: missed ticks are skipped, while the
-    // role clock still sees the real jump through monotonic elapsed
-    // milliseconds.
-    loop {
-        interval.tick().await;
-        let waiters = {
-            let mut runtime = state.0.lock().await;
-            runtime.tick()
+        let Some(recipient) = self.recipient(room_name, destination) else {
+            return Ok(Effects::default());
         };
-        for waiter in waiters {
-            waiter.notify_one();
-        }
+        let now = self.now();
+        let room = self
+            .rooms
+            .get_mut(room_name)
+            .ok_or(BindingError::UnknownPlayer)?;
+        let (_, effect) =
+            room.host
+                .relay(now, player_id, recipient, envelope.from, envelope.payload)?;
+        Ok(room.apply(effect))
     }
 }
 
@@ -332,14 +172,14 @@ async fn upgrade(
 
 async fn session(socket: WebSocket, state: ServerState, room_name: RoomName) {
     let waiter = Arc::new(Notify::new());
-    let (player_id, join_waiters) = {
+    let (player_id, join_effects) = {
         let mut runtime = state.0.lock().await;
         match runtime.join(room_name.clone(), Arc::clone(&waiter)) {
             Ok(joined) => joined,
             Err(_) => return,
         }
     };
-    for waiter in join_waiters {
+    for waiter in join_effects.ws_waiters {
         waiter.notify_one();
     }
 
@@ -362,11 +202,14 @@ async fn session(socket: WebSocket, state: ServerState, room_name: RoomName) {
         }
     }
 
-    let leave_waiters = {
+    let leave_effects = {
         let mut runtime = state.0.lock().await;
         runtime.leave(&room_name, player_id)
     };
-    for waiter in leave_waiters {
+    for waiter in leave_effects.ws_waiters {
+        waiter.notify_one();
+    }
+    for waiter in leave_effects.udp_waiters {
         waiter.notify_one();
     }
 
@@ -392,15 +235,18 @@ async fn read_loop(
                 let Ok(envelope) = decode_inbound(&frame) else {
                     return;
                 };
-                let waiters = {
+                let effects = {
                     let mut runtime = state.0.lock().await;
                     match runtime.handle_envelope(&room_name, player_id, envelope) {
-                        Ok(waiters) => waiters,
+                        Ok(effects) => effects,
                         // A binding rejection closes only this connection.
                         Err(_) => return,
                     }
                 };
-                for waiter in waiters {
+                for waiter in effects.ws_waiters {
+                    waiter.notify_one();
+                }
+                for waiter in effects.udp_waiters {
                     waiter.notify_one();
                 }
             }
@@ -464,22 +310,6 @@ async fn write_loop(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct RouteId(NonZeroU32);
-
-impl RouteId {
-    const fn new(value: u32) -> Option<Self> {
-        match NonZeroU32::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-
-    const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WireEnvelope<'a> {
     to: Option<RouteId>,
@@ -520,32 +350,6 @@ fn decode_inbound(frame: &[u8]) -> Result<WireEnvelope<'_>, DecodeError> {
     })
 }
 
-/// Classify undecodable server-addressed bytes narrowly: a SYN-shaped
-/// type with the pinned pre-3.0 magic is the one case with a
-/// source-backed rejection; other SYN shapes are plain malformed SYNs;
-/// anything else is established-peer noise. Truncation and unsupported
-/// types never panic and never produce a generic rejection.
-fn classify_malformed(payload: &[u8]) -> MalformedClass {
-    let Some(type_bytes) = payload.get(..2) else {
-        return MalformedClass::Established;
-    };
-    // Protocol header words are big-endian on the wire.
-    let word = u16::from_be_bytes(type_bytes.try_into().expect("two bytes"));
-    if word & !RELIABLE_BIT != 0 {
-        return MalformedClass::Established;
-    }
-    // SYN-shaped: the magic follows the type word and the reliable
-    // sequence byte when present.
-    let offset = if word & RELIABLE_BIT != 0 { 3 } else { 2 };
-    let magic = payload
-        .get(offset..offset + 4)
-        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("four bytes")));
-    match magic {
-        Some(OLD_SYN_MAGIC) => MalformedClass::Syn { old_magic: true },
-        _ => MalformedClass::Syn { old_magic: false },
-    }
-}
-
 fn encode_outbound(packet: crate::OutboundPacket<RouteId>) -> Vec<u8> {
     let mut frame = Vec::with_capacity(OUTBOUND_HEADER_LEN + packet.payload().len());
     frame.extend_from_slice(&packet.metadata().get().to_le_bytes());
@@ -558,7 +362,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use doom_proto::{ConnectData, GameSettings, ServerPacket, Syn, TiccmdDiff, WireHeader};
+    use doom_proto::{
+        ClientPacket, ConnectData, GameSettings, ServerPacket, Syn, TiccmdDiff, WireHeader,
+    };
     use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -649,10 +455,14 @@ mod tests {
         // Normal cleanup removes the admitted offender with its one
         // external Leave; a pre-SYN member's removal is quiet for
         // everyone else (no abort, broadcast, or game-end effect).
-        let waiters = runtime.leave(&room(), offender);
-        assert!(!waiters.is_empty(), "the offender's writer is woken");
+        let effects = runtime.leave(&room(), offender);
         assert!(
-            waiters
+            !effects.ws_waiters.is_empty(),
+            "the offender's writer is woken"
+        );
+        assert!(
+            effects
+                .ws_waiters
                 .iter()
                 .all(|waiter| Arc::ptr_eq(waiter, &offender_waiter)),
             "the cleanup is quiet for the bystander"
@@ -1223,7 +1033,7 @@ mod tests {
             while room.host.pop_outbound(player).is_some() {}
         }
 
-        let state = ServerState(Arc::new(Mutex::new(runtime)));
+        let state = SharedState(Arc::new(Mutex::new(runtime)));
         let timer = tokio::spawn(timer_loop(state.clone()));
         // The interval exists and has ticked once; drain that pass.
         tokio::task::yield_now().await;

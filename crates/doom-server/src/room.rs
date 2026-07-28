@@ -85,6 +85,12 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         self.role.lowres_turn()
     }
 
+    /// The stateless query answer for the room's current state; no
+    /// peer, identity, or retention is created for the querier.
+    pub fn query_response(&self) -> doom_proto::ServerPacket {
+        self.role.query_response()
+    }
+
     /// Admission: bounded registry membership first, then exactly one
     /// `Input::Join`; a failed admission never reaches the role. The
     /// label is volatile lobby metadata computed from the new id.
