@@ -64,7 +64,8 @@ pub enum DecodeError {
         count: usize,
         max: usize,
     },
-    /// A field value the protocol does not allow.
+    /// A field value the protocol does not allow, including reliable
+    /// framing that the type does not carry in this direction.
     InvalidValue { field: &'static str },
 }
 
@@ -88,6 +89,21 @@ pub enum EncodeError {
         count: usize,
         max: usize,
     },
+    /// A field value the protocol does not allow, including reliable
+    /// framing that the type does not carry, an unsorted or duplicated
+    /// player index, a low-resolution turn that is not a multiple of
+    /// 256, or half of an atomic field pair.
+    InvalidValue { field: &'static str },
+}
+
+/// Reliable framing matrix, per direction: these and only these types
+/// travel as reliable packets in Chocolate 3.1.1.
+fn reliable_type_c2s(type_id: u16) -> bool {
+    matches!(type_id, 5 | 15) // GAMESTART, LAUNCH
+}
+
+fn reliable_type_s2c(type_id: u16) -> bool {
+    matches!(type_id, 0 | 5 | 12 | 15) // SYN accept, GAMESTART, CONSOLE_MESSAGE, LAUNCH
 }
 
 fn printable(bytes: &[u8]) -> bool {
@@ -500,7 +516,32 @@ impl TiccmdDiff {
         Ok(d)
     }
 
-    fn encode(&self, w: &mut Writer, lowres_turn: bool) {
+    fn encode(&self, w: &mut Writer, lowres_turn: bool) -> Result<(), EncodeError> {
+        // A low-resolution turn is written as one byte (value / 256), so
+        // anything that is not an exact multiple of 256 would silently
+        // lose precision instead of round-tripping. The quotient of any
+        // i16 that is a multiple of 256 always fits i8.
+        if lowres_turn
+            && let Some(v) = self.turn
+            && v % 256 != 0
+        {
+            return Err(EncodeError::InvalidValue {
+                field: "ticdiff.turn_lowres",
+            });
+        }
+        // The Raven and Strife masks each carry a pair of fields, so a
+        // half-populated pair has no wire form and must not be written.
+        if self.lookfly.is_some() != self.arti.is_some() {
+            return Err(EncodeError::InvalidValue {
+                field: "ticdiff.raven_pair",
+            });
+        }
+        if self.buttons2.is_some() != self.inventory.is_some() {
+            return Err(EncodeError::InvalidValue {
+                field: "ticdiff.strife_pair",
+            });
+        }
+
         let mut mask = 0u8;
         if self.forward.is_some() {
             mask |= DIFF_FORWARD;
@@ -520,10 +561,10 @@ impl TiccmdDiff {
         if self.chatchar.is_some() {
             mask |= DIFF_CHATCHAR;
         }
-        if self.lookfly.is_some() || self.arti.is_some() {
+        if self.lookfly.is_some() {
             mask |= DIFF_RAVEN;
         }
-        if self.buttons2.is_some() || self.inventory.is_some() {
+        if self.buttons2.is_some() {
             mask |= DIFF_STRIFE;
         }
         w.u8(mask);
@@ -549,14 +590,15 @@ impl TiccmdDiff {
         if let Some(v) = self.chatchar {
             w.u8(v);
         }
-        if self.lookfly.is_some() || self.arti.is_some() {
-            w.u8(self.lookfly.unwrap_or(0));
-            w.u8(self.arti.unwrap_or(0));
+        if let Some(lookfly) = self.lookfly {
+            w.u8(lookfly);
+            w.u8(self.arti.expect("raven pair checked"));
         }
-        if self.buttons2.is_some() || self.inventory.is_some() {
-            w.u8(self.buttons2.unwrap_or(0));
-            w.u16(self.inventory.unwrap_or(0));
+        if let Some(buttons2) = self.buttons2 {
+            w.u8(buttons2);
+            w.u16(self.inventory.expect("strife pair checked"));
         }
+        Ok(())
     }
 }
 
@@ -622,6 +664,40 @@ fn split_header(r: &mut Reader<'_>) -> Result<(u16, WireHeader), DecodeError> {
     Ok((word & !RELIABLE_BIT, WireHeader { reliable_seq }))
 }
 
+/// Enforce the reliable framing matrix: the listed types per direction
+/// must be reliable, and every other supported type must be plain.
+/// Applied on both decode and encode.
+fn check_framing(type_id: u16, header: WireHeader, c2s: bool) -> Result<(), DecodeError> {
+    let required = if c2s {
+        reliable_type_c2s(type_id)
+    } else {
+        reliable_type_s2c(type_id)
+    };
+    if required == header.reliable_seq.is_some() {
+        Ok(())
+    } else {
+        Err(DecodeError::InvalidValue {
+            field: "header.reliable",
+        })
+    }
+}
+
+/// The same matrix as an encode-side error.
+fn check_framing_encode(type_id: u16, header: WireHeader, c2s: bool) -> Result<(), EncodeError> {
+    let required = if c2s {
+        reliable_type_c2s(type_id)
+    } else {
+        reliable_type_s2c(type_id)
+    };
+    if required == header.reliable_seq.is_some() {
+        Ok(())
+    } else {
+        Err(EncodeError::InvalidValue {
+            field: "header.reliable",
+        })
+    }
+}
+
 /// Client-to-server packets (c2s).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientPacket {
@@ -671,6 +747,7 @@ impl ClientPacket {
     pub fn decode(bytes: &[u8], lowres_turn: bool) -> Result<(WireHeader, Self), DecodeError> {
         let mut r = Reader::new(bytes);
         let (type_id, header) = split_header(&mut r)?;
+        check_framing(type_id, header, true)?;
         let packet = match type_id {
             0 => {
                 let magic = r.u32("syn.magic")?;
@@ -738,6 +815,7 @@ impl ClientPacket {
     /// Encode to exact wire bytes with the given framing. `lowres_turn`
     /// must match the session's GAMESTART setting for `GAMEDATA`.
     pub fn encode(&self, header: WireHeader, lowres_turn: bool) -> Result<Vec<u8>, EncodeError> {
+        check_framing_encode(self.type_id(), header, true)?;
         let mut w = Writer::new();
         w.u16(
             self.type_id()
@@ -787,12 +865,19 @@ impl ClientPacket {
             | ClientPacket::Query => {}
             ClientPacket::GameStart(settings) => settings.encode(&mut w)?,
             ClientPacket::GameData(data) => {
+                if data.tics.len() > u8::MAX as usize {
+                    return Err(EncodeError::CountOutOfRange {
+                        field: "gamedata.tics",
+                        count: data.tics.len(),
+                        max: u8::MAX as usize,
+                    });
+                }
                 w.u8(data.ack);
                 w.u8(data.start);
                 w.u8(data.tics.len() as u8);
                 for tic in &data.tics {
                     w.s16(tic.latency);
-                    tic.diff.encode(&mut w, lowres_turn);
+                    tic.diff.encode(&mut w, lowres_turn)?;
                 }
             }
             ClientPacket::GameDataAck { ack } => w.u8(*ack),
@@ -849,6 +934,7 @@ impl ServerPacket {
     pub fn decode(bytes: &[u8], lowres_turn: bool) -> Result<(WireHeader, Self), DecodeError> {
         let mut r = Reader::new(bytes);
         let (type_id, header) = split_header(&mut r)?;
+        check_framing(type_id, header, false)?;
         let packet = match type_id {
             0 => {
                 let version = r.nul_string("syn_accept.version", None, true)?.to_vec();
@@ -978,6 +1064,7 @@ impl ServerPacket {
     /// Encode to exact wire bytes with the given framing. `lowres_turn`
     /// must match the session's GAMESTART setting for `GAMEDATA`.
     pub fn encode(&self, header: WireHeader, lowres_turn: bool) -> Result<Vec<u8>, EncodeError> {
+        check_framing_encode(self.type_id(), header, false)?;
         let mut w = Writer::new();
         w.u16(
             self.type_id()
@@ -1033,11 +1120,25 @@ impl ServerPacket {
             }
             ServerPacket::GameStart(settings) => settings.encode(&mut w)?,
             ServerPacket::GameData(data) => {
-                w.u8(data.start);
-                w.u8(data.tics.len() as u8);
+                if data.tics.len() > u8::MAX as usize {
+                    return Err(EncodeError::CountOutOfRange {
+                        field: "gamedata.tics",
+                        count: data.tics.len(),
+                        max: u8::MAX as usize,
+                    });
+                }
+                // The wire mask carries no order, so the decoder assigns
+                // diffs to players in ascending index order. An unsorted
+                // or duplicated index would silently bind a diff to the
+                // wrong player; reject before writing any bytes.
                 for tic in &data.tics {
-                    w.s16(tic.latency);
-                    let mut mask = 0u8;
+                    for pair in tic.players.windows(2) {
+                        if pair[0].0 >= pair[1].0 {
+                            return Err(EncodeError::InvalidValue {
+                                field: "gamedata.players",
+                            });
+                        }
+                    }
                     for (index, _) in &tic.players {
                         if *index >= NET_MAXPLAYERS as u8 {
                             return Err(EncodeError::CountOutOfRange {
@@ -1046,11 +1147,19 @@ impl ServerPacket {
                                 max: NET_MAXPLAYERS,
                             });
                         }
+                    }
+                }
+                w.u8(data.start);
+                w.u8(data.tics.len() as u8);
+                for tic in &data.tics {
+                    w.s16(tic.latency);
+                    let mut mask = 0u8;
+                    for (index, _) in &tic.players {
                         mask |= 1 << index;
                     }
                     w.u8(mask);
                     for (_, diff) in &tic.players {
-                        diff.encode(&mut w, lowres_turn);
+                        diff.encode(&mut w, lowres_turn)?;
                     }
                 }
             }
