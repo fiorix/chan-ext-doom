@@ -133,8 +133,9 @@ The end-to-end browser invariant is bilateral agreement at the same exit: both p
 
 ## References
 
-- `chan-doom:team/roadmap/v0.80.0/doom-multiplayer.md`: grounding and acceptance analysis.
-- `chan:crates/chan-server/resources/doom/README.md`: bundle build and provenance model.
+- [`../roadmap/doom-multiplayer.md`](../roadmap/doom-multiplayer.md): superseded grounding analysis that produced this design.
+- [`../roadmap/design-review-2026-07-27.md`](../roadmap/design-review-2026-07-27.md): accepted decision audit for this design.
+- [`../roadmap/doom-overlay-remote-protocol.md`](../roadmap/doom-overlay-remote-protocol.md): registered future chan integration item.
 - https://github.com/cloudflare/doom-wasm: browser multiplayer precedent.
 - https://blog.cloudflare.com/doom-multiplayer-workers/: room-router precedent.
 - https://github.com/rojo2/wasm-doom: engine base.
