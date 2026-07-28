@@ -86,6 +86,19 @@ impl Harness {
         self.role.handle(Milliseconds(T0.0 + ms), Input::Timer)
     }
 
+    /// Acknowledge the current head: the exact-head ACK pops it and emits
+    /// the next head immediately (pinned semantics).
+    fn ack(&mut self, player: PlayerId, next_seq: u8) -> Vec<Action> {
+        self.role.handle(
+            T0,
+            Input::Packet {
+                player,
+                header: WireHeader { reliable_seq: None },
+                packet: ClientPacket::ReliableAck { next_seq },
+            },
+        )
+    }
+
     fn sends_to(actions: &[Action], player: PlayerId) -> Vec<&Action> {
         actions
             .iter()
@@ -162,10 +175,10 @@ fn is_syn_accept(action: &Action) -> bool {
 
 fn is_reject_with(action: &Action, text: &[u8]) -> bool {
     match action {
-        Action::Send {
-            packet: ServerPacket::Rejected { reason },
+        Action::Disconnect {
+            terminal: Some(terminal),
             ..
-        } => reason.as_slice() == text,
+        } => matches!(&terminal.1, ServerPacket::Rejected { reason } if reason.as_slice() == text),
         _ => false,
     }
 }
@@ -193,7 +206,23 @@ fn one_player_accept_waitdata_and_cadence() {
     }
     assert_eq!(h.role.controller(), Some(alice));
 
-    // No lobby update before the cadence elapses.
+    // Pinned first-update behavior: the first personalized WAITING_DATA
+    // leaves in the same pump as the accept, right after it.
+    let first_updates: Vec<_> = actions
+        .iter()
+        .filter(|a| {
+            matches!(
+                a,
+                Action::Send {
+                    packet: ServerPacket::WaitingData(_),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(first_updates.len(), 1);
+
+    // No further lobby update before the cadence elapses.
     assert!(h.tick(1000).is_empty());
     let actions = h.tick(1001);
     let updates: Vec<_> = actions
@@ -305,8 +334,8 @@ fn no_common_protocol_rejected() {
     );
     assert!(actions.iter().any(|a| matches!(
         a,
-        Action::Send {
-            packet: ServerPacket::Rejected { .. },
+        Action::Disconnect {
+            terminal: Some(_),
             ..
         }
     )));
@@ -329,10 +358,11 @@ fn old_magic_gets_source_backed_reject() {
             class: MalformedClass::Syn { old_magic: true },
         },
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::Send {
-        packet: ServerPacket::Rejected { reason },
+    assert!(actions.iter().any(|a| matches!(a, Action::Disconnect {
+        terminal: Some(terminal),
         ..
-    } if reason.starts_with(b"You are using an old client version"))));
+    } if matches!(&terminal.1, ServerPacket::Rejected { reason }
+        if reason.starts_with(b"You are using an old client version")))));
     // Other malformed classes drop silently.
     let bob = h.join("b");
     assert!(
@@ -461,10 +491,11 @@ fn drone_first_is_rejected_like_upstream() {
             packet: ClientPacket::Syn(syn_value("Observer", 0, 0, 1)),
         },
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::Send {
-        packet: ServerPacket::Rejected { reason },
+    assert!(actions.iter().any(|a| matches!(a, Action::Disconnect {
+        terminal: Some(terminal),
         ..
-    } if reason.starts_with(b"Game mismatch:"))));
+    } if matches!(&terminal.1, ServerPacket::Rejected { reason }
+        if reason.starts_with(b"Game mismatch:")))));
 }
 
 // --- LAUNCH and GAMESTART ----------------------------------------------------
@@ -491,31 +522,33 @@ fn launch_only_from_controller_and_broadcast() {
 
     let actions = h.launch(alice);
     assert_eq!(h.role.state(), ServerState::WaitingStart);
-    // Alice: the broadcast is her only reliable send; her LAUNCH also
-    // draws a plain-framed ReliableAck.
-    assert_eq!(Harness::reliable_sends_to(&actions, alice).len(), 1);
+    // Head-only delivery: the broadcast queues behind each client's
+    // unacked SYN accept, so nothing is emitted to anyone yet.
+    assert!(Harness::reliable_sends_to(&actions, alice).is_empty());
+    assert!(Harness::reliable_sends_to(&actions, bob).is_empty());
     assert!(actions.iter().any(|a| matches!(a, Action::Send {
         packet: ServerPacket::ReliableAck { next_seq: 1 },
         player,
         ..
     } if *player == alice)));
-    // Bob: just the broadcast.
-    assert_eq!(Harness::reliable_sends_to(&actions, bob).len(), 1);
-    match actions.iter().find(|a| {
-        matches!(
-            a,
-            Action::Send {
-                packet: ServerPacket::Launch { .. },
-                ..
-            }
-        )
-    }) {
-        Some(Action::Send {
+
+    // The exact-head ACK pops the accept and emits LAUNCH immediately,
+    // as the committed fixtures chain (accept seq 0, LAUNCH seq 1).
+    let emitted = h.ack(alice, 1);
+    assert_eq!(Harness::reliable_sends_to(&emitted, alice).len(), 1);
+    match Harness::reliable_sends_to(&emitted, alice)[0] {
+        Action::Send {
+            header,
             packet: ServerPacket::Launch { num_players },
             ..
-        }) => assert_eq!(*num_players, 2),
-        other => panic!("expected Launch, got {other:?}"),
+        } => {
+            assert_eq!(header.reliable_seq, Some(1));
+            assert_eq!(*num_players, 2);
+        }
+        other => panic!("expected Launch after ACK, got {other:?}"),
     }
+    let emitted = h.ack(bob, 1);
+    assert_eq!(Harness::reliable_sends_to(&emitted, bob).len(), 1);
 
     // A second LAUNCH (her next in-sequence value) is acknowledged but
     // ignored now that the state moved on: no broadcast, no transition.
@@ -539,14 +572,21 @@ fn controller_gamestart_is_authoritative_and_deathmatch_reaches_everyone() {
     h.syn(bob, "Bob");
     h.launch(alice);
 
+    h.ack(alice, 1);
+    h.ack(bob, 1);
     let _refresh = h.gamestart(alice, 1, 1);
     // Controller is the only ready one so far; no start yet, but a lobby
     // refresh reaches the ready peer.
     assert_eq!(h.role.state(), ServerState::WaitingStart);
     assert!(h.role.settings.is_some());
 
-    let actions = h.gamestart(bob, 0, 1);
+    let _ready = h.gamestart(bob, 0, 1);
     assert_eq!(h.role.state(), ServerState::InGame);
+    // The broadcast queues behind the LAUNCH head; the next ACKs release
+    // it, one GAMESTART per recipient.
+    let first = h.ack(alice, 2);
+    let second = h.ack(bob, 2);
+    let actions: Vec<_> = first.into_iter().chain(second).collect();
     let gamestarts: Vec<_> = actions
         .iter()
         .filter(|a| {
@@ -613,6 +653,8 @@ fn non_controller_gamestart_marks_ready_without_replacing_settings() {
     h.launch(alice);
 
     // Bob (not the controller) sends different settings first.
+    h.ack(alice, 1);
+    h.ack(bob, 1);
     let mut other = settings_value(0);
     other.map = 2;
     h.role.handle(
@@ -710,6 +752,12 @@ fn disconnect_during_start_aborts_and_cleans_drones() {
     h.launch(alice);
     assert_eq!(h.role.state(), ServerState::WaitingStart);
 
+    // Drain both reliable chains so the abort broadcast can emit.
+    h.ack(bob, 1);
+    h.ack(bob, 2);
+    h.ack(drone, 1);
+    h.ack(drone, 2);
+
     let actions: Vec<Action> = h.role.handle(T0, Input::Leave { player: alice });
     assert!(actions.iter().any(|a| matches!(a, Action::Send {
         packet: ServerPacket::ConsoleMessage { message },
@@ -717,16 +765,22 @@ fn disconnect_during_start_aborts_and_cleans_drones() {
     } if message.starts_with(b"Game startup aborted because player 'Alice'"))));
     assert!(actions.iter().any(|a| matches!(a, Action::GameEnded)));
     assert_eq!(h.role.state(), ServerState::WaitingLaunch);
-    // The leftover drone receives an initiated DISCONNECT.
+    // Pinned NET_SV_GameEnded: every survivor, player and drone alike,
+    // starts its initiated disconnect.
     assert!(actions.iter().any(|a| matches!(a, Action::Send {
         packet: ServerPacket::Disconnect,
         player,
         ..
     } if *player == drone)));
+    assert!(actions.iter().any(|a| matches!(a, Action::Send {
+        packet: ServerPacket::Disconnect,
+        player,
+        ..
+    } if *player == bob)));
 }
 
 #[test]
-fn remote_disconnect_is_acked_and_removed() {
+fn remote_disconnect_sleeps_five_seconds_with_duplicate_reack() {
     let mut h = Harness::new();
     let alice = h.join("a");
     h.syn(alice, "Alice");
@@ -745,6 +799,30 @@ fn remote_disconnect_is_acked_and_removed() {
             ..
         }
     )));
+    // The identity lingers: no removal yet, in case the ACK was lost.
+    assert_eq!(h.role.peer_count(), 1);
+
+    // A duplicate DISCONNECT is re-acknowledged.
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Disconnect,
+        },
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::Send {
+            packet: ServerPacket::DisconnectAck,
+            ..
+        }
+    )));
+    assert_eq!(h.role.peer_count(), 1);
+
+    // The identity is removed only after the sleep.
+    assert!(h.tick(4999).is_empty());
+    let actions = h.tick(5000);
     assert!(
         actions
             .iter()
@@ -891,6 +969,9 @@ fn reliable_cap_64_accepted_65_removes_without_allocating() {
         RELIABLE_CAP
     );
 
+    // Bob acknowledges his accept so the overflow broadcast can emit.
+    h.ack(bob, 1);
+
     // The 65th: the peer is removed, no entry is added, and the effect is
     // a bounded broadcast to the remaining peer.
     let mut actions = Vec::new();
@@ -904,6 +985,7 @@ fn reliable_cap_64_accepted_65_removes_without_allocating() {
     assert!(actions.iter().any(|a| matches!(a, Action::Disconnect {
         player,
         reason: DisconnectReason::ReliableOverflow,
+        ..
     } if *player == alice)));
     assert_eq!(h.role.peer_count(), 1);
     assert!(actions.iter().any(|a| matches!(a, Action::Send {
@@ -953,6 +1035,9 @@ fn timeout_removes_and_broadcasts_only_to_survivors() {
     let bob = h.join("b");
     h.syn(alice, "Alice");
     h.syn(bob, "Bob");
+
+    // Bob acknowledges his accept so the timeout broadcast can emit.
+    h.ack(bob, 1);
 
     // Alice goes silent for 30 s; Bob is still heard from.
     let actions = h.role.handle(
@@ -1191,7 +1276,7 @@ fn fixture_launch_and_gamestart_replay() {
         false,
     )
     .expect("fixture LAUNCH decodes");
-    let actions = h.role.handle(
+    h.role.handle(
         T0,
         Input::Packet {
             player: alice,
@@ -1200,7 +1285,11 @@ fn fixture_launch_and_gamestart_replay() {
         },
     );
     assert_eq!(h.role.state(), ServerState::WaitingStart);
-    match Harness::reliable_sends_to(&actions, alice)[0] {
+    // Head-only delivery: the broadcast queues behind the accept; the
+    // exact-head ACK releases it (accept seq 0, LAUNCH seq 1).
+    let emitted = h.ack(alice, 1);
+    assert_eq!(Harness::reliable_sends_to(&emitted, alice).len(), 1);
+    match Harness::reliable_sends_to(&emitted, alice)[0] {
         Action::Send {
             packet: ServerPacket::Launch { num_players },
             ..
@@ -1213,7 +1302,7 @@ fn fixture_launch_and_gamestart_replay() {
         false,
     )
     .expect("fixture GAMESTART decodes");
-    let actions = h.role.handle(
+    h.role.handle(
         T0,
         Input::Packet {
             player: alice,
@@ -1223,6 +1312,10 @@ fn fixture_launch_and_gamestart_replay() {
     );
     assert_eq!(h.role.state(), ServerState::InGame);
 
+    // The GAMESTART broadcast rides the chain: first the LAUNCH head,
+    // then the GAMESTART behind it.
+    h.ack(alice, 1);
+    let actions = h.ack(alice, 2);
     let gamestarts: Vec<_> = actions
         .iter()
         .filter(|a| {
@@ -1255,4 +1348,384 @@ fn fixture_launch_and_gamestart_replay() {
         }
         other => panic!("expected GameStart, got {other:?}"),
     }
+}
+
+// --- followup-8 correction regressions ----------------------------------------
+
+#[test]
+fn head_only_second_enqueue_waits_and_ack_emits_next() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+
+    // Behind the unacked accept, a broadcast queues silently.
+    let mut actions = Vec::new();
+    h.role.enqueue_reliable(
+        &mut actions,
+        alice,
+        ServerPacket::ConsoleMessage {
+            message: b"second".to_vec(),
+        },
+    );
+    assert!(Harness::reliable_sends_to(&actions, alice).is_empty());
+
+    // The exact-head ACK pops the accept and emits the queued message
+    // immediately, with its retry clock starting now.
+    let emitted = h.ack(alice, 1);
+    assert_eq!(Harness::reliable_sends_to(&emitted, alice).len(), 1);
+    match Harness::reliable_sends_to(&emitted, alice)[0] {
+        Action::Send { header, .. } => assert_eq!(header.reliable_seq, Some(1)),
+        other => panic!("expected next head after ACK, got {other:?}"),
+    }
+
+    // Losing the first send converges by head retry: the message comes
+    // back with the same sequence after the retry interval, and the
+    // queue never grows.
+    assert!(Harness::reliable_sends_to(&h.tick(1000), alice).is_empty());
+    let retried = h.tick(1001);
+    assert_eq!(Harness::reliable_sends_to(&retried, alice).len(), 1);
+    match Harness::reliable_sends_to(&retried, alice)[0] {
+        Action::Send { header, .. } => assert_eq!(header.reliable_seq, Some(1)),
+        other => panic!("expected head retry, got {other:?}"),
+    }
+    assert_eq!(
+        h.role
+            .peers
+            .get(&alice)
+            .expect("peer")
+            .reliable_outbox
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn gamestart_overflow_cannot_leave_ingame_with_zero_peers() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+
+    // Fill alice's FIFO to the cap through the internal path.
+    h.role
+        .peers
+        .get_mut(&alice)
+        .expect("peer")
+        .reliable_outbox
+        .clear();
+    for _ in 0..RELIABLE_CAP {
+        let mut sink = Vec::new();
+        h.role.enqueue_reliable(
+            &mut sink,
+            alice,
+            ServerPacket::ConsoleMessage {
+                message: b"fill".to_vec(),
+            },
+        );
+    }
+
+    // Drive to the start: the GAMESTART enqueue overflows, removes the
+    // only peer, and the transition must not complete.
+    h.launch(alice);
+    h.gamestart(alice, 1, 0);
+    assert_eq!(h.role.state(), ServerState::WaitingLaunch);
+    assert_eq!(h.role.peer_count(), 0);
+    assert_ne!(h.role.state(), ServerState::InGame);
+}
+
+#[test]
+fn presyn_member_neither_blocks_start_nor_marks_ready() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let bob = h.join("b");
+    h.syn(alice, "Alice");
+    // bob never sends SYN.
+
+    // bob's LAUNCH and GAMESTART are dropped as unknown-address traffic.
+    assert!(h.launch(bob).is_empty());
+    let actions = h.gamestart(bob, 0, 0);
+    assert!(actions.is_empty());
+    assert!(!h.role.peers.get(&bob).expect("peer").ready);
+    assert_eq!(h.role.controller(), Some(alice));
+
+    // Alice can launch and start alone: bob does not block the game.
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.gamestart(alice, 1, 0);
+    assert_eq!(h.role.state(), ServerState::InGame);
+
+    // bob's pre-SYN leave carries no abort or game-end effects.
+    let actions: Vec<Action> = h.role.handle(T0, Input::Leave { player: bob });
+    assert!(!actions.iter().any(|a| matches!(a, Action::GameEnded)));
+    assert_eq!(h.role.state(), ServerState::InGame);
+}
+
+#[test]
+fn no_non_disconnect_traffic_while_disconnecting() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let drone = h.join("d");
+    h.syn(alice, "Alice");
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn_value("Observer", 0, 0, 1)),
+        },
+    );
+
+    // End the game: the drone is disconnecting. Nothing but DISCONNECT
+    // retries may reach it afterwards.
+    h.role.handle(T0, Input::Leave { player: alice });
+    for step in 1..8 {
+        let actions = h.tick(1001 * step);
+        for action in &actions {
+            if let Action::Send { packet, player, .. } = action
+                && *player == drone
+            {
+                assert!(
+                    matches!(packet, ServerPacket::Disconnect),
+                    "only DISCONNECT may reach a disconnecting peer, got {packet:?}"
+                );
+            }
+        }
+        if h.role.peer_count() == 0 {
+            break;
+        }
+    }
+
+    // Its own packets do not restart protocol effects either.
+    assert!(h.launch(drone).is_empty());
+}
+
+#[test]
+fn heretic_episode_exceptions_and_boundaries() {
+    assert!(valid_episode_map(6, 1, 4, 1), "registered heretic E4M1");
+    assert!(!valid_episode_map(6, 1, 4, 2), "E4M2 is not valid");
+    assert!(valid_episode_map(6, 3, 6, 1), "retail heretic E6M1");
+    assert!(valid_episode_map(6, 3, 6, 2), "E6M2");
+    assert!(valid_episode_map(6, 3, 6, 3), "E6M3");
+    assert!(!valid_episode_map(6, 3, 6, 4), "E6M4 is not valid");
+    // The exceptions do not leak into doom.
+    assert!(!valid_episode_map(0, 1, 4, 1), "doom registered has no E4");
+}
+
+#[test]
+fn drone_lowres_does_not_force_player_settings() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let drone = h.join("d");
+    h.syn(alice, "Alice");
+    // The drone records lowres; no player does.
+    let mut drone_syn = syn_value("Observer", 0, 0, 1);
+    drone_syn.connect.lowres_turn = 1;
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: drone,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(drone_syn),
+        },
+    );
+
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.ack(drone, 1);
+    h.ack(drone, 2);
+    h.gamestart(alice, 1, 0);
+    let settings = h.role.settings.clone().expect("settings adopted");
+    assert_eq!(
+        settings.lowres_turn, 0,
+        "a drone's lowres must not force settings"
+    );
+
+    // A lowres player does force it.
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let mut syn = syn_value("Alice", 0, 0, 0);
+    syn.connect.lowres_turn = 1;
+    h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn),
+        },
+    );
+    h.launch(alice);
+    h.ack(alice, 1);
+    h.gamestart(alice, 1, 0);
+    let settings = h.role.settings.clone().expect("settings adopted");
+    assert_eq!(settings.lowres_turn, 1);
+}
+
+#[test]
+fn every_plain_send_resets_the_keepalive_idle() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+
+    // Acknowledge the accept first so no retry is pending.
+    h.ack(alice, 1);
+
+    // A query at +900 ms sends a plain response, resetting send-idle.
+    let actions = h.role.handle(
+        Milliseconds(T0.0 + 900),
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Query,
+        },
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::Send {
+            packet: ServerPacket::QueryResponse(_),
+            ..
+        }
+    )));
+
+    // At +1001 ms no keepalive may fire: the last send was 101 ms ago.
+    let actions = h.tick(1001);
+    assert!(!actions.iter().any(|a| matches!(a, Action::Send {
+        packet: ServerPacket::Keepalive,
+        player,
+        ..
+    } if *player == alice)));
+
+    // The lobby cadence also counts as a send, so the next keepalive
+    // lands a full idle second after the latest actual send.
+    let actions = h.tick(2002);
+    assert!(actions.iter().any(|a| matches!(a, Action::Send {
+        packet: ServerPacket::Keepalive,
+        player,
+        ..
+    } if *player == alice)));
+}
+
+#[test]
+fn invalid_label_cannot_produce_unencodable_action() {
+    let mut h = Harness::new();
+    let player = player_id(&mut h.registry, h.room.clone());
+    let actions = h.role.handle(
+        T0,
+        Input::Join {
+            player,
+            addr_label: b"bad\0label".to_vec(),
+        },
+    );
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::Disconnect {
+            reason: DisconnectReason::MalformedInput,
+            ..
+        }
+    )));
+    assert_eq!(h.role.peer_count(), 0);
+
+    // And nothing about that peer can ever be emitted later.
+    assert!(h.tick(2000).is_empty());
+
+    // A long-but-NUL-free label is bounded, not rejected.
+    let player = player_id(&mut h.registry, h.room.clone());
+    assert!(
+        h.role
+            .handle(
+                T0,
+                Input::Join {
+                    player,
+                    addr_label: vec![b'x'; 100],
+                },
+            )
+            .is_empty()
+    );
+    assert_eq!(h.role.peer_count(), 1);
+}
+
+#[test]
+fn terminal_packets_survive_a_binding_style_reducer() {
+    // A reducer that applies actions in order: sends enqueue to the
+    // peer's outbox, a Disconnect delivers the terminal packet and only
+    // then closes.
+    #[derive(Default)]
+    struct MockHost {
+        outboxes: std::collections::BTreeMap<PlayerId, Vec<ServerPacket>>,
+        closed: Vec<PlayerId>,
+    }
+    impl MockHost {
+        fn apply(&mut self, actions: &[Action]) {
+            for action in actions {
+                match action {
+                    Action::Send { player, packet, .. } => {
+                        assert!(
+                            !self.closed.contains(player),
+                            "send to a closed peer: the role must not produce one"
+                        );
+                        self.outboxes
+                            .entry(*player)
+                            .or_default()
+                            .push(packet.clone());
+                    }
+                    Action::Disconnect {
+                        player, terminal, ..
+                    } => {
+                        if let Some(terminal) = terminal {
+                            self.outboxes
+                                .entry(*player)
+                                .or_default()
+                                .push(terminal.1.clone());
+                        }
+                        self.closed.push(*player);
+                    }
+                    Action::GameEnded => {}
+                }
+            }
+        }
+    }
+
+    // Rejection: the REJECTED packet must be in the outbox at close time.
+    let mut host = MockHost::default();
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let mut syn = syn_value("Alice", 0, 0, 0);
+    syn.protocols = vec![b"OTHER".to_vec()];
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Syn(syn),
+        },
+    );
+    host.apply(&actions);
+    let outbox = host.outboxes.get(&alice).expect("an outbox exists");
+    assert!(
+        outbox
+            .iter()
+            .any(|p| matches!(p, ServerPacket::Rejected { .. }))
+    );
+    assert!(host.closed.contains(&alice));
+
+    // Sleep-expiry removal carries no terminal but also cannot drop a
+    // pending acknowledgement: the ACK went out as a plain send while the
+    // identity was alive, before any close.
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+    let actions = h.role.handle(
+        T0,
+        Input::Packet {
+            player: alice,
+            header: WireHeader { reliable_seq: None },
+            packet: ClientPacket::Disconnect,
+        },
+    );
+    host = MockHost::default();
+    host.apply(&actions);
+    let outbox = host.outboxes.get(&alice).expect("an outbox exists");
+    assert!(
+        outbox
+            .iter()
+            .any(|p| matches!(p, ServerPacket::DisconnectAck))
+    );
 }
