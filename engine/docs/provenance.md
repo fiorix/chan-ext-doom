@@ -346,7 +346,7 @@ The main loop is the one structural difference. A browser cannot be held in a lo
 
 **Current native status: the target builds, links, boots the pinned shareware IWAD and runs.** A native `doom` links at roughly 900 KB and reaches `W_Init` adding `doom1.wad`, the `DOOM Shareware` banner, `I_Init`, `NET_Init`, `M_Init`, `R_Init`, `P_Init`, `S_Init`, `D_CheckNetGame` reporting `player 1 of 1 (1 nodes)`, `HU_Init` and `ST_Init`, then runs the attract sequence with no error on stderr.
 
-`net_sdl.c` is compiled and linked into the native target, so the UDP transport is present in the binary. A live session against an upstream server has not been demonstrated.
+`net_sdl.c` is compiled and linked into the native target, and the UDP transport carries a real session: the native engine joins an upstream Chocolate Doom 3.1.1 dedicated server over SDL_net, completes the SYN handshake, launches from the lobby, and exchanges tics. The server names itself `chocolate-doom 3.1.1` and the engine names itself `WebDOOM 1.0.0`, so `NET_CL_ParseSYN` prints a version-mismatch warning; that is a name comparison, not a protocol difference, and the game starts and runs regardless.
 
 ## Running it
 
