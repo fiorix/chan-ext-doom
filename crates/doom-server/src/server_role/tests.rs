@@ -3664,3 +3664,216 @@ fn wire_shapes_keep_the_server_client_asymmetry_explicit() {
         "lowres_turn narrows the angleturn field"
     );
 }
+
+// --- FU19/FU20 battery: discriminating regressions for the three
+// surviving guard mutants, the six-tic deadlock tail, and the
+// cumulative reconstruction oracle
+
+/// Client-style cumulative oracle: apply each tic's partial diff for one
+/// player onto that player's running absolute base (forward, turn).
+fn reconstruct(tics: &[doom_proto::FullTic], player: u8) -> Vec<(i8, i16)> {
+    let mut base = (0i8, 0i16);
+    tics.iter()
+        .map(|tic| {
+            let (_, diff) = tic
+                .players
+                .iter()
+                .find(|(index, _)| *index == player)
+                .expect("player diff present");
+            if let Some(forward) = diff.forward {
+                base.0 = forward;
+            }
+            if let Some(turn) = diff.turn {
+                base.1 = turn;
+            }
+            base
+        })
+        .collect()
+}
+
+#[test]
+fn completeness_alone_blocks_advancement_when_all_acks_are_ahead() {
+    let (mut h, alice, bob) = in_game_two();
+    // Alice's tic 0 is present; bob's is not. With the ratified ACK
+    // ceiling the partner of a laggard can never acknowledge past the
+    // stall through packets, so the only way to isolate the completeness
+    // gate from the minimum acknowledgement is to set both ACKs ahead
+    // directly (proto probe `im_completeness_gate_proof`).
+    send(&mut h, alice, upload(0, 0, vec![(1, diff(1))]));
+    game_mut(&mut h, alice).acknowledged = 1;
+    game_mut(&mut h, bob).acknowledged = 1;
+    h.tick(1);
+    assert_eq!(
+        h.role.recv.as_ref().expect("window").start,
+        0,
+        "completeness alone blocks advancement with min-ack satisfied"
+    );
+
+    // The exact missing tic arrives: advancement resumes.
+    send(&mut h, bob, upload(0, 0, vec![(1, diff(2))]));
+    h.tick(2);
+    assert_eq!(h.role.recv.as_ref().expect("window").start, 1);
+}
+
+#[test]
+fn resend_request_is_inert_with_a_wrong_absolute_identity_in_slot() {
+    let (mut h, alice) = in_game_one();
+    h.tick(1);
+    // The requested modulo slot holds a QueuedTic, but its absolute
+    // sequence belongs to a later tic: a stale request for tic 0 must
+    // not alias it (proto probe `im_resend_aliased_slot_ignored`).
+    game_mut(&mut h, alice).sendqueue[0] = Some(queued(0, 128));
+    let actions = send(
+        &mut h,
+        alice,
+        ClientPacket::GameDataResend { start: 0, count: 1 },
+    );
+    assert!(
+        actions.is_empty(),
+        "a wrong absolute identity in the right slot is inert"
+    );
+
+    // The same entry serves a request whose identity does match.
+    let actions = send(
+        &mut h,
+        alice,
+        ClientPacket::GameDataResend {
+            start: 128,
+            count: 1,
+        },
+    );
+    let to_alice = gamedata_to(&actions, alice);
+    assert_eq!(to_alice.len(), 1);
+    assert_eq!(to_alice[0].start, 128);
+    assert_eq!(to_alice[0].tics.len(), 1);
+}
+
+#[test]
+fn deadlock_boundary_is_strictly_over_1000ms_with_full_six_tic_tail() {
+    let (mut h, alice, bob) = in_game_two();
+    // Alice uploads tics 0..=126 at T0: her only missing slot is 127,
+    // never stamped, so the 300 ms path stays silent for it. Bob's
+    // single tic lets alice pump exactly once, so her queue holds one
+    // unacknowledged tic for the replay.
+    send(&mut h, bob, upload(0, 0, vec![(9, diff(7))]));
+    let tics: Vec<(i16, doom_proto::TiccmdDiff)> = (0..127i16).map(|i| (i, diff(1))).collect();
+    send(&mut h, alice, upload(0, 0, tics));
+    h.tick(1);
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert!(recv.entries[126][0].active);
+        assert!(!recv.entries[127][0].active);
+    }
+    // Bob never uploads again, so alice never pumps: every resend and
+    // gamedata addressed to alice below is deadlock-originated.
+
+    // Exactly 1000 ms is not strictly over the threshold: quiet (proto
+    // probe `im_deadlock_strict_boundary`).
+    let actions = h.tick(1_000);
+    assert!(
+        resends_to(&actions, alice).is_empty(),
+        "1000 ms is not over the deadlock threshold"
+    );
+    assert!(gamedata_to(&actions, alice).is_empty());
+
+    // 1001 ms: the full six-tic wire request at the tail, plus the exact
+    // unacknowledged queue replay; only in-window slots are stamped.
+    let actions = h.tick(1_001);
+    assert_eq!(
+        resends_to(&actions, alice),
+        vec![(127, 6)],
+        "the wire request always covers six tics even past the tail"
+    );
+    let replay = gamedata_to(&actions, alice);
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].tics[0].players, vec![(1, diff(7))]);
+    {
+        let recv = h.role.recv.as_ref().expect("window");
+        assert_eq!(
+            recv.entries[127][0].resend_time,
+            Some(Milliseconds(T0.0 + 1_001)),
+            "only the in-window slot is stamped"
+        );
+        assert_eq!(recv.entries[126][0].resend_time, None);
+    }
+}
+
+#[test]
+fn resend_preserves_cumulative_base_plus_diff_reconstruction() {
+    let (mut h, alice, bob) = in_game_two();
+    // Three partial diffs whose absolute meaning depends on the running
+    // per-player base: forward set once, turn carried across a tic that
+    // does not mention it, then forward changed alone.
+    let diffs = [
+        doom_proto::TiccmdDiff {
+            forward: Some(50),
+            turn: Some(0x100),
+            ..Default::default()
+        },
+        doom_proto::TiccmdDiff {
+            turn: Some(0x200),
+            ..Default::default()
+        },
+        doom_proto::TiccmdDiff {
+            forward: Some(-20),
+            ..Default::default()
+        },
+    ];
+    let mut oracle_base = (0i8, 0i16);
+    let mut oracle = Vec::new();
+    for d in &diffs {
+        if let Some(forward) = d.forward {
+            oracle_base.0 = forward;
+        }
+        if let Some(turn) = d.turn {
+            oracle_base.1 = turn;
+        }
+        oracle.push(oracle_base);
+    }
+    assert_eq!(oracle, vec![(50, 0x100), (50, 0x200), (-20, 0x200)]);
+
+    // Queue the three tics for bob across three pumps and reconstruct
+    // the absolute commands from the live fan-out.
+    let mut live = Vec::new();
+    for (step, d) in diffs.iter().enumerate() {
+        send(&mut h, alice, upload(0, step as u8, vec![(1, d.clone())]));
+        let actions = h.tick(step as u64 + 1);
+        live.push(
+            gamedata_to(&actions, bob)[0]
+                .tics
+                .last()
+                .expect("tail")
+                .clone(),
+        );
+    }
+    assert_eq!(reconstruct(&live, 0), oracle, "live fan-out reconstructs");
+
+    // A conflicting duplicate poisons the live window; the verbatim
+    // resend must still reconstruct the same absolute commands.
+    send(
+        &mut h,
+        alice,
+        upload(
+            0,
+            0,
+            vec![(
+                50,
+                doom_proto::TiccmdDiff {
+                    forward: Some(127),
+                    ..Default::default()
+                },
+            )],
+        ),
+    );
+    let actions = send(
+        &mut h,
+        bob,
+        ClientPacket::GameDataResend { start: 0, count: 3 },
+    );
+    let resent = gamedata_to(&actions, bob)[0].tics.clone();
+    assert_eq!(
+        reconstruct(&resent, 0),
+        oracle,
+        "the resend reconstructs the same absolute commands"
+    );
+}
