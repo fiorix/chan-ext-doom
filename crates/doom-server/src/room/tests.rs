@@ -88,6 +88,21 @@ fn upload(ack: u8, start: u8, tics: Vec<(i16, doom_proto::TiccmdDiff)>) -> Clien
     })
 }
 
+fn syn_drone_lowres(name: &str) -> ClientPacket {
+    let ClientPacket::Syn(mut syn) = syn_lowres(name) else {
+        unreachable!()
+    };
+    syn.connect.drone = 1;
+    ClientPacket::Syn(syn)
+}
+
+fn diff_turn() -> doom_proto::TiccmdDiff {
+    doom_proto::TiccmdDiff {
+        turn: Some(0x100),
+        ..Default::default()
+    }
+}
+
 fn plain() -> WireHeader {
     WireHeader { reliable_seq: None }
 }
@@ -676,20 +691,6 @@ fn removal_effect_carries_the_owed_prefix_with_metadata_and_tags() {
 // must fail this test.
 #[test]
 fn gamedata_produced_before_a_same_batch_reset_encodes_at_production_width() {
-    fn syn_drone_lowres(name: &str) -> ClientPacket {
-        let ClientPacket::Syn(mut syn) = syn_lowres(name) else {
-            unreachable!()
-        };
-        syn.connect.drone = 1;
-        ClientPacket::Syn(syn)
-    }
-    fn diff_turn() -> doom_proto::TiccmdDiff {
-        doom_proto::TiccmdDiff {
-            turn: Some(0x100),
-            ..Default::default()
-        }
-    }
-
     let mut h = host(16);
     // The drone is the lower PlayerId (the timer visits it first), the
     // room's only player second. Both negotiate lowres.
@@ -748,6 +749,90 @@ fn gamedata_produced_before_a_same_batch_reset_encodes_at_production_width() {
 
     // The drone's final fan-out encodes at its production width even
     // though the role finished the batch wide.
+    let mut gamedata = None;
+    while let Some(packet) = h.pop_outbound(drone) {
+        if matches!(
+            ServerPacket::decode(packet.payload(), true),
+            Ok((_, ServerPacket::GameData(_)))
+        ) {
+            gamedata = Some(packet);
+        }
+    }
+    let gamedata = gamedata.expect("the drone had a fan-out queued");
+    assert_eq!(
+        gamedata.lowres(),
+        Some(true),
+        "the tag is the production width"
+    );
+    let (_, ServerPacket::GameData(data)) =
+        ServerPacket::decode(gamedata.payload(), true).expect("decodes lowres")
+    else {
+        unreachable!()
+    };
+    assert!(
+        data.tics
+            .iter()
+            .any(|tic| tic.players.iter().any(|(_, d)| d.turn == Some(0x100))),
+        "the narrow turn survived"
+    );
+    assert!(
+        ServerPacket::decode(gamedata.payload(), false).is_err(),
+        "the bytes are not wide-encoded"
+    );
+}
+
+// Engine-33 item 3 / addendum 6: the exact-capacity recursive-leave
+// construction. One reduce batch overflows the last player at the
+// outbox bound, her recursive Leave ends the game and resets the width
+// MID-REDUCE, and the drone's GAMEDATA sits later in the same batch
+// (deterministic lowest-PlayerId-first timer order). It must still
+// encode at its production width. A mutation reading the live role
+// width at encode time fails this test by name.
+#[test]
+fn recursive_leave_flips_width_mid_reduce_but_gamedata_keeps_production_width() {
+    let mut h = host(4);
+    // The player has the lower PlayerId, the drone second; the player
+    // SYNs first (upstream rejects a first-SYN drone).
+    let alice = join(&mut h);
+    let drone = join(&mut h);
+    h.packet(T0, alice, plain(), syn_lowres("Alice"));
+    h.packet(T0, drone, plain(), syn_drone_lowres("Observer"));
+    h.packet(T0, alice, reliable(0), ClientPacket::Launch);
+    h.packet(
+        T0,
+        alice,
+        reliable(1),
+        ClientPacket::GameStart(settings(0, 1)),
+    );
+    h.packet(
+        T0,
+        drone,
+        reliable(0),
+        ClientPacket::GameStart(settings(0, 1)),
+    );
+    assert!(h.lowres_turn(), "the room adopted lowres");
+    while h.pop_outbound(alice).is_some() {}
+
+    // Fill alice's outbox to exactly the bound: she is still a member,
+    // and the next host send removes her as a slow consumer.
+    for _ in 0..4 {
+        let (outcome, _) = h.relay(T0, drone, alice, 20, b"fill").expect("fill relays");
+        assert_eq!(outcome, RelayOutcome::Queued(alice));
+    }
+    assert!(h.contains(alice));
+
+    // The tic the drone's fan-out merges, then one timer pass: alice's
+    // pump send overflows her, her recursive Leave ends the game and
+    // resets the settings mid-batch, and the drone's GAMEDATA is
+    // encoded afterwards in the same reduction.
+    h.packet(T0, alice, plain(), upload(0, 0, vec![(11, diff_turn())]));
+    let effect = h.tick(Milliseconds(T0.0 + 30));
+    assert!(effect.game_ended, "the last player left");
+    assert!(!h.contains(alice));
+    assert!(!h.lowres_turn(), "the role reset to wide mid-reduce");
+
+    // The drone's GAMEDATA was produced while the room was lowres and
+    // is encoded after the flip: the production tag keeps it lowres.
     let mut gamedata = None;
     while let Some(packet) = h.pop_outbound(drone) {
         if matches!(

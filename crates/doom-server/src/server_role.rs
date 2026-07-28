@@ -1197,7 +1197,12 @@ impl ServerRole {
     fn on_timer(&mut self, now: Milliseconds) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        for player in self.peers.keys().copied().collect::<Vec<_>>() {
+        // Deterministic visitation order (lowest PlayerId first): the
+        // role's effects are order-sensitive within one batch, so the
+        // timer must not depend on hash iteration.
+        let mut timer_peers: Vec<PlayerId> = self.peers.keys().copied().collect();
+        timer_peers.sort_unstable();
+        for player in timer_peers {
             let (syn, conn, idle_recv, idle_send, idle_waitdata, connected, name) = {
                 let Some(peer) = self.peers.get(&player) else {
                     continue;
