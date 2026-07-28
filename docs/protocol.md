@@ -5,6 +5,7 @@ This document is the owned inventory of the Chocolate Doom network protocol as i
 - **[observed]**: seen in the committed captures under `fixtures/` (index in `fixtures/manifest.json`; reproduction path in `docs/verification.md`).
 - **[reference]**: read from the pinned upstream C source (chocolate-doom `410d96855b5df5410ff591a90efeafa889119224`, tag `chocolate-doom-3.1.1`). Used for interoperability only; no C code is ported into `crates/`.
 - **[unknown]**: not present in committed evidence and not verified.
+- **[integration]**: exercised by the repository's live browser engine and `doomd` path, including its binding tests, but not stored as packet bytes in the native UDP fixture corpus.
 - **capture-time note**: seen in raw capture logs that are not committed (scratch `packets.jsonl` with `t_ms`). The committed fixtures retain packet order, direction, and bytes, but no timestamps, so rates and intervals quoted this way are not independently reproducible from the committed evidence alone.
 
 Capture source of truth: `fixtures/` and `fixtures/rig/capture.py`. All captures are native UDP loopback, chocolate-doom 3.1.1 client against chocolate-server 3.1.1, shareware doom1.wad (sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, which is never committed).
@@ -264,7 +265,7 @@ The fixture tests therefore assert structure (header, length, hash of the commit
 
 ## 6. WebSocket transport envelope (browser path)
 
-This envelope is **not** part of the Chocolate packet format: it is a transport wrapper added and removed around the packets of section 4, and the wrapped bytes are unchanged. It is not observable in these native UDP captures, so this section is `[reference]` at source level, verified against both pinned upstream sources (engine module and router). On-the-wire verification against a live router is `[unknown]`: current coverage is source-level only.
+This envelope is **not** part of the Chocolate packet format: it is a transport wrapper added and removed around the packets of section 4, and the wrapped bytes are unchanged. It does not appear in the native UDP fixture corpus, so the layout below is `[reference]` at source level, verified against both pinned upstream sources (engine module and router). It is also exercised live: the browser engine completes the two-node path through the committed `doomd` room relay, and the `doomd` binding tests cover the envelope behavior, so this section is additionally `[integration]`.
 
 Pins for this evidence:
 
@@ -277,6 +278,8 @@ Frame shapes (each binary WebSocket message):
 - **Router to engine**: `[from: u32 LE][Chocolate packet…]`, minimum 4 bytes. The router forwards `data.slice(4)`, so it strips only the `to` field. The engine's receive callback strips that `from` prefix (`numBytes - 4`, payload at offset 4) before handing the Chocolate packet to the net layer. Hence the asymmetry: 8-byte header c2s, 4-byte header s2c.
 - The u32 ids are host-order values on little-endian infrastructure (engine: `memcpy` on wasm32; router: `Uint32Array` over the frame), so they are **little-endian**, unlike the big-endian packet payload they wrap. Ids are per-instance (`instanceUID`), assigned by the hosting side.
 - **Registration/reset**: an in-WASM server role announces itself with an 8-byte frame `to = 0`, `from = instanceUID` and an empty payload (sent by the engine's server-init). The pinned router special-cases `from == 1 && to == 0` as a server restart: it closes every session and clears its client table. Instance id 1 is the server role by that router's convention.
+
+This repository's `doomd` implements the same envelope `[integration]`: the asymmetric 8-byte and 4-byte forms, a nonzero source route id bound per connection (with a change of source rejected), route id 1 reserved for the room host by the same convention, and the exact reset marker (frame with `to` absent, `from` equal to 1, and an empty payload), which resets the room and disconnects its current members. The `doomd` binding tests exercise the route envelope, source binding, the reset marker, and relay behavior, and the browser engine's two-node path through `doomd` completes with both instances reporting their player assignments.
 
 ## 7. Timing and reliability parameters
 
@@ -298,4 +301,4 @@ Frame shapes (each binary WebSocket message):
 - Rich ticcmd diffs (movement and buttons), ticdup above 1, extratics, and deathmatch flags in GAMESTART are not covered: every committed fixture is an idle single-player co-op run.
 - Multi-player GAMESTART (`num_players > 1`, per-client `consoleplayer`) is not covered: committed fixtures carry single-player GAMESTART only.
 - RESEND under real loss and reliable resend on the wire are not observed: the loopback path is lossless and the rig has no loss-injecting scenario.
-- The WebSocket envelope of section 6 is verified at source level only; it has not been observed on a live router.
+- The WebSocket envelope bytes of section 6 are absent from the native UDP fixture corpus: no committed WebSocket packet capture exists. The envelope is exercised by the live browser path through `doomd` and by the `doomd` binding tests, which is integration evidence rather than a stored capture.
