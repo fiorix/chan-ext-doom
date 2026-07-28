@@ -254,6 +254,90 @@ static void BuildState(void)
     LinkThinker(&test_door.thinker, (void *) T_VerticalDoor);
 }
 
+// Capture one D_StateCanaryReport line.
+//
+// The capture is an anonymous tmpfile(), never a named path. An earlier
+// version wrote a fixed /tmp file, which collided between concurrent runs and,
+// worse, made freopen() follow whatever symlink happened to sit at that public
+// name and truncate the target. A test must not carry a clobber primitive.
+//
+// Returns false on any setup failure rather than leaving the caller to assert
+// on an empty buffer: "no sha256= token" passes trivially against no output at
+// all, so a broken capture must be a failure, not a quiet pass.
+static boolean CaptureReport(const char *at, char *out, size_t cap)
+{
+    FILE *tmp;
+    int saved;
+    long n;
+
+    if (out == NULL || cap == 0)
+    {
+        return false;
+    }
+
+    out[0] = '\0';
+
+    tmp = tmpfile();
+    if (tmp == NULL)
+    {
+        return false;
+    }
+
+    saved = dup(fileno(stdout));
+    if (saved < 0)
+    {
+        fclose(tmp);
+        return false;
+    }
+
+    fflush(stdout);
+    if (dup2(fileno(tmp), fileno(stdout)) < 0)
+    {
+        /* stdout was never redirected, so only the saved copy needs closing */
+        close(saved);
+        fclose(tmp);
+        return false;
+    }
+
+    D_StateCanaryReport(at);
+    fflush(stdout);
+
+    /* restore on every path out from here, including the read failures */
+    if (dup2(saved, fileno(stdout)) < 0)
+    {
+        close(saved);
+        fclose(tmp);
+        return false;
+    }
+    close(saved);
+    clearerr(stdout);
+
+    if (fseek(tmp, 0, SEEK_END) != 0)
+    {
+        fclose(tmp);
+        return false;
+    }
+
+    n = ftell(tmp);
+    rewind(tmp);
+
+    if (n <= 0 || (size_t) n >= cap)
+    {
+        fclose(tmp);
+        return false;
+    }
+
+    if (fread(out, 1, (size_t) n, tmp) != (size_t) n)
+    {
+        fclose(tmp);
+        return false;
+    }
+
+    out[n] = '\0';
+    fclose(tmp);
+    return true;
+}
+
 #define DCS_SCRATCH_LEN_TEST (512 * 1024)
 
 static unsigned int ReadU32(const byte *buf, size_t offset)
@@ -853,6 +937,23 @@ int main(void)
         Check(b < a, "and writes fewer bytes, since no position is recorded");
     }
 
+    // The capture mechanism itself has to be shown to work, or the oversize
+    // assertions below would pass against an empty buffer for the wrong
+    // reason: "emits no sha256= token" is trivially true of no output at all.
+    // So capture a report that does succeed, and require the token to appear.
+    {
+        char buf[512];
+
+        BuildState();
+        Check(CaptureReport("exit", buf, sizeof(buf)),
+              "a successful report is captured");
+        Check(strstr(buf, "sha256=") != NULL,
+              "and the capture really does observe the sha256 token");
+        Check(strstr(buf, "bytes=") != NULL, "and the byte count");
+        Check(strstr(buf, "state did not fit") == NULL,
+              "and a fitting state is not reported as a refusal");
+    }
+
     // --- a state too large for the scratch buffer -------------------------
 
     // The serializer refuses rather than truncating. A truncated digest would
@@ -911,33 +1012,10 @@ int main(void)
             // The report is the only thing the verdict layer ever sees, so
             // assert on its actual output rather than on the return path.
             {
-                const char *path = "/tmp/dcs_oversize_report.txt";
                 char buf[512];
-                FILE *f;
-                size_t n = 0;
 
-                int saved = dup(fileno(stdout));
-
-                fflush(stdout);
-                if (freopen(path, "w", stdout) != NULL)
-                {
-                    D_StateCanaryReport("exit");
-                    fflush(stdout);
-                }
-                /* put the real stdout back, however the runner supplied it */
-                dup2(saved, fileno(stdout));
-                close(saved);
-                clearerr(stdout);
-
-                f = fopen(path, "r");
-                if (f != NULL)
-                {
-                    n = fread(buf, 1, sizeof(buf) - 1, f);
-                    fclose(f);
-                }
-                buf[n] = '\0';
-                remove(path);
-
+                Check(CaptureReport("exit", buf, sizeof(buf)),
+                      "the oversize report is captured");
                 Check(strstr(buf, "state did not fit, no digest") != NULL,
                       "the oversize report names the refusal");
                 Check(strstr(buf, "sha256=") == NULL,
