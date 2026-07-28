@@ -268,7 +268,7 @@ emcc -Oz -std=gnu99 \
 
 Four parts of that line are load-bearing:
 
-- `-std=gnu99` pins the language mode. Without it the compiler default applies, and that default has moved to C23, which rejects this tree's legacy `doomtype.h` enum member named `false`. It must be GNU C99 rather than strict C99: `sdl_mixer/music.c` calls `strtok_r`, which `-std=c99` hides behind `__STRICT_ANSI__`. This flag is also what keeps this recipe comparable with the CMake route, which pins the same mode; when only one route pinned it, the resulting size difference looked like a linker artifact and was misattributed to one.
+- `-std=gnu99` pins the language mode, for parity and reproducibility rather than to work around a broken default. emcc 6.0.3 defaults to GNU C17 (`__STDC_VERSION__` 201710L) and builds this tree without complaint, which is how the earlier unpinned pin was produced at all. The point is that GNU C17 and GNU C99 do not produce the same artifact: they differ by 83 wasm bytes. So an unpinned route leaves the pinned hashes hostage to whatever the toolchain default happens to be on the day, and pinning only one of the two routes is what once made a language difference look like a linker artifact. It must be GNU C99 rather than strict C99 because `sdl_mixer/music.c` calls `strtok_r`, which `-std=c99` hides behind `__STRICT_ANSI__`.
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. There is no native build to mirror this: see "Native build" below.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
@@ -280,7 +280,7 @@ The flag set is otherwise upstream's `CMakeLists.txt` Release configuration, min
 
 ### The CMake route
 
-`CMakeLists.txt` builds the same thing and is kept in step with the recipe above. It restricts its globs to the four source roots so `test/` (whose translation units carry their own `main`) is never linked into the engine, sorts the source list for the same determinism reason, drops `src/net_sdl.c` to match what `net_transport.h` selects, and pins `C_STANDARD 99` so a toolchain defaulting to C23 cannot reject this tree's legacy `doomtype.h` enum member named `false`.
+`CMakeLists.txt` builds the same thing and is kept in step with the recipe above. It restricts its globs to the four source roots so `test/` (whose translation units carry their own `main`) is never linked into the engine, sorts the source list for the same determinism reason, drops `src/net_sdl.c` to match what `net_transport.h` selects, and pins `C_STANDARD 99` with `C_EXTENSIONS ON` so it compiles in the same language mode as the recipe rather than in whatever the toolchain defaults to.
 
 ```sh
 source ~/dev/emsdk/emsdk_env.sh

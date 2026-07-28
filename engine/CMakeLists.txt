@@ -109,11 +109,13 @@ list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_sdl.c)
 add_executable(doom ${ENGINE_SOURCES})
 
 # Both build routes pin GNU C99 explicitly, and the recipe in
-# docs/provenance.md passes the same -std=gnu99. Leaving either on the
-# compiler default is what made the two routes diverge: the default moved to
-# C23, which rejects this tree's legacy doomtype.h enum member named false,
-# and comparing a defaulted build against a pinned one attributed a language
-# difference to the linker.
+# docs/provenance.md passes the same -std=gnu99. The reason is parity and
+# reproducibility, not a broken default: emcc 6.0.3 defaults to GNU C17
+# (__STDC_VERSION__ 201710L) and compiles this tree fine. But GNU C17 and GNU
+# C99 do not produce the same artifact, they differ by 83 wasm bytes, so an
+# unpinned route makes the pinned hashes depend on whatever the toolchain
+# default happens to be. Leaving one route defaulted and the other pinned is
+# exactly what once made a language difference look like a linker artifact.
 #
 # The extensions are not incidental. sdl_mixer/music.c calls strtok_r, which
 # strict -std=c99 hides behind __STRICT_ANSI__, so C_EXTENSIONS OFF does not
