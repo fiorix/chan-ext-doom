@@ -268,7 +268,7 @@ emcc -Oz \
 
 Three parts of that line are load-bearing:
 
-- `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. The native build excludes `net_websockets.c` for the mirror-image reason.
+- `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. There is no native build to mirror this: see "Native build" below.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
 - `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1689618 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
@@ -278,14 +278,24 @@ The flag set is otherwise upstream's `CMakeLists.txt` Release configuration, min
 
 ### The CMake route
 
-`CMakeLists.txt` builds the same thing and is kept in step with the recipe above. It restricts its globs to the four source roots so `test/` (whose translation units carry their own `main`) is never linked into the engine, sorts the source list for the same determinism reason, and selects the transport translation unit to match what `net_transport.h` selects: Emscripten drops `src/net_sdl.c`, native drops `src/net_websockets.c`.
+`CMakeLists.txt` builds the same thing and is kept in step with the recipe above. It restricts its globs to the four source roots so `test/` (whose translation units carry their own `main`) is never linked into the engine, sorts the source list for the same determinism reason, drops `src/net_sdl.c` to match what `net_transport.h` selects, and pins `C_STANDARD 99` so a toolchain defaulting to C23 cannot reject this tree's legacy `doomtype.h` enum member named `false`.
 
 ```sh
-emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release
+source ~/dev/emsdk/emsdk_env.sh
+emcmake cmake -S engine -B build
 cmake --build build
 ```
 
-**Not executed on the reference host: it has no `cmake`, and no way to install one without root** (`python3 -m venv` is unavailable, there is no `pip`). The single-`emcc` recipe above remains the reference that the pinned hashes come from; the CMake route is written to match it flag for flag but its artifacts have not been compared. Treat it as unverified until someone runs it.
+**It is an Emscripten-only entry point and refuses anything else.** A non-Emscripten toolchain fails at configure time with a deliberate diagnostic, before CMake compiles even its compiler-identification program and long before anything probes for SDL. That refusal is a statement about the source, not about the host: see "Native build" below.
+
+Executed and compared. Configure and a full link complete with emsdk 6.0.3, and the result is deterministic: two fresh configure-and-build cycles produce an identical `doom.wasm`. Against the single-`emcc` reference from the same clean archive:
+
+| artifact | reference | CMake |
+| --- | --- | --- |
+| `doom.js` | 188756 bytes | byte-identical |
+| `doom.wasm` | 1689618 bytes | 1689704 bytes, +86 |
+
+The `doom.js` files are the same bytes. The `doom.wasm` files are the same program with a different layout, and the difference is accounted for rather than assumed: the type, import, function, table, memory, global, export and element sections are identical in size, both modules declare 1896 functions and carry 1896 code bodies and 2160 data segments, the memory declarations are identical, and neither contains a string the other lacks, so no build path leaks in. The whole delta is `code` +83 and `data` +3, and it starts at a data-segment header whose `i32.const` offset differs by four. CMake compiles each translation unit to its own object and `wasm-ld` merges them at object granularity, while the recipe hands every source to one `emcc` invocation that packs the data more tightly; the shifted segment changes the magnitude of address constants embedded in the code, which changes their LEB128 encoding widths. The pinned hashes therefore stay the recipe's, which reproduces them exactly.
 
 ### Expected output
 
@@ -300,16 +310,19 @@ Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record 
 
 ## Native build
 
-`net_sdl.c` is the UDP transport that lets native chocolate-doom clients share a room, and `net_transport.h` already selects it for non-emscripten builds. It is **not built or tested here**: this host has neither SDL2 nor SDL_net development headers.
+**There is no native build of this fork, and the missing piece is the source, not the toolchain.**
+
+An earlier version of this document said the source and transport selection were wired and only the toolchain was absent. That was wrong, and the correction matters because it changes what M2 owes. With SDL2 2.32.10 and SDL2_net 2.2.0 present, a native configure gets past both packages and then dies partway through the build:
 
 ```
-$ cc -std=c99 -Isrc -Isrc/doom -c src/net_sdl.c -o /tmp/net_sdl.o
-src/net_sdl.c:36:10: fatal error: SDL_net.h: No such file or directory
+engine/src/doom/d_main.c:81:10: fatal error: emscripten.h: No such file or directory
 ```
 
-Exact missing prerequisite on a Debian or Ubuntu host: `libsdl2-net-dev` (candidate 2.2.0+dfsg-4 here, not installed), plus `libsdl2-dev` for the rest of the engine. The source and the transport selection are wired; only the toolchain is absent.
+That is not an isolated include. Fifteen translation units include `<emscripten.h>` unconditionally, only `i_timer.c` guards it. There are twenty-one `EM_ASM` sites spread across video, audio, input, joystick, GIF capture, ENDOOM and the game layer, with nine in `i_webmusic.c` alone. `d_main.c` inverts the game loop through `emscripten_set_main_loop` and `emscripten_cancel_main_loop`, which is an architectural difference rather than a flag. Selecting `net_sdl.c` instead of `net_websockets.c` changes none of it.
 
-The CMake native configuration fails earlier and more clearly, by design: it `pkg_check_modules`s `sdl2` and `SDL2_net` at configure time rather than letting the build die on a missing include. That path is also unrun here, for the same lack of `cmake`.
+So `CMakeLists.txt` refuses a non-Emscripten toolchain at configure time rather than advertising a native target it cannot deliver. The refusal is checked before `project()`, so it fires before any C is compiled and before SDL is probed at all: a host with every native dependency installed still gets the same diagnostic, because the dependency that is missing is in this tree.
+
+`net_sdl.c` remains in the tree as restored, reviewed source. It is deliberately excluded from every build here and is **not presently buildable**. Native UDP interop, which is what makes native chocolate-doom clients able to share a room, is an M2 exit requirement, and reaching it means porting the browser-only seams above, not just flipping the transport selection.
 
 ## Running it
 

@@ -1,5 +1,55 @@
 cmake_minimum_required(VERSION 3.13)
+
+# This entry point builds the browser engine and nothing else.
+#
+# The refusal below is deliberate, not a missing feature. This fork's source is
+# not native-ready: fifteen translation units include <emscripten.h>
+# unconditionally, there are twenty-one EM_ASM sites across video, audio,
+# input, joystick, GIF capture, ENDOOM and the game layer, and d_main.c inverts
+# the game loop through emscripten_set_main_loop. Selecting net_sdl.c instead
+# of net_websockets.c does not change any of that. A native target would
+# configure, then fail partway through compiling with a missing emscripten.h,
+# which reads like a broken build rather than an unfinished port.
+#
+# The check runs before project() so configure fails before CMake compiles even
+# its own compiler-identification program, and long before anything probes for
+# SDL. Native UDP interop is an M2 exit requirement and net_sdl.c is kept as
+# restored, reviewed source for it; it is not presently buildable.
+
+set(DOOMIT_TARGETING_EMSCRIPTEN FALSE)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    set(DOOMIT_TARGETING_EMSCRIPTEN TRUE)
+elseif(CMAKE_TOOLCHAIN_FILE MATCHES "Emscripten\\.cmake$")
+    set(DOOMIT_TARGETING_EMSCRIPTEN TRUE)
+endif()
+
+if(NOT DOOMIT_TARGETING_EMSCRIPTEN)
+    message(FATAL_ERROR
+        "doomit-engine: browser-only build; refusing a non-Emscripten toolchain.\n"
+        "\n"
+        "Configure through emsdk instead:\n"
+        "    source ~/dev/emsdk/emsdk_env.sh\n"
+        "    emcmake cmake -S engine -B <build-dir>\n"
+        "\n"
+        "This is not a toolchain detection failure. The engine sources depend "
+        "on Emscripten unconditionally, so no native engine can be produced "
+        "from this tree today. A real native engine, including native UDP "
+        "interop, is M2 work; src/net_sdl.c is restored source kept for it and "
+        "is not presently buildable.")
+endif()
+
 project(doomit-engine C)
+
+# The pre-project check reads the toolchain the caller asked for. This one
+# reads what the toolchain actually configured, so a file named like
+# Emscripten.cmake that is not one still cannot reach the source list.
+
+if(NOT EMSCRIPTEN)
+    message(FATAL_ERROR
+        "doomit-engine: browser-only build; the loaded toolchain did not "
+        "produce an Emscripten target.")
+endif()
 
 # This mirrors the single-emcc recipe in docs/provenance.md, which is the
 # reference: the pinned artifact hashes come from that recipe.
@@ -49,14 +99,21 @@ list(SORT ENGINE_SOURCES)
 # picks the net_module_t symbol, and the build picks the translation unit.
 # Compiling the wrong one fails at the include (SDL_net.h) or at the link
 # (undefined net_sdl_module).
+#
+# Only the WebSocket transport is ever built here. net_sdl.c stays in the tree
+# as restored source for the M2 native engine and is excluded unconditionally,
+# because there is no configuration of this entry point that builds it.
 
-if(EMSCRIPTEN)
-    list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_sdl.c)
-else()
-    list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_websockets.c)
-endif()
+list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_sdl.c)
 
 add_executable(doom ${ENGINE_SOURCES})
+
+# GCC 15 and Clang 19 default to C23, which rejects this tree's legacy
+# doomtype.h enum member named false. The reference recipe is explicit about
+# the language version and this must be too, rather than inheriting whatever
+# the toolchain's default happens to become.
+
+set_target_properties(doom PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED YES)
 
 # -Wno-#warnings must be quoted: CMake would otherwise treat the # as the
 # start of a comment and pass the invalid flag -Wno- to the compiler.
@@ -73,41 +130,26 @@ target_compile_options(doom PRIVATE
     -ffile-prefix-map=${ENGINE_ROOT}/=
     )
 
-if(EMSCRIPTEN)
-    set_target_properties(doom PROPERTIES SUFFIX ".js")
+set_target_properties(doom PROPERTIES SUFFIX ".js")
 
-    target_compile_options(doom PRIVATE -sUSE_SDL=2 -sUSE_LIBPNG=1)
+target_compile_options(doom PRIVATE -sUSE_SDL=2 -sUSE_LIBPNG=1)
 
-    # Kept in step with docs/provenance.md. ASYNCIFY is not optional: I_Sleep
-    # yields through it, and without that the browser event loop never runs
-    # while the network code is waiting, so every connect times out.
-    # -lwebsocket.js supplies the transport's emscripten_websocket_* symbols.
+# Kept in step with docs/provenance.md. ASYNCIFY is not optional: I_Sleep
+# yields through it, and without that the browser event loop never runs
+# while the network code is waiting, so every connect times out.
+# -lwebsocket.js supplies the transport's emscripten_websocket_* symbols.
 
-    target_link_options(doom PRIVATE
-        -Oz
-        -sWASM=1
-        -sUSE_SDL=2
-        -sUSE_LIBPNG=1
-        -sALLOW_MEMORY_GROWTH=1
-        -sNO_EXIT_RUNTIME=1
-        -sEXPORTED_RUNTIME_METHODS=FS,UTF8ToString
-        -sMODULARIZE=1
-        -sASSERTIONS=0
-        -sASYNCIFY
-        -sASYNCIFY_STACK_SIZE=32768
-        -lwebsocket.js
-        )
-else()
-    # Native builds carry the UDP transport, so they need SDL2 and SDL2_net.
-    # These fail loudly at configure time rather than as a confusing missing
-    # include later.
-
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(SDL2 REQUIRED sdl2)
-    pkg_check_modules(SDL2_NET REQUIRED SDL2_net)
-
-    target_include_directories(doom PRIVATE
-        ${SDL2_INCLUDE_DIRS} ${SDL2_NET_INCLUDE_DIRS})
-    target_link_libraries(doom PRIVATE
-        ${SDL2_LIBRARIES} ${SDL2_NET_LIBRARIES} m)
-endif()
+target_link_options(doom PRIVATE
+    -Oz
+    -sWASM=1
+    -sUSE_SDL=2
+    -sUSE_LIBPNG=1
+    -sALLOW_MEMORY_GROWTH=1
+    -sNO_EXIT_RUNTIME=1
+    -sEXPORTED_RUNTIME_METHODS=FS,UTF8ToString
+    -sMODULARIZE=1
+    -sASSERTIONS=0
+    -sASYNCIFY
+    -sASYNCIFY_STACK_SIZE=32768
+    -lwebsocket.js
+    )
