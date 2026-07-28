@@ -67,7 +67,7 @@ export function parseCanaryLine(text) {
   }
 
   const state = text.match(
-    /^STATE CANARY: exit episode=(\d+) map=(\d+) gametic=(-?\d+) bytes=(\d+) sha256=([0-9a-f]{64})$/);
+    /^STATE CANARY: exit episode=(\d+) map=(\d+) gametic=(\d+) bytes=(\d+) sha256=([0-9a-f]{64})$/);
   if (state) {
     return {
       kind: "state",
@@ -125,10 +125,6 @@ function isCount(v) {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 }
 
-function isTic(v) {
-  return typeof v === "number" && Number.isSafeInteger(v);
-}
-
 export function isValidReport(r) {
   if (!r || typeof r !== "object") return false;
   if (r.type !== "report") return false;
@@ -141,7 +137,10 @@ export function isValidReport(r) {
 
   if (!s || typeof s !== "object" || s.kind !== "state") return false;
   if (!isCount(s.bytes) || !isDigest(s.sha256)) return false;
-  if (!isCount(s.episode) || !isCount(s.map) || !isTic(s.gametic)) return false;
+  // gametic included: it is a counter that starts at zero and is only ever
+  // incremented, so no legitimate producer emits a negative one and a
+  // negative value means the report was crafted or corrupt.
+  if (!isCount(s.episode) || !isCount(s.map) || !isCount(s.gametic)) return false;
 
   return true;
 }

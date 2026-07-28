@@ -81,6 +81,12 @@ const stateLine = (e, m, t, bytes, sha) =>
   // payload past the digest.
   check(parseCanaryLine(inputLine(10, H1) + " extra") === null,
         "trailing content after a result line is rejected");
+
+  // The parser is the other place a negative gametic could enter.
+  check(parseCanaryLine(stateLine(1, 1, -5000, 655, H2)) === null,
+        "a state line with a negative gametic is not parsed as a result");
+  check(parseCanaryLine(stateLine(1, 1, 0, 655, H2)) !== null,
+        "a state line with gametic zero still parses");
 }
 
 // --- room normalization ----------------------------------------------------
@@ -245,10 +251,17 @@ const mkReport = (session, partner, inSha, stSha, over = {}) => ({
     check(!isValidReport(r), `a report with ${why} is rejected`);
   }
 
-  // A negative gametic is legal; only non-integers are not.
-  const negTic = mkReport("a", "b", H1, H2);
-  negTic.state.gametic = -1;
-  check(isValidReport(negTic), "a negative gametic is allowed");
+  // gametic is a counter that starts at zero and is only ever incremented,
+  // so a negative one cannot come from the engine and is rejected.
+  for (const bad of [-1, -5000, Number.MIN_SAFE_INTEGER]) {
+    const negTic = mkReport("a", "b", H1, H2);
+    negTic.state.gametic = bad;
+    check(!isValidReport(negTic), `a negative gametic (${bad}) is rejected`);
+  }
+
+  const zeroTic = mkReport("a", "b", H1, H2);
+  zeroTic.state.gametic = 0;
+  check(isValidReport(zeroTic), "a zero gametic is allowed");
 
   const missing = mkReport("a", "b", H1, H2);
   delete missing.state;
