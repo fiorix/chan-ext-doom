@@ -163,13 +163,28 @@ const mkReport = (session, partner, inSha, stSha, over = {}) => ({
   check(compareReports(null, mkReport("you", "me", H1, H2)).aggregate === VERDICT.PENDING,
         "no local report yet is PENDING");
 
+  // A half report carries no exit identity, so there is no way to show it is
+  // about the same moment as ours. It is not comparable in either direction:
+  // it cannot reach MATCH, and an apparent disagreement in it cannot be
+  // distinguished from the peer simply being at a different exit. Reports on
+  // the wire are always complete, so this only guards the internal path.
   v = compareReports(mine, { input: mine.input });
-  check(v.input === VERDICT.MATCH && v.state === VERDICT.PENDING &&
-        v.aggregate === VERDICT.PENDING, "half a peer report cannot reach MATCH");
+  check(v.aggregate === VERDICT.PENDING, "half a peer report cannot reach MATCH");
+  check(v.input === VERDICT.PENDING && v.state === VERDICT.PENDING,
+        "half a peer report is not comparable at all");
 
   v = compareReports(mine, { input: { bytes: 1200, sha256: "e".repeat(64) } });
-  check(v.aggregate === VERDICT.MISMATCH,
-        "a disagreement in one half reports immediately");
+  check(v.aggregate === VERDICT.PENDING,
+        "an apparent disagreement in a half report is not reported as MISMATCH");
+
+  // Two complete reports at different exits are likewise not comparable: one
+  // window being a level ahead is not a divergence.
+  const otherExit = mkReport("you", "me", "c".repeat(64), "d".repeat(64));
+  otherExit.state.gametic = 9999;
+  check(compareReports(mine, otherExit).aggregate === VERDICT.PENDING,
+        "complete reports at different exits are PENDING, not MISMATCH");
+  check(compareReports(mine, otherExit).labels.aggregate === "M1 CANARY PENDING",
+        "and render the pending literal");
 }
 
 // --- the literal UI contract -----------------------------------------------

@@ -8,6 +8,7 @@
 
 import {
   receiveMessage,
+  receiveCanaryLine,
   armMessage,
   publishOutbound,
   armAdopts,
@@ -78,6 +79,23 @@ function makeWorld() {
       const p = pages.get(id);
       p.myReport = r;
       for (const m of publishOutbound(p)) broadcast(id, m);
+    },
+
+    // Feeds one engine log line through the same reducer the page uses, so
+    // the local half of the protocol is exercised rather than simulated.
+    line(id, text) {
+      const r = receiveCanaryLine(pages.get(id), text);
+      pages.set(id, r.state);
+      actions.push(`${id}:${r.action}`);
+      for (const out of r.outbound) broadcast(id, out);
+      return r.action;
+    },
+
+    // One whole exit, as the engine emits it: input line then state line.
+    finishExit(id, tic, inSha = H1, stSha = H2) {
+      this.line(id, `DEMO CANARY: exit bytes=1200 sha256=${inSha}`);
+      this.line(id,
+        `STATE CANARY: exit episode=1 map=1 gametic=${tic} bytes=655 sha256=${stSha}`);
     },
 
     send(fromId, msg) { broadcast(fromId, msg); },
@@ -331,6 +349,192 @@ function makeWorld() {
   check(drained, `eight pages: the queue drains (${steps} deliveries)`);
   check(w.countActions(":arm:adopt") <= 8,
         "eight pages: adoptions are bounded by the page count");
+}
+
+// --- multi-exit: both finish orders must converge ---------------------------
+
+// The defect this section exists for: a peer that finished an exit first had
+// its report discarded when the local page started that same exit, and since
+// receiving a report never triggers a reply, the second finisher waited for
+// something already delivered.
+
+function pairedWorld() {
+  const w = makeWorld();
+  w.add("A", "A1");
+  w.add("B", "B1");
+  w.drain();
+  return w;
+}
+
+// 1. first exit, each finish order
+for (const [first, second] of [["A", "B"], ["B", "A"]]) {
+  const w = pairedWorld();
+  w.finishExit(first, 1000);
+  w.drain();
+  check(w.verdict(first) === VERDICT.PENDING,
+        `first exit, ${first} first: the first finisher waits`);
+
+  w.finishExit(second, 1000);
+  const { drained } = w.drain();
+
+  check(drained, `first exit, ${first} first: the queue drains`);
+  check(w.verdict("A") === VERDICT.MATCH && w.verdict("B") === VERDICT.MATCH,
+        `first exit, ${first} first: both reach MATCH`);
+}
+
+// 2. second and third exits, both orders
+for (const [first, second] of [["A", "B"], ["B", "A"]]) {
+  const w = pairedWorld();
+
+  for (const [n, tic] of [[1, 1000], [2, 2000], [3, 3000]]) {
+    const inSha = String(n).repeat(64).slice(0, 64);
+    const stSha = String((n + 4) % 10).repeat(64).slice(0, 64);
+
+    w.finishExit(first, tic, inSha, stSha);
+    w.drain();
+    w.finishExit(second, tic, inSha, stSha);
+    const { drained } = w.drain();
+
+    check(drained, `exit ${n}, ${first} first: the queue drains`);
+    check(w.verdict("A") === VERDICT.MATCH && w.verdict("B") === VERDICT.MATCH,
+          `exit ${n}, ${first} first: both reach MATCH`);
+  }
+}
+
+// 3. a peer report arriving before local input, between input and state, and
+//    after local state
+{
+  // before local input
+  let w = pairedWorld();
+  w.finishExit("A", 1000);
+  w.drain();
+  w.finishExit("B", 1000);
+  w.drain();
+  check(w.verdict("B") === VERDICT.MATCH, "peer report before local input: MATCH");
+
+  // between local input and local state
+  w = pairedWorld();
+  w.line("B", `DEMO CANARY: exit bytes=1200 sha256=${H1}`);
+  w.finishExit("A", 1000);
+  w.drain();
+  check(w.verdict("B") === VERDICT.PENDING,
+        "peer report mid-report: still pending until the local pair completes");
+  w.line("B", `STATE CANARY: exit episode=1 map=1 gametic=1000 bytes=655 sha256=${H2}`);
+  w.drain();
+  check(w.verdict("B") === VERDICT.MATCH, "peer report mid-report: MATCH once complete");
+
+  // after local state
+  w = pairedWorld();
+  w.finishExit("B", 1000);
+  w.drain();
+  w.finishExit("A", 1000);
+  w.drain();
+  check(w.verdict("B") === VERDICT.MATCH, "peer report after local state: MATCH");
+}
+
+// 4. peers temporarily at different exits: PENDING, never a false MISMATCH
+{
+  const w = pairedWorld();
+  w.finishExit("A", 1000);
+  w.drain();
+  w.finishExit("B", 1000);
+  w.drain();
+  check(w.verdict("A") === VERDICT.MATCH, "different exits: matched at the first exit");
+
+  // A runs ahead to the next exit with entirely different digests.
+  w.finishExit("A", 2000, "7".repeat(64), "8".repeat(64));
+  w.drain();
+  check(w.verdict("B") !== VERDICT.MISMATCH,
+        "different exits: B does not report a divergence merely for being behind");
+  check(w.verdict("A") === VERDICT.PENDING,
+        "different exits: A waits rather than comparing across exits");
+
+  // B catches up with the same digests: they agree.
+  w.finishExit("B", 2000, "7".repeat(64), "8".repeat(64));
+  w.drain();
+  check(w.verdict("A") === VERDICT.MATCH && w.verdict("B") === VERDICT.MATCH,
+        "different exits: both match once B reaches the same exit");
+}
+
+// A real divergence at the same exit must still be reported.
+{
+  const w = pairedWorld();
+  w.finishExit("A", 1000, H1, H2);
+  w.drain();
+  w.finishExit("B", 1000, H1, "9".repeat(64));
+  w.drain();
+  check(w.verdict("A") === VERDICT.MISMATCH && w.verdict("B") === VERDICT.MISMATCH,
+        "a genuine divergence at the same exit is still MISMATCH on both");
+}
+
+// 5. duplicate and reordered peer reports
+{
+  const w = pairedWorld();
+  w.finishExit("A", 1000);
+  w.drain();
+  w.finishExit("B", 1000);
+  w.drain();
+  const settled = w.verdict("B");
+
+  // The same report again.
+  const aState = w.pages.get("A");
+  for (let i = 0; i < 3; i++) {
+    w.send("A", { type: "report", session: aState.session, partner: aState.partner,
+                  input: aState.myReport.input, state: aState.myReport.state });
+  }
+  w.drain();
+  check(w.verdict("B") === settled, "duplicate peer reports do not change the verdict");
+
+  // Both move to the next exit, then a stale report for the previous one
+  // arrives late and must not displace the newer result.
+  w.finishExit("A", 2000, "3".repeat(64), "4".repeat(64));
+  w.drain();
+  w.finishExit("B", 2000, "3".repeat(64), "4".repeat(64));
+  w.drain();
+  check(w.verdict("B") === VERDICT.MATCH, "second exit matches");
+
+  w.send("A", { type: "report", session: aState.session, partner: aState.partner,
+                input: { kind: "input", bytes: 1200, sha256: H1 },
+                state: { kind: "state", episode: 1, map: 1, gametic: 1000,
+                         bytes: 655, sha256: H2 } });
+  w.drain();
+  check(w.verdict("B") === VERDICT.MATCH,
+        "a late report for an older exit does not displace the newer one");
+  check(w.countActions(":report:stale") > 0, "the stale report is named as such");
+}
+
+// 6. no publish storm: a received report never causes another report
+{
+  const w = pairedWorld();
+  const before = w.countActions(":report:accepted");
+  w.finishExit("A", 1000);
+  w.drain();
+  w.finishExit("B", 1000);
+  const { drained, steps } = w.drain();
+
+  check(drained, "no storm: the queue drains");
+  check(steps < 20, `no storm: it settles in ${steps} deliveries`);
+  // Two complete reports, so each side accepts at most one.
+  check(w.countActions(":report:accepted") - before <= 2,
+        "no storm: each side accepts one report, and answers none");
+}
+
+// Bounded storage: many exits must not accumulate state.
+{
+  const w = pairedWorld();
+  for (let n = 1; n <= 12; n++) {
+    const sha = String(n % 10).repeat(64);
+    w.finishExit("A", n * 1000, sha, sha);
+    w.drain();
+    w.finishExit("B", n * 1000, sha, sha);
+    w.drain();
+    check(w.verdict("A") === VERDICT.MATCH, `exit ${n}: still matching`);
+  }
+  const p = w.pages.get("B");
+  check(Object.keys(p).length <= 6,
+        "twelve exits later the page still holds a fixed set of fields");
+  check(p.peerReport && p.peerReport.state.gametic === 12000,
+        "and only the newest peer report");
 }
 
 console.log(`${checks} checks, ${failures} failures`);

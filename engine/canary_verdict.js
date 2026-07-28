@@ -101,18 +101,6 @@ export function channelName(roomUrl) {
   return "doomit-canary:" + normalizeRoomUrl(roomUrl);
 }
 
-export function isComplete(report) {
-  return !!(report && report.input && report.state);
-}
-
-//
-// Validation of anything arriving on the channel.
-//
-// A structured-clone object from any same-origin page reaches this channel.
-// Being on it is not evidence of anything, so every field is checked before
-// it can influence a verdict.
-//
-
 function isSessionId(v) {
   return typeof v === "string" && v.length > 0 && v.length <= 128;
 }
@@ -124,6 +112,33 @@ function isDigest(v) {
 function isCount(v) {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 }
+
+export function isComplete(report) {
+  return !!(report && report.input && report.state);
+}
+
+// Which exit a complete report describes. Only the state half carries it, so
+// a half report has no exit identity and cannot be shown to be about the same
+// moment as anything else.
+export function exitKey(report) {
+  if (!report || !report.state) return null;
+  const s = report.state;
+  if (!isCount(s.episode) || !isCount(s.map) || !isCount(s.gametic)) return null;
+  return `${s.episode}:${s.map}:${s.gametic}`;
+}
+
+export function sameExit(a, b) {
+  const ka = exitKey(a);
+  return ka !== null && ka === exitKey(b);
+}
+
+//
+// Validation of anything arriving on the channel.
+//
+// A structured-clone object from any same-origin page reaches this channel.
+// Being on it is not evidence of anything, so every field is checked before
+// it can influence a verdict.
+//
 
 export function isValidReport(r) {
   if (!r || typeof r !== "object") return false;
@@ -226,10 +241,29 @@ function compareOne(mine, theirs) {
 }
 
 // Pessimistic by design: MATCH only when both components match, MISMATCH as
-// soon as either does even if the other is still unknown, PENDING otherwise.
+// soon as either does, PENDING otherwise.
+//
+// Two reports are only comparable when they describe the same exit. Peers run
+// at their own pace and are routinely at different exits for a moment, and
+// comparing across that boundary would report a divergence that is really
+// just one window being a level ahead. A half report carries no exit identity
+// at all, so it is not comparable either.
 export function compareReports(mine, theirs) {
-  const input = compareOne(mine && mine.input, theirs && theirs.input);
-  const state = compareOne(mine && mine.state, theirs && theirs.state);
+  if (!isComplete(mine) || !isComplete(theirs) || !sameExit(mine, theirs)) {
+    return {
+      input: VERDICT.PENDING,
+      state: VERDICT.PENDING,
+      aggregate: VERDICT.PENDING,
+      labels: {
+        input: LABEL.input[VERDICT.PENDING],
+        state: LABEL.state[VERDICT.PENDING],
+        aggregate: LABEL.aggregate[VERDICT.PENDING],
+      },
+    };
+  }
+
+  const input = compareOne(mine.input, theirs.input);
+  const state = compareOne(mine.state, theirs.state);
 
   let aggregate;
   if (input === VERDICT.MISMATCH || state === VERDICT.MISMATCH) {
@@ -313,6 +347,14 @@ export function receiveMessage(state, msg) {
     return { action: "report:rejected", state, outbound: [] };
   }
 
+  // One slot, so storage stays bounded however many exits a run reaches. A
+  // report for an exit older than the one already held is dropped, so a
+  // reordered delivery cannot displace a newer result with a stale one.
+  const held = state.peerReport;
+  if (held && held.state && msg.state.gametic < held.state.gametic) {
+    return { action: "report:stale", state, outbound: [] };
+  }
+
   return { action: "report:accepted", state: { ...state, peerReport: msg }, outbound: [] };
 }
 
@@ -320,4 +362,35 @@ export function receiveMessage(state, msg) {
 export function publishOutbound(state) {
   if (!state.partner || !isComplete(state.myReport)) return [];
   return [reportMessage(state)];
+}
+
+// The local half of the protocol: one engine log line in, new state out.
+//
+// This lived in the page, and that is precisely where a liveness defect hid.
+// A peer that finished an exit first would have its report discarded when the
+// local page started that same exit, and since receiving a report never
+// triggers a reply, the second finisher waited forever for something already
+// delivered. Both halves of the protocol are shared with the simulator now.
+export const LINE = {
+  IGNORED: "line:not-a-result",
+  PARTIAL: "line:partial",
+  COMPLETE: "line:complete",
+};
+
+export function receiveCanaryLine(state, text) {
+  const parsed = parseCanaryLine(text);
+  if (!parsed) return { action: LINE.IGNORED, state, outbound: [] };
+
+  // Starting a new exit deliberately does NOT drop the peer report. A peer
+  // that is ahead of us has already published the exit we are working
+  // towards, and throwing it away is what stranded the second finisher.
+  // Comparison is gated on the exit identity instead, so a retained report
+  // for a different exit reads as PENDING rather than as a divergence.
+  const next = { ...state, myReport: addCanaryLine(state.myReport, parsed) };
+
+  if (!isComplete(next.myReport)) {
+    return { action: LINE.PARTIAL, state: next, outbound: [] };
+  }
+
+  return { action: LINE.COMPLETE, state: next, outbound: publishOutbound(next) };
 }

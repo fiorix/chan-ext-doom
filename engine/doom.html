@@ -246,7 +246,7 @@
       import { classifyMessage, GATE } from "./message_gate.js";
       import {
         parseCanaryLine, channelName, isComplete, compareReports,
-        addCanaryLine, receiveMessage, armMessage, publishOutbound,
+        receiveMessage, receiveCanaryLine, armMessage,
         armAdopts, LABEL, VERDICT,
       } from "./canary_verdict.js";
 
@@ -582,21 +582,16 @@
 
       // A line that passed the message gate is still only text. It becomes a
       // result only if it parses strictly as one, so ordinary engine output
-      // and the armed line cannot be mistaken for evidence.
+      // and the armed line cannot be mistaken for evidence. The transition
+      // itself lives in the shared reducer: keeping it here is what let a
+      // liveness defect hide outside the tested protocol.
       function considerCanaryLine(text) {
-        const parsed = parseCanaryLine(text);
-        if (!parsed) return;
+        const r = receiveCanaryLine(peer, text);
+        if (r.action === "line:not-a-result") return;
 
-        const before = peer.myReport;
-        peer.myReport = addCanaryLine(peer.myReport, parsed);
-
-        // A second exit within one launch starts a fresh report, so a peer
-        // never sees a new input paired with the previous exit's state.
-        if (before && isComplete(before) && !isComplete(peer.myReport)) {
-          peer.peerReport = null;
-        }
-
-        if (isComplete(peer.myReport)) send(publishOutbound(peer));
+        peer = r.state;
+        window.__doomLastLine = r.action;
+        send(r.outbound);
         renderVerdict();
       }
 
