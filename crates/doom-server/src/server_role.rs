@@ -214,6 +214,18 @@ fn expand_tic(relative: u32, low: u8) -> i64 {
     result
 }
 
+/// Pinned acknowledgement contract: an expanded acknowledgement applies
+/// only when it is non-negative, strictly ahead of the stored value, and
+/// no greater than the peer's send sequence (a client cannot acknowledge
+/// tics the server never sent). Anything else is ignored, without
+/// affecting anything else in the same packet.
+fn apply_ack(game: &mut PeerGame, expanded: i64) {
+    if expanded < 0 || expanded <= game.acknowledged as i64 || expanded > game.sendseq as i64 {
+        return;
+    }
+    game.acknowledged = expanded as u32;
+}
+
 /// One receive-window slot for one player: a received tic, its latency,
 /// and the last time a resend was requested for it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -306,6 +318,10 @@ struct Peer {
     /// In-game state, initialized exactly once at game start and cleared
     /// on removal or game end so nothing stale reaches a later game.
     game: Option<PeerGame>,
+    /// The frozen per-game player index, assigned once at game start and
+    /// never renumbered while the game runs (pinned `sv_players[]`
+    /// semantics). `None` for drones and outside a game.
+    game_index: Option<usize>,
 }
 
 impl Peer {
@@ -332,6 +348,7 @@ impl Peer {
             last_send: now,
             last_waitdata: now,
             game: None,
+            game_index: None,
         }
     }
 
@@ -533,6 +550,7 @@ impl ServerRole {
         self.recv = None;
         for peer in self.peers.values_mut() {
             peer.game = None;
+            peer.game_index = None;
         }
 
         let survivors: Vec<PlayerId> = self.peers.keys().copied().collect();
@@ -903,11 +921,21 @@ impl ServerRole {
         }
 
         // Every window, acknowledgement, send sequence, and game-data
-        // clock initializes exactly once here.
+        // clock initializes exactly once here, and every connected
+        // non-drone player gets its frozen index for this game, in slot
+        // order. Later removals clear participation only and must not
+        // renumber survivors: holes are preserved.
         let now = self.clock;
         self.recv = Some(RecvWindow::new(0));
+        let players = self.established_players();
         for (_, peer) in self.peers.iter_mut().filter(|(_, peer)| peer.connected()) {
             peer.game = Some(PeerGame::new(now));
+            peer.game_index = None;
+        }
+        for (index, player) in players.iter().enumerate() {
+            if let Some(peer) = self.peers.get_mut(player) {
+                peer.game_index = Some(index);
+            }
         }
 
         self.state = ServerState::InGame;
@@ -916,19 +944,21 @@ impl ServerRole {
 
     // --- in-game receive, acknowledgement, and retransmission ------------
 
-    /// The slot-order index of a connected player, or 8 for a drone
-    /// (drones never occupy a receive slot because they never upload).
+    /// The frozen per-game index of a connected player, or `None` for a
+    /// drone (drones never occupy a receive slot because they never
+    /// upload). Assigned once at game start and never renumbered.
     fn recv_player_index(&self, player: PlayerId) -> Option<usize> {
-        let index = self.player_index(player);
-        (index >= 0).then_some(index as usize)
+        let peer = self.peers.get(&player)?;
+        peer.connected().then_some(peer.game_index)?
     }
 
     /// Pinned `NET_SV_ParseGameData`: accept uploads only in game and
     /// only from connected non-drone players. Expand both low bytes
-    /// against the receive window, store only in-range tics with their
-    /// diff and latency, raise the sender's acknowledgement
-    /// monotonically, and request any newly revealed missing run behind
-    /// the fresh data without duplicating a live request.
+    /// against the receive window; apply the acknowledgement
+    /// independently, so an invalid one never blocks in-window tics from
+    /// the same packet; store in-range tics only when the expanded start
+    /// is non-negative; and request any newly revealed missing run
+    /// behind the fresh data without duplicating a live request.
     fn on_upload(
         &mut self,
         player: PlayerId,
@@ -956,6 +986,23 @@ impl ServerRole {
         let ack_expanded = expand_tic(recv.start, data.ack);
         let start_expanded = expand_tic(recv.start, data.start);
 
+        // The acknowledgement is validated on its own and applied first,
+        // so an invalid one never blocks the in-window tics below.
+        if let Some(game) = self
+            .peers
+            .get_mut(&player)
+            .and_then(|peer| peer.game.as_mut())
+        {
+            apply_ack(game, ack_expanded);
+        }
+
+        // A negative expanded start is invalid for both insertion and
+        // gap generation (a positive start beyond the window still flows
+        // through the clamped gap scan below).
+        if start_expanded < 0 {
+            return actions;
+        }
+
         for (offset, tic) in data.tics.iter().enumerate() {
             let slot = start_expanded + offset as i64 - recv.start as i64;
             if !(0..BACKUPTICS as i64).contains(&slot) {
@@ -974,15 +1021,6 @@ impl ServerRole {
             {
                 game.last_gamedata = now;
             }
-        }
-
-        if let Some(game) = self
-            .peers
-            .get_mut(&player)
-            .and_then(|peer| peer.game.as_mut())
-            && ack_expanded > game.acknowledged as i64
-        {
-            game.acknowledged = ack_expanded as u32;
         }
 
         // Missing-run discovery behind the new data: scan down for the
@@ -1021,9 +1059,9 @@ impl ServerRole {
         actions
     }
 
-    /// Pinned `NET_SV_ParseGameDataACK`: the same monotonic expanded
-    /// acknowledgement update, from any connected client including
-    /// drones (pinned: drones acknowledge).
+    /// Pinned `NET_SV_ParseGameDataACK`: the same independently
+    /// validated acknowledgement update, from any connected client
+    /// including drones (pinned: drones acknowledge).
     fn on_gamedata_ack(&mut self, player: PlayerId, ack: u8) {
         if self.state != ServerState::InGame {
             return;
@@ -1038,10 +1076,8 @@ impl ServerRole {
         if !peer.connected() {
             return;
         }
-        if let Some(game) = peer.game.as_mut()
-            && ack_expanded > game.acknowledged as i64
-        {
-            game.acknowledged = ack_expanded as u32;
+        if let Some(game) = peer.game.as_mut() {
+            apply_ack(game, ack_expanded);
         }
     }
 
@@ -1078,8 +1114,11 @@ impl ServerRole {
         actions
     }
 
-    /// Emit a fan-out span from a peer's send queue. Every entry is
-    /// verified by absolute identity before encoding.
+    /// Emit a fan-out span from a peer's send queue, all or nothing:
+    /// every requested entry must still match its queued absolute
+    /// identity, otherwise the whole send is inert. Skipping an interior
+    /// entry would compress the span under its old start and alias the
+    /// tail onto the wrong absolute tics.
     fn send_tics(&mut self, player: PlayerId, start: u32, end: u64) -> Vec<Action> {
         let mut tics: Vec<doom_proto::FullTic> = Vec::new();
         let Some(peer) = self.peers.get(&player) else {
@@ -1089,10 +1128,9 @@ impl ServerRole {
             return Vec::new();
         };
         for tic in start as u64..=end {
-            if let Some(queued) = &game.sendqueue[(tic as usize) % BACKUPTICS]
-                && queued.seq as u64 == tic
-            {
-                tics.push(queued.tic.clone());
+            match &game.sendqueue[(tic as usize) % BACKUPTICS] {
+                Some(queued) if queued.seq as u64 == tic => tics.push(queued.tic.clone()),
+                _ => return Vec::new(),
             }
         }
 
@@ -1309,7 +1347,7 @@ impl ServerRole {
         }
         let indices: Vec<usize> = players
             .iter()
-            .map(|player| self.player_index(*player) as usize)
+            .filter_map(|player| self.peers.get(player)?.game_index)
             .collect();
         let Some(recv) = self.recv.as_mut() else {
             return;
@@ -1363,17 +1401,30 @@ impl ServerRole {
         }
         let recv_index = recv_index as usize;
 
-        let players = self.established_players();
-        let recipient_index = players.iter().position(|candidate| *candidate == player);
+        // Frozen per-game indices: removal never renumbers the columns.
+        let players: Vec<(usize, PlayerId)> = self
+            .established_players()
+            .into_iter()
+            .filter_map(|candidate| {
+                self.peers
+                    .get(&candidate)
+                    .and_then(|peer| peer.game_index)
+                    .map(|index| (index, candidate))
+            })
+            .collect();
+        let recipient_index = players
+            .iter()
+            .find(|(_, candidate)| *candidate == player)
+            .map(|(index, _)| *index);
 
         // The current tic must be present from every other connected
         // player (the recipient relies on its own command already).
         let mut others = 0usize;
-        for (index, _) in players.iter().enumerate() {
-            if Some(index) == recipient_index {
+        for (index, _) in &players {
+            if Some(*index) == recipient_index {
                 continue;
             }
-            if !recv.entries[recv_index][index].active {
+            if !recv.entries[recv_index][*index].active {
                 return actions;
             }
             others += 1;
@@ -1383,21 +1434,23 @@ impl ServerRole {
             return actions;
         }
 
-        // Merge: every active player's diff, ascending index, max latency.
+        // Merge: every active player's diff, ascending frozen index, max
+        // latency. The playeringame bits and the ascending order are
+        // frozen for the life of the game.
         let mut merged = doom_proto::FullTic {
             latency: 0,
             players: Vec::new(),
         };
-        for (index, _) in players.iter().enumerate() {
-            if Some(index) == recipient_index {
+        for (index, _) in &players {
+            if Some(*index) == recipient_index {
                 continue;
             }
-            let entry = &recv.entries[recv_index][index];
+            let entry = &recv.entries[recv_index][*index];
             if !entry.active {
                 continue;
             }
             merged.latency = merged.latency.max(entry.latency);
-            merged.players.push((index as u8, entry.diff.clone()));
+            merged.players.push((*index as u8, entry.diff.clone()));
         }
 
         let sendseq = game.sendseq;
@@ -1432,8 +1485,10 @@ impl ServerRole {
             consoleplayer: 0,
             player_classes: Vec::new(),
         });
-        // The emitted count never exceeds 255, the codec's bound.
-        let span = (settings.extratics as u32).min(254);
+        // extratics is validated below BACKUPTICS at game start, so the
+        // whole span is always inside the send queue (and far below the
+        // codec's 255-count bound).
+        let span = settings.extratics as u32;
         let start = sendseq.saturating_sub(span);
         actions.extend(self.send_tics(player, start, sendseq as u64));
 
@@ -1911,6 +1966,12 @@ fn valid_game_version(mission: u8, version: u8) -> bool {
 /// `NET_ValidGameSettings` (net_common.c).
 fn valid_game_settings(mode: u8, mission: u8, settings: &GameSettings) -> bool {
     if settings.ticdup == 0 || settings.deathmatch > 2 {
+        return false;
+    }
+    // Deliberate abuse-path deviation: upstream accepts any extratics
+    // byte, but a span of BACKUPTICS or more cannot be replayed
+    // atomically from the bounded send queue, so reject it here.
+    if settings.extratics as usize >= BACKUPTICS {
         return false;
     }
     if !(-1..=4).contains(&settings.skill) {
