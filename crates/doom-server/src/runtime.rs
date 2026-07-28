@@ -5,7 +5,7 @@
 //! mix; transport identity and address maps live here at the binding,
 //! never in the sans-I/O role.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
@@ -45,6 +45,7 @@ pub async fn serve(
         rooms: HashMap::new(),
         outbox_capacity,
         started: Instant::now(),
+        next_listener: 0,
         udp_notifiers: HashMap::new(),
     })));
     let router = crate::websocket::router(state.clone());
@@ -72,10 +73,22 @@ pub(crate) struct Runtime {
     pub(crate) rooms: HashMap<RoomName, BindRoom>,
     pub(crate) outbox_capacity: NonZeroUsize,
     pub(crate) started: Instant,
-    /// UDP listener notifiers by pinned room name, independent of the
-    /// room hosts' lifetime: a pinned room still drops when empty, so
-    /// a reconnect always starts a fresh role.
-    pub(crate) udp_notifiers: HashMap<RoomName, Arc<Notify>>,
+    /// The next opaque UDP listener identity to issue.
+    pub(crate) next_listener: u64,
+    /// UDP listener wake handles by opaque listener identity: two
+    /// listeners pinned to one room stay distinct, and the table lives
+    /// outside the room map so a configured listener never pins an
+    /// otherwise empty room host.
+    pub(crate) udp_notifiers: HashMap<ListenerId, Arc<Notify>>,
+}
+
+/// One admitted UDP peer: the listener it arrived on plus its remote
+/// address. Reply provenance, wakeups, and lifecycle are scoped to
+/// that pair, so the same remote socket reaching two listeners of one
+/// room is two distinct peers sharing the one `RoomHost`.
+pub(crate) struct UdpPeer {
+    pub(crate) listener: ListenerId,
+    pub(crate) address: SocketAddr,
 }
 
 /// One named room across all transports: the shared host plus the
@@ -84,14 +97,17 @@ pub(crate) struct BindRoom {
     pub(crate) host: RoomHost<RouteId>,
     pub(crate) connections: HashMap<PlayerId, Connection>,
     pub(crate) routes: HashMap<RouteId, PlayerId>,
-    /// UDP address identity, binding-owned: removed in the same
-    /// reduction as the registry removal, without consulting the role.
-    pub(crate) udp_players: HashMap<PlayerId, SocketAddr>,
-    pub(crate) udp_addresses: HashMap<SocketAddr, PlayerId>,
+    /// UDP address identity, binding-owned and listener-scoped:
+    /// removed in the same reduction as the registry removal, without
+    /// consulting the role.
+    pub(crate) udp_players: HashMap<PlayerId, UdpPeer>,
+    pub(crate) udp_addresses: HashMap<(ListenerId, SocketAddr), PlayerId>,
     /// Datagrams captured at removal time (the removed peer's remaining
-    /// outbox and its terminal, terminal last). Bounded per removal by
-    /// the removed peer's own bounded outbox; drained by the listener.
-    pub(crate) pending_udp: std::collections::VecDeque<(SocketAddr, Vec<u8>)>,
+    /// outbox and its terminal, terminal last), per listener so each
+    /// socket sends exactly its own peers' traffic. Bounded per removal
+    /// by the removed peer's own bounded outbox; drained by the
+    /// listener that owns it.
+    pub(crate) pending_udp: HashMap<ListenerId, VecDeque<(SocketAddr, Vec<u8>)>>,
 }
 
 pub(crate) struct Connection {
@@ -107,7 +123,7 @@ pub(crate) struct Connection {
 pub(crate) struct Effects {
     /// WebSocket writers to wake.
     pub(crate) ws_waiters: Vec<Arc<Notify>>,
-    /// UDP room notifiers to wake so the listener drains and sends.
+    /// UDP listener notifiers to wake so each listener drains and sends.
     pub(crate) udp_waiters: Vec<Arc<Notify>>,
     /// Datagrams to send immediately, outside any room state (the
     /// stateless QUERY reply).
@@ -134,7 +150,7 @@ impl BindRoom {
             routes: HashMap::new(),
             udp_players: HashMap::new(),
             udp_addresses: HashMap::new(),
-            pending_udp: std::collections::VecDeque::new(),
+            pending_udp: HashMap::new(),
         }
     }
 
@@ -171,11 +187,11 @@ impl BindRoom {
     pub(crate) fn apply(
         &mut self,
         effect: HostEffect,
-        udp_notifier: Option<&Arc<Notify>>,
+        udp_notifiers: &HashMap<ListenerId, Arc<Notify>>,
     ) -> Effects {
         let mut effects = Effects::default();
-        let notify_udp = |effects: &mut Effects| {
-            if let Some(notifier) = udp_notifier
+        let notify_udp = |effects: &mut Effects, listener: ListenerId| {
+            if let Some(notifier) = udp_notifiers.get(&listener)
                 && !effects.udp_waiters.iter().any(|w| Arc::ptr_eq(w, notifier))
             {
                 effects.udp_waiters.push(Arc::clone(notifier));
@@ -185,8 +201,8 @@ impl BindRoom {
             if let Some(connection) = self.connections.get(&player) {
                 effects.ws_waiters.push(Arc::clone(&connection.waiter));
             }
-            if self.udp_players.contains_key(&player) {
-                notify_udp(&mut effects);
+            if let Some(peer) = self.udp_players.get(&player) {
+                notify_udp(&mut effects, peer.listener);
             }
         }
         for (player, terminal) in effect.disconnects {
@@ -198,16 +214,16 @@ impl BindRoom {
                     connection.terminal = Some(frame);
                 }
                 effects.ws_waiters.push(Arc::clone(&connection.waiter));
-            } else if let Some(address) = self.udp_players.remove(&player) {
-                self.udp_addresses.remove(&address);
+            } else if let Some(peer) = self.udp_players.remove(&player) {
+                self.udp_addresses.remove(&(peer.listener, peer.address));
+                let pending = self.pending_udp.entry(peer.listener).or_default();
                 while let Some(packet) = self.host.pop_outbound(player) {
-                    self.pending_udp
-                        .push_back((address, packet.payload().to_vec()));
+                    pending.push_back((peer.address, packet.payload().to_vec()));
                 }
                 if let Some(terminal) = terminal {
-                    self.pending_udp.push_back((address, terminal));
+                    pending.push_back((peer.address, terminal));
                 }
-                notify_udp(&mut effects);
+                notify_udp(&mut effects, peer.listener);
             }
         }
         effects
@@ -219,11 +235,15 @@ impl Runtime {
         Milliseconds(self.started.elapsed().as_millis() as u64)
     }
 
-    pub(crate) fn room_or_insert(&mut self, room_name: &RoomName) -> &mut BindRoom {
-        let capacity = self.outbox_capacity;
-        self.rooms
-            .entry(room_name.clone())
-            .or_insert_with(|| BindRoom::new(room_name, capacity))
+    /// Issue the opaque identity and wake handle for one configured
+    /// UDP listener. The handle lives outside the room map, so a
+    /// listener never retains an otherwise empty room host.
+    pub(crate) fn register_listener(&mut self) -> (ListenerId, Arc<Notify>) {
+        let listener = ListenerId(self.next_listener);
+        self.next_listener += 1;
+        let notifier = Arc::new(Notify::new());
+        self.udp_notifiers.insert(listener, Arc::clone(&notifier));
+        (listener, notifier)
     }
 
     pub(crate) fn join(
@@ -232,8 +252,15 @@ impl Runtime {
         waiter: Arc<Notify>,
     ) -> Result<(PlayerId, Effects), JoinError> {
         let now = self.now();
-        let notifier = self.udp_notifiers.get(&room_name).cloned();
-        let room = self.room_or_insert(&room_name);
+        let Self {
+            rooms,
+            udp_notifiers,
+            outbox_capacity,
+            ..
+        } = self;
+        let room = rooms
+            .entry(room_name.clone())
+            .or_insert_with(|| BindRoom::new(&room_name, *outbox_capacity));
         let (player, effect) = room
             .host
             .join(now, |player| format!("ws:{}", player.get()).into_bytes())?;
@@ -245,7 +272,7 @@ impl Runtime {
                 terminal: None,
             },
         );
-        Ok((player, room.apply(effect, notifier.as_ref())))
+        Ok((player, room.apply(effect, udp_notifiers)))
     }
 
     /// Transport hangup or binding-initiated removal: the room host's
@@ -256,12 +283,16 @@ impl Runtime {
     pub(crate) fn leave(&mut self, room_name: &RoomName, player_id: PlayerId) -> Effects {
         let mut effects = Effects::default();
         let now = self.now();
-        let Some(room) = self.rooms.get_mut(room_name) else {
+        let Self {
+            rooms,
+            udp_notifiers,
+            ..
+        } = self;
+        let Some(room) = rooms.get_mut(room_name) else {
             return effects;
         };
         let effect = room.host.leave(now, player_id);
-        let notifier = self.udp_notifiers.get(room_name).cloned();
-        effects.merge(room.apply(effect, notifier.as_ref()));
+        effects.merge(room.apply(effect, udp_notifiers));
         if let Some(connection) = room.connections.remove(&player_id) {
             if let Some(route) = connection.route {
                 room.routes.remove(&route);
@@ -269,7 +300,7 @@ impl Runtime {
             effects.ws_waiters.push(connection.waiter);
         }
         if room.is_empty() {
-            self.rooms.remove(room_name);
+            rooms.remove(room_name);
         }
         effects
     }
@@ -281,16 +312,20 @@ impl Runtime {
         let now = self.now();
         let mut effects = Effects::default();
         let mut empty = Vec::new();
-        for (room_name, room) in &mut self.rooms {
+        let Self {
+            rooms,
+            udp_notifiers,
+            ..
+        } = self;
+        for (room_name, room) in rooms.iter_mut() {
             let effect = room.host.tick(now);
-            let notifier = self.udp_notifiers.get(room_name).cloned();
-            effects.merge(room.apply(effect, notifier.as_ref()));
+            effects.merge(room.apply(effect, udp_notifiers));
             if room.is_empty() {
                 empty.push(room_name.clone());
             }
         }
         for room_name in empty {
-            self.rooms.remove(&room_name);
+            rooms.remove(&room_name);
         }
         effects
     }
@@ -334,6 +369,12 @@ impl RouteId {
         self.0.get()
     }
 }
+
+/// Opaque identity of one configured UDP listener, issued at serve
+/// startup. UDP address identity is the `(ListenerId, SocketAddr)`
+/// pair, never the remote address alone.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ListenerId(u64);
 
 /// Classify undecodable server-addressed bytes narrowly: a SYN-shaped
 /// type with the pinned pre-3.0 magic is the one case with a

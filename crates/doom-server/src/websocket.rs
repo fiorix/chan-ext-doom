@@ -111,27 +111,34 @@ impl Runtime {
         };
         if destination.get() == SERVER_ROUTE {
             let now = self.now();
-            let notifier = self.udp_notifiers.get(room_name).cloned();
-            let Some(room) = self.rooms.get_mut(room_name) else {
+            let Self {
+                rooms,
+                udp_notifiers,
+                ..
+            } = self;
+            let Some(room) = rooms.get_mut(room_name) else {
                 return Ok(Effects::default());
             };
             let effect = room.server_payload(now, player_id, envelope.payload);
-            return Ok(room.apply(effect, notifier.as_ref()));
+            return Ok(room.apply(effect, udp_notifiers));
         }
 
         let Some(recipient) = self.recipient(room_name, destination) else {
             return Ok(Effects::default());
         };
         let now = self.now();
-        let notifier = self.udp_notifiers.get(room_name).cloned();
-        let room = self
-            .rooms
+        let Self {
+            rooms,
+            udp_notifiers,
+            ..
+        } = self;
+        let room = rooms
             .get_mut(room_name)
             .ok_or(BindingError::UnknownPlayer)?;
         let (_, effect) =
             room.host
                 .relay(now, player_id, recipient, envelope.from, envelope.payload)?;
-        Ok(room.apply(effect, notifier.as_ref()))
+        Ok(room.apply(effect, udp_notifiers))
     }
 }
 
@@ -372,6 +379,7 @@ mod tests {
             rooms: HashMap::new(),
             outbox_capacity: NonZeroUsize::new(capacity).expect("test capacity is nonzero"),
             started: Instant::now(),
+            next_listener: 0,
             udp_notifiers: HashMap::new(),
         }
     }
