@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -284,6 +286,11 @@ impl Runtime {
 
 async fn timer_loop(state: ServerState) {
     let mut interval = tokio::time::interval(TIMER_PERIOD);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Executor starvation or a suspended process must not become an
+    // unbounded catch-up burst: missed ticks are skipped, while the
+    // role clock still sees the real jump through monotonic elapsed
+    // milliseconds.
     loop {
         interval.tick().await;
         let waiters = {
@@ -561,7 +568,7 @@ mod tests {
     fn test_runtime() -> Runtime {
         Runtime {
             rooms: HashMap::new(),
-            outbox_capacity: NonZeroUsize::new(4).expect("test capacity is nonzero"),
+            outbox_capacity: NonZeroUsize::new(16).expect("test capacity is nonzero"),
             started: Instant::now(),
         }
     }
@@ -1182,6 +1189,68 @@ mod tests {
         client.close(None).await.expect("client closes");
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_timer_ticks_are_skipped_not_burst() {
+        // A single-player room in game: every timer pass pumps one
+        // fan-out, so fan-out count measures reducer passes.
+        let mut runtime = test_runtime();
+        let player = join(&mut runtime);
+        for payload in [
+            syn_packet("Alice", 0, 0, 0),
+            launch_packet(0),
+            ack_packet(1),
+            ack_packet(2),
+            settings_packet(1, 0),
+        ] {
+            let frame = client_frame(1, 20, &payload);
+            let envelope = decode_inbound(&frame).expect("frame decodes");
+            runtime
+                .handle_envelope(&room(), player, envelope)
+                .expect("envelope accepted");
+        }
+        {
+            let room = runtime.rooms.get_mut(&room()).expect("room");
+            assert!(room.host.contains(player), "the room is in game");
+            while room.host.pop_outbound(player).is_some() {}
+        }
+
+        let state = ServerState(Arc::new(Mutex::new(runtime)));
+        let timer = tokio::spawn(timer_loop(state.clone()));
+        // The interval exists and has ticked once; drain that pass.
+        tokio::task::yield_now().await;
+        {
+            let mut runtime = state.0.lock().await;
+            let room = runtime.rooms.get_mut(&room()).expect("room");
+            while room.host.pop_outbound(player).is_some() {}
+        }
+        // Ten seconds pass with the executor unable to service the
+        // timer: two hundred missed 50 ms ticks.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..15 {
+            tokio::task::yield_now().await;
+        }
+        timer.abort();
+
+        let mut runtime = state.0.lock().await;
+        let room = runtime.rooms.get_mut(&room()).expect("room");
+        let mut gamedata = 0;
+        while let Some(packet) = room.host.pop_outbound(player) {
+            if let ServerPacket::GameData(_) = ServerPacket::decode(packet.payload(), false)
+                .expect("decodes")
+                .1
+            {
+                gamedata += 1;
+            }
+        }
+        // Skip: one collapsed pass (one pump plus the one deadlock
+        // replay). Burst: one pass per missed tick — eleven pump
+        // emissions to the single-player cap plus the replay.
+        assert!(
+            gamedata <= 4,
+            "a 10 s jump produced {gamedata} fan-out packets: a catch-up burst, not a skip"
+        );
     }
 
     #[tokio::test]
