@@ -108,9 +108,14 @@ pub enum Action {
         packet: ServerPacket,
     },
     /// Remove the peer from the room. `terminal` is the final packet the
-    /// peer is owed (a REJECTED or an acknowledgement): the binding must
-    /// deliver it before closing, because the role's state for the peer
-    /// is already gone and no later send will ever be produced for it.
+    /// peer is owed (a REJECTED or an acknowledgement). This is the
+    /// SendAndClose contract, atomic by construction: the terminal
+    /// packet rides inside the removal action itself, so no ordering
+    /// mistake can separate it from the close, and the binding must
+    /// deliver it to the peer before closing, because the role's state
+    /// for the peer is already gone and no later send will ever be
+    /// produced for it. A binding-style reducer proves the delivery in
+    /// `terminal_packets_survive_a_binding_style_reducer`.
     Disconnect {
         player: PlayerId,
         reason: DisconnectReason,

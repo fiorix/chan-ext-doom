@@ -1705,6 +1705,9 @@ fn terminal_packets_survive_a_binding_style_reducer() {
             .any(|p| matches!(p, ServerPacket::Rejected { .. }))
     );
     assert!(host.closed.contains(&alice));
+    // The terminal packet is delivered as the FINAL packet before the
+    // removal takes effect: nothing owed is lost behind the close.
+    assert!(matches!(outbox.last(), Some(ServerPacket::Rejected { .. })));
 
     // Sleep-expiry removal carries no terminal but also cannot drop a
     // pending acknowledgement: the ACK went out as a plain send while the
