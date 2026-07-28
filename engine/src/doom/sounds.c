@@ -246,11 +246,10 @@ sfxinfo_t S_sfx[] =
 // The table must be exactly as long as the enum that indexes it. S_Start
 // initialises every entry from 1 to NUMSFX, so a table one row short is not a
 // missing sound: it is a write past the end, over whatever the linker placed
-// next. This tree has already paid for that once, with six missing rows
-// landing -1 on the first twelve S_music entries.
+// next.
 //
-// A negative array size is a constraint violation, so a mismatch is a
-// compile error rather than something a test has to discover at runtime by
+// A negative array size is a constraint violation, so a mismatch is a compile
+// error rather than something a test would have to discover at runtime by
 // performing the very out-of-bounds access it is trying to rule out.
 
 typedef char doomit_S_sfx_matches_NUMSFX[

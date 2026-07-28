@@ -17,11 +17,10 @@
 //     The tables' lengths are NOT proven here. sounds.c carries a
 //     compile-time guard requiring sizeof(S_sfx)/sizeof(S_sfx[0]) to equal
 //     NUMSFX, and the same for S_music and NUMMUSIC, so a mismatched table is
-//     a compile error in production and never reaches this file. That matters:
-//     an earlier version of this test declared the arrays as incomplete
-//     externs and indexed to the enum bound to infer their extent, which is
-//     undefined behaviour exactly when the tables are short, so it could only
-//     "detect" the fault by committing it.
+//     a compile error in production and never reaches this file. A length
+//     cannot be established from this side anyway: the arrays arrive here as
+//     incomplete externs, so indexing them to the enum bound to infer an
+//     extent would be undefined behaviour exactly when they are short.
 //
 //     What is left here is what a size check cannot say: that the entries the
 //     enum names are actually populated, and that running S_Start's own
