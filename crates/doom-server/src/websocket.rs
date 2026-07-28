@@ -566,9 +566,13 @@ mod tests {
     // --- reducer-level tests ---------------------------------------------
 
     fn test_runtime() -> Runtime {
+        test_runtime_with_capacity(4)
+    }
+
+    fn test_runtime_with_capacity(capacity: usize) -> Runtime {
         Runtime {
             rooms: HashMap::new(),
-            outbox_capacity: NonZeroUsize::new(16).expect("test capacity is nonzero"),
+            outbox_capacity: NonZeroUsize::new(capacity).expect("test capacity is nonzero"),
             started: Instant::now(),
         }
     }
@@ -1194,8 +1198,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn missed_timer_ticks_are_skipped_not_burst() {
         // A single-player room in game: every timer pass pumps one
-        // fan-out, so fan-out count measures reducer passes.
-        let mut runtime = test_runtime();
+        // fan-out, so fan-out count measures reducer passes. The local
+        // capacity fits the drive-to-gamestart flow, whose reliable
+        // chain peaks at six queued packets before the drain; the
+        // shared default of four would evict the peer mid-setup.
+        let mut runtime = test_runtime_with_capacity(8);
         let player = join(&mut runtime);
         for payload in [
             syn_packet("Alice", 0, 0, 0),

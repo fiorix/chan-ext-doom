@@ -9,10 +9,11 @@ use std::num::NonZeroUsize;
 
 use doom_proto::{ClientPacket, WireHeader};
 
+use crate::core::MAX_HOST_BATCH;
 use crate::server_role::{Action, Input, MalformedClass, Milliseconds, ServerRole};
 use crate::{
-    HostError, HostOutcome, JoinError, MAX_HOST_BATCH, OutboundPacket, PlayerId, Registry,
-    RelayError, RelayOutcome, RoomName,
+    HostError, HostOutcome, JoinError, OutboundPacket, PlayerId, Registry, RelayError,
+    RelayOutcome, RoomName,
 };
 
 /// What the binding must apply after one consistent reduction batch.

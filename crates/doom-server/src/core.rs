@@ -29,7 +29,7 @@ pub const MAX_PAYLOAD_LEN: usize = 65_527;
 /// `(capacity - 1) + MAX_HOST_BATCH` (63 + 67 = 130 with defaults),
 /// because a batch-start snapshot at capacity removes on the next
 /// send; `capacity + MAX_HOST_BATCH` is a safe loose upper bound.
-pub const MAX_HOST_BATCH: usize = 67;
+pub(crate) const MAX_HOST_BATCH: usize = 67;
 
 /// A validated room name.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -231,7 +231,7 @@ impl<Metadata> Registry<Metadata> {
     /// capacity at this moment is removed by its next host send, and an
     /// overflow left undrained at batch end is measured by the next
     /// batch's snapshot.
-    pub fn begin_host_batch(&mut self) {
+    pub(crate) fn begin_host_batch(&mut self) {
         let backlog = self
             .rooms
             .values()
@@ -245,7 +245,7 @@ impl<Metadata> Registry<Metadata> {
     }
 
     /// Ends the active host-originated batch.
-    pub fn end_host_batch(&mut self) {
+    pub(crate) fn end_host_batch(&mut self) {
         self.host_batch_backlog = None;
     }
 
@@ -733,7 +733,10 @@ mod tests {
         // configured capacity up to the producer's own measured bound:
         // the batch is producer-bounded, not consumer backlog.
         registry.begin_host_batch();
-        for _ in 0..MAX_HOST_BATCH {
+        // One beyond the producer invariant still queues: a batch
+        // addition is never a slow-consumer result by itself (the
+        // RoomHost reduction contract asserts the invariant loudly).
+        for _ in 0..=MAX_HOST_BATCH {
             assert_eq!(
                 registry
                     .queue_host(player, 1, b"burst")
