@@ -2002,3 +2002,118 @@ fn disconnecting_drone_is_not_counted_in_waiting_data() {
     let data = h.role.waiting_data(carol);
     assert_eq!(data.num_drones, 0, "a disconnecting drone is not connected");
 }
+
+#[test]
+fn presyn_member_is_timer_silent() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    let ghost = h.join("g");
+    h.syn(alice, "Alice");
+    h.ack(alice, 1);
+    // ghost is admitted but never sends SYN.
+
+    // Past the one-second send-idle threshold: no keepalive or any other
+    // action targets the pre-SYN member.
+    let actions = h.tick(2000);
+    assert!(
+        Harness::sends_to(&actions, ghost).is_empty(),
+        "a pre-SYN member must get no protocol traffic, got {actions:?}"
+    );
+
+    // Thirty seconds on, with the survivor's receive clock kept fresh: no
+    // timeout, disconnect, GameEnded, or console broadcast from the
+    // pre-SYN member, and in particular no empty-name broadcast to the
+    // live survivor.
+    for step in 1..=30 {
+        h.role.handle(
+            Milliseconds(T0.0 + 2000 + step * 1000),
+            Input::Packet {
+                player: alice,
+                header: WireHeader { reliable_seq: None },
+                packet: ClientPacket::Keepalive,
+            },
+        );
+    }
+    let actions = h.tick(32_000);
+    assert!(
+        Harness::sends_to(&actions, ghost).is_empty(),
+        "a pre-SYN member must stay timer-silent at 30 s, got {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::GameEnded)),
+        "a pre-SYN member must not end the game"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::Disconnect { .. })),
+        "a pre-SYN member must not be timed out"
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Send {
+            packet: ServerPacket::ConsoleMessage { message },
+            ..
+        } if message.starts_with(b"Client ''"))),
+        "no empty-name broadcast may reach the live survivor"
+    );
+    assert_eq!(h.role.peer_count(), 2);
+}
+
+#[test]
+fn reliable_cap_is_literally_sixty_four() {
+    // The deviation is deliberate and literal: 64 accepted, the 65th
+    // removes. This must not drift with a reused constant.
+    assert_eq!(RELIABLE_CAP, 64);
+
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+    h.role
+        .peers
+        .get_mut(&alice)
+        .expect("peer")
+        .reliable_outbox
+        .clear();
+
+    // Exactly sixty-four accepted enqueues, counted literally.
+    for _ in 0..64 {
+        let mut sink = Vec::new();
+        h.role.enqueue_reliable(
+            &mut sink,
+            alice,
+            ServerPacket::ConsoleMessage {
+                message: b"fill".to_vec(),
+            },
+        );
+    }
+    assert_eq!(
+        h.role
+            .peers
+            .get(&alice)
+            .expect("peer")
+            .reliable_outbox
+            .len(),
+        64
+    );
+    assert_eq!(h.role.peer_count(), 1);
+
+    // The 65th removes the peer without allocation or victim emission.
+    let mut actions = Vec::new();
+    h.role.enqueue_reliable(
+        &mut actions,
+        alice,
+        ServerPacket::ConsoleMessage {
+            message: b"one too many".to_vec(),
+        },
+    );
+    assert!(actions.iter().any(|a| matches!(a, Action::Disconnect {
+        player,
+        reason: DisconnectReason::ReliableOverflow,
+        ..
+    } if *player == alice)));
+    assert!(
+        Harness::sends_to(&actions, alice).is_empty(),
+        "the 65th emits nothing to the removed peer"
+    );
+    assert_eq!(h.role.peer_count(), 0);
+}
