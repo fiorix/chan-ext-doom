@@ -99,9 +99,9 @@ pub(crate) async fn listener(
             }
             _ = notifier.notified() => {}
         }
-        let (datagrams, effects) = {
+        let (datagrams, effects, taken) = {
             let mut runtime = state.0.lock().await;
-            runtime.drain_udp(listener_id, &room_name)
+            runtime.take_udp(listener_id, &room_name)
         };
         for waiter in effects.ws_waiters {
             waiter.notify_one();
@@ -113,6 +113,12 @@ pub(crate) async fn listener(
             // Send failures are isolated and bounded: the datagram is
             // dropped, role state is untouched, no queue is retained.
             let _ = socket.send_to(&bytes, address).await;
+        }
+        // Phase two after the actual send attempts: clear this batch's
+        // tombstones and drop the room if nothing retains it.
+        {
+            let mut runtime = state.0.lock().await;
+            runtime.finish_udp(listener_id, &room_name, taken);
         }
     }
 }
@@ -257,26 +263,30 @@ impl Runtime {
         }
     }
 
-    /// Drain every owed datagram for one listener of a room: its
-    /// pending removal traffic first (terminal last per removed peer),
-    /// then each of its mapped peers' outboxes FIFO. Capturing the
-    /// pending batch for the send attempt clears this listener's
-    /// removal tombstones, and a room left empty afterwards is dropped
-    /// here, so pending traffic is part of room lifetime. An outbound
-    /// datagram over the 1500-byte ceiling is first offered to the
-    /// accepted `GAMEDATA` newest-suffix adaptation; only a packet that
-    /// cannot be adapted is a distinct producer error, never truncated,
-    /// split, silently dropped, or sent through the slow-consumer path,
-    /// isolating exactly its intended recipient through the normal
-    /// removal path while every other peer continues. The effects of
-    /// that isolation (survivor wakeups, the isolated peer's own
-    /// terminal capture) ride the returned `Effects` through the same
-    /// post-lock delivery path as every other reduction.
-    pub(crate) fn drain_udp(
+    /// Take every owed datagram for one listener of a room — phase one
+    /// of the send contract. The batch is the listener's pending
+    /// removal traffic first (terminal last per removed peer), then
+    /// each of its mapped peers' outboxes FIFO. The take only MOVES
+    /// the batch: this listener's tombstones stay and the room stays
+    /// draining while the batch is in flight, so no new session can
+    /// start before the prior terminal actually leaves the socket.
+    /// The listener sends outside the lock, then calls `finish_udp`
+    /// (phase two) to clear exactly this batch's tombstones and drop
+    /// the room if it is now empty. An outbound datagram over the
+    /// 1500-byte ceiling is first offered to the accepted `GAMEDATA`
+    /// newest-suffix adaptation; only a packet that cannot be adapted
+    /// is a distinct producer error, never truncated, split, silently
+    /// dropped, or sent through the slow-consumer path, isolating
+    /// exactly its intended recipient through the normal removal path
+    /// while every other peer continues. The effects of that isolation
+    /// (survivor wakeups, the isolated peer's own terminal capture)
+    /// ride the returned `Effects` through the same post-lock delivery
+    /// path as every other reduction.
+    pub(crate) fn take_udp(
         &mut self,
         listener: ListenerId,
         room_name: &RoomName,
-    ) -> (Vec<(SocketAddr, Vec<u8>)>, Effects) {
+    ) -> (Vec<(SocketAddr, Vec<u8>)>, Effects, TakenUdpBatch) {
         let now = self.now();
         let Self {
             rooms,
@@ -285,12 +295,26 @@ impl Runtime {
         } = self;
         let mut out = Vec::new();
         let mut effects = Effects::default();
+        let mut taken = TakenUdpBatch::default();
         let mut oversized: Vec<(PlayerId, usize)> = Vec::new();
         {
             let Some(room) = rooms.get_mut(room_name) else {
-                return (out, effects);
+                return (out, effects, taken);
             };
+            debug_assert!(
+                !room.udp_inflight.contains(&listener),
+                "one in-flight batch per listener"
+            );
             let lowres = room.host.lowres_turn();
+            // The tombstones this batch answers for, snapshotted before
+            // any new removal can add its own: finishing clears exactly
+            // these, never state created after the take.
+            taken.tombstones = room
+                .udp_draining
+                .iter()
+                .filter(|(candidate, _)| *candidate == listener)
+                .copied()
+                .collect();
             if let Some(pending) = room.pending_udp.get_mut(&listener) {
                 while let Some((address, bytes)) = pending.pop_front() {
                     if bytes.len() > MAX_DATAGRAM_LEN {
@@ -306,11 +330,6 @@ impl Runtime {
                     out.push((address, bytes));
                 }
             }
-            // This listener's pending batch is captured above for the
-            // send attempt that follows the lock release, so its
-            // removal tombstones clear and re-admission opens.
-            room.udp_draining
-                .retain(|(candidate, _)| *candidate != listener);
             let players: Vec<(PlayerId, SocketAddr)> = room
                 .udp_players
                 .iter()
@@ -342,6 +361,9 @@ impl Runtime {
                     out.push((address, bytes.to_vec()));
                 }
             }
+            if !out.is_empty() {
+                room.udp_inflight.insert(listener);
+            }
         }
         for (player, _) in oversized {
             if let Some(room) = rooms.get_mut(room_name) {
@@ -349,13 +371,40 @@ impl Runtime {
                 effects.merge(room.apply(effect, udp_notifiers));
             }
         }
-        // Final empty-room cleanup: a room whose last batch this drain
-        // attempted now drops, and the next valid SYN starts fresh.
-        if rooms.get(room_name).is_some_and(BindRoom::is_empty) {
-            rooms.remove(room_name);
-        }
-        (out, effects)
+        (out, effects, taken)
     }
+
+    /// Phase two of the send contract, called after the listener
+    /// attempted every datagram of the taken batch outside the lock:
+    /// clear exactly that batch's tombstones (never pending state or
+    /// tombstones created after the take) and drop the room if nothing
+    /// retains it anymore.
+    pub(crate) fn finish_udp(
+        &mut self,
+        listener: ListenerId,
+        room_name: &RoomName,
+        taken: TakenUdpBatch,
+    ) {
+        let Some(room) = self.rooms.get_mut(room_name) else {
+            return;
+        };
+        room.udp_inflight.remove(&listener);
+        for identity in taken.tombstones {
+            room.udp_draining.remove(&identity);
+        }
+        if room.is_empty() {
+            self.rooms.remove(room_name);
+        }
+    }
+}
+
+/// The tombstone snapshot of one taken listener batch: finishing that
+/// batch clears exactly these identities, never state created after
+/// the take. Binding-owned; the listener carries it across the send
+/// attempts.
+#[derive(Default)]
+pub(crate) struct TakenUdpBatch {
+    tombstones: Vec<(ListenerId, SocketAddr)>,
 }
 
 #[cfg(test)]
@@ -365,8 +414,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::JoinError;
-    use crate::runtime::{ListenerFuture, udp_supervisor};
+    use crate::runtime::{JoinRefusal, ListenerFuture, udp_supervisor};
     use doom_proto::{ConnectData, FullTic, GameSettings, Syn, TiccmdDiff};
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -475,6 +523,18 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:23420".parse().expect("valid addr")
+    }
+
+    /// Take and immediately finish one listener batch, mirroring the
+    /// listener loop when the sends happen between the two phases.
+    fn drain(
+        rt: &mut Runtime,
+        listener: ListenerId,
+        room: &RoomName,
+    ) -> (Vec<(SocketAddr, Vec<u8>)>, Effects) {
+        let (datagrams, effects, taken) = rt.take_udp(listener, room);
+        rt.finish_udp(listener, room, taken);
+        (datagrams, effects)
     }
 
     /// A fully populated vanilla diff: 8 bytes wide, 7 lowres, so the
@@ -687,7 +747,7 @@ mod tests {
         let first = rt.rooms[&room()].udp_addresses[&(listener, from)];
         // Drain the accept/waiting so the acknowledgement below is
         // unambiguous.
-        rt.drain_udp(listener, &room());
+        drain(&mut rt, listener, &room());
 
         // The remote disconnect is acknowledged through the ordinary
         // outbox path.
@@ -699,7 +759,7 @@ mod tests {
                 .encode(WireHeader { reliable_seq: None }, false)
                 .expect("encodes"),
         );
-        let (datagrams, _) = rt.drain_udp(listener, &room());
+        let (datagrams, _) = drain(&mut rt, listener, &room());
         assert!(
             datagrams.iter().any(|(a, bytes)| {
                 *a == from && matches!(decode_server(bytes, false), ServerPacket::DisconnectAck)
@@ -719,7 +779,7 @@ mod tests {
                 .get(&room())
                 .is_none_or(|bind_room| bind_room.udp_addresses.is_empty())
         );
-        rt.drain_udp(listener, &room());
+        drain(&mut rt, listener, &room());
         if let Some(bind_room) = rt.rooms.get(&room()) {
             assert!(!bind_room.host.contains(first));
         }
@@ -779,7 +839,7 @@ mod tests {
         // (d) Removal of (l1, from) leaves (l2, from) fully intact, and
         // draining the removed peer's batch disturbs nothing else.
         rt.leave(&room(), p1);
-        rt.drain_udp(l1, &room());
+        drain(&mut rt, l1, &room());
         let bind_room = rt.rooms.get(&room()).expect("room stays alive");
         assert!(!bind_room.udp_addresses.contains_key(&(l1, from)));
         assert!(!bind_room.host.contains(p1));
@@ -929,7 +989,7 @@ mod tests {
             .host
             .relay(now, other, player, route, &lowres)
             .expect("fits the room-core bound");
-        let (datagrams, _) = rt.drain_udp(listener, &room());
+        let (datagrams, _) = drain(&mut rt, listener, &room());
         let relayed: Vec<&Vec<u8>> = datagrams
             .iter()
             .map(|(_, bytes)| bytes)
@@ -972,7 +1032,7 @@ mod tests {
             .relay(now, other, player, route, &bytes)
             .expect("fits the room-core bound");
 
-        let (datagrams, effects) = rt.drain_udp(listener, &room());
+        let (datagrams, effects) = drain(&mut rt, listener, &room());
         let adapted_bytes = datagrams
             .iter()
             .map(|(_, bytes)| bytes)
@@ -1010,6 +1070,25 @@ mod tests {
 
     // --- H4: pending traffic in room lifetime ------------------------------
 
+    /// The draining-room refusals that must hold from the removal
+    /// until the listener FINISHES the batch's send attempts: no
+    /// re-admission of the removed address, no new session in the
+    /// room, WebSocket joins refused.
+    fn assert_draining_refusals(rt: &mut Runtime, listener: ListenerId, from: SocketAddr) {
+        let effects = rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        assert!(effects.ws_waiters.is_empty());
+        assert!(effects.udp_waiters.is_empty());
+        assert!(effects.direct_udp.is_empty());
+        let other: SocketAddr = "127.0.0.1:29999".parse().expect("valid addr");
+        let effects = rt.udp_datagram(listener, &room(), other, &fixture_syn());
+        assert!(effects.udp_waiters.is_empty());
+        assert!(matches!(
+            rt.join(room(), Arc::new(Notify::new())),
+            Err(JoinRefusal::RoomDraining)
+        ));
+        assert!(rt.rooms[&room()].udp_addresses.is_empty());
+    }
+
     #[test]
     fn pending_removal_traffic_holds_room_until_listener_attempt() {
         let mut rt = runtime();
@@ -1020,8 +1099,7 @@ mod tests {
         // 30 s of silence: the role's own timeout removes the peer in a
         // tick reduction, which captures the owed accept/waiting into
         // the bounded pending batch. The mapping is gone but the room
-        // is retained against further sweeps until the listener
-        // attempts the batch.
+        // is retained against further sweeps.
         rt.started = rt
             .started
             .checked_sub(Duration::from_secs(31))
@@ -1035,36 +1113,36 @@ mod tests {
         assert!(!bind_room.pending_udp[&listener].is_empty());
         assert!(bind_room.udp_draining.contains(&(listener, from)));
 
-        // Before the attempt: the same (listener, address) is not
-        // re-admitted, a different address does not open a session in
-        // the draining room, and a WebSocket join is refused.
-        let effects = rt.udp_datagram(listener, &room(), from, &fixture_syn());
-        assert!(effects.ws_waiters.is_empty());
-        assert!(effects.udp_waiters.is_empty());
-        assert!(effects.direct_udp.is_empty());
-        assert!(rt.rooms[&room()].udp_addresses.is_empty());
-        let other: SocketAddr = "127.0.0.1:29999".parse().expect("valid addr");
-        let effects = rt.udp_datagram(listener, &room(), other, &fixture_syn());
-        assert!(effects.udp_waiters.is_empty());
-        assert!(rt.rooms[&room()].udp_addresses.is_empty());
-        assert!(matches!(
-            rt.join(room(), Arc::new(Notify::new())),
-            Err(JoinError::RoomDraining)
-        ));
-        rt.tick();
-        assert!(rt.rooms.contains_key(&room()));
+        // Before the take, the draining-room refusals hold.
+        assert_draining_refusals(&mut rt, listener, from);
 
-        // The listener's drain attempt captures the owed batch,
-        // terminal-last order preserved, and drops the emptied room.
-        let (datagrams, _) = rt.drain_udp(listener, &room());
+        // The take moves the batch out but attempts nothing yet: the
+        // tombstone and the room's draining state SURVIVE the take, so
+        // a WebSocket join racing the send window is still refused (the
+        // addendum-1 seam) and no sweep can drop the room.
+        let (datagrams, effects, taken) = rt.take_udp(listener, &room());
         assert!(datagrams.len() >= 2, "accept and waiting are owed");
         assert!(matches!(
             decode_server(&datagrams[0].1, false),
             ServerPacket::SynAccept(_)
         ));
+        assert!(effects.ws_waiters.is_empty());
+        let bind_room = rt
+            .rooms
+            .get(&room())
+            .expect("the in-flight batch retains the room");
+        assert!(bind_room.udp_draining.contains(&(listener, from)));
+        assert!(bind_room.udp_inflight.contains(&listener));
+        assert_draining_refusals(&mut rt, listener, from);
+        rt.tick();
+        assert!(rt.rooms.contains_key(&room()));
+
+        // The finish (after the actual send attempts) clears exactly
+        // this batch's tombstone and drops the emptied room.
+        rt.finish_udp(listener, &room(), taken);
         assert!(
             !rt.rooms.contains_key(&room()),
-            "the drained empty room drops"
+            "the finished empty room drops"
         );
 
         // The next valid SYN starts a fresh host.
@@ -1075,6 +1153,82 @@ mod tests {
             panic!("query response")
         };
         assert_eq!(query.num_players, 1);
+    }
+
+    #[test]
+    fn finish_clears_only_the_taken_batch_generation() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let first = addr();
+        let second: SocketAddr = "127.0.0.1:29999".parse().expect("valid addr");
+        rt.udp_datagram(listener, &room(), first, &fixture_syn());
+
+        // The second peer joins the silence 20 s later.
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(20))
+            .expect("backdate the clock");
+        rt.udp_datagram(listener, &room(), second, &fixture_syn());
+        let surviving = rt.rooms[&room()].udp_addresses[&(listener, second)];
+
+        // 35 s after the first admission (15 after the second): only
+        // the first peer times out.
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(15))
+            .expect("backdate past the first peer's timeout");
+        rt.tick();
+        let bind_room = rt.rooms.get(&room()).expect("room");
+        assert!(bind_room.udp_draining.contains(&(listener, first)));
+        assert!(!bind_room.udp_draining.contains(&(listener, second)));
+
+        // Take the first peer's batch; while it is in flight, queue a
+        // relay into the survivor's outbox and let the survivor cross
+        // its own timeout, producing a LATER pending generation on the
+        // same listener.
+        let (datagrams, _, taken) = rt.take_udp(listener, &room());
+        assert!(!datagrams.is_empty());
+        let now = rt.now();
+        let bind_room = rt.rooms.get_mut(&room()).expect("room");
+        let (sender, _) = bind_room
+            .host
+            .join(now, |_| b"ws:relay".to_vec())
+            .expect("member joins");
+        let route = crate::runtime::RouteId::new(11).expect("nonzero");
+        bind_room
+            .host
+            .relay(now, sender, surviving, route, b"later")
+            .expect("relays");
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(20))
+            .expect("backdate past the second peer's timeout");
+        rt.tick();
+        let bind_room = rt.rooms.get(&room()).expect("room retained");
+        assert!(!bind_room.host.contains(surviving));
+        assert!(bind_room.udp_draining.contains(&(listener, second)));
+        assert!(!bind_room.pending_udp[&listener].is_empty());
+
+        // Finishing the older batch clears only its own tombstone: the
+        // later pending batch and its tombstone survive untouched.
+        rt.finish_udp(listener, &room(), taken);
+        let bind_room = rt
+            .rooms
+            .get(&room())
+            .expect("the later generation retains the room");
+        assert!(!bind_room.udp_draining.contains(&(listener, first)));
+        assert!(bind_room.udp_draining.contains(&(listener, second)));
+        assert!(!bind_room.pending_udp[&listener].is_empty());
+
+        // The transportless relay member leaves quietly, the next take
+        // delivers only the later generation's owed batch, and
+        // finishing it drops the emptied room.
+        rt.leave(&room(), sender);
+        let (datagrams, _, taken) = rt.take_udp(listener, &room());
+        assert!(!datagrams.is_empty());
+        assert!(datagrams.iter().all(|(address, _)| *address == second));
+        rt.finish_udp(listener, &room(), taken);
+        assert!(!rt.rooms.contains_key(&room()));
     }
 
     // --- H5: isolation effects delivered -----------------------------------
@@ -1108,7 +1262,7 @@ mod tests {
             .relay(now, other, player, route, &big)
             .expect("fits the room-core bound");
 
-        let (datagrams, effects) = rt.drain_udp(listener, &room());
+        let (datagrams, effects) = drain(&mut rt, listener, &room());
         assert!(
             datagrams
                 .iter()

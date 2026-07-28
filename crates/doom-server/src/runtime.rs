@@ -28,6 +28,25 @@ pub(crate) const OLD_SYN_MAGIC: u32 = 3_436_803_284;
 /// The runtime timer period driving every live room role.
 pub(crate) const TIMER_PERIOD: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Why a connection could not join through the shared runtime.
+/// Binding-private: the public sans-I/O `JoinError` stays free of
+/// transport state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum JoinRefusal {
+    /// The registry refused (room full or identifier space exhausted).
+    Registry(JoinError),
+    /// The room is held only by removal traffic whose send attempt has
+    /// not finished; its lifetime already ended and the next admission
+    /// must start a fresh host.
+    RoomDraining,
+}
+
+impl From<JoinError> for JoinRefusal {
+    fn from(error: JoinError) -> Self {
+        Self::Registry(error)
+    }
+}
+
 /// The shared runtime state handle.
 #[derive(Clone)]
 pub(crate) struct SharedState(pub(crate) Arc<Mutex<Runtime>>);
@@ -120,16 +139,20 @@ pub(crate) struct BindRoom {
     /// Datagrams captured at removal time (the removed peer's remaining
     /// outbox and its terminal, terminal last), per listener so each
     /// socket sends exactly its own peers' traffic. Bounded per removal
-    /// by the removed peer's own bounded outbox; drained by the
-    /// listener that owns it.
+    /// by the removed peer's own bounded outbox; taken by the listener
+    /// that owns it.
     pub(crate) pending_udp: HashMap<ListenerId, VecDeque<(SocketAddr, Vec<u8>)>>,
     /// Removed `(listener, address)` pairs whose bounded pending batch
-    /// has not yet been attempted by the listener. Not the live
-    /// identity mapping: re-admission waits for the drain attempt, and
-    /// each entry clears after it. Never rely on readiness ordering for
-    /// this; a ready SYN must not be admitted before the prior
-    /// terminal leaves the socket.
+    /// has not yet been SENT by the listener. Not the live identity
+    /// mapping: re-admission waits for the send attempt, and each entry
+    /// clears only when the batch that captured it finishes. Never rely
+    /// on readiness ordering for this; a ready SYN must not be admitted
+    /// before the prior terminal leaves the socket.
     pub(crate) udp_draining: HashSet<(ListenerId, SocketAddr)>,
+    /// Listeners with a taken-but-unfinished send batch in this room:
+    /// the batch retains the room and keeps admissions refused until
+    /// the listener finishes it after the actual send attempts.
+    pub(crate) udp_inflight: HashSet<ListenerId>,
 }
 
 pub(crate) struct Connection {
@@ -174,6 +197,7 @@ impl BindRoom {
             udp_addresses: HashMap::new(),
             pending_udp: HashMap::new(),
             udp_draining: HashSet::new(),
+            udp_inflight: HashSet::new(),
         }
     }
 
@@ -195,26 +219,29 @@ impl BindRoom {
         }
     }
 
-    /// Whether the room holds nothing on any transport and owes no
-    /// undrained removal traffic (the runtime then drops it, so
-    /// unbounded room names cannot retain hosts). Pending datagrams
-    /// keep the room until their listener attempts the batch.
+    /// Whether the room holds nothing on any transport, owes no
+    /// untaken removal traffic, and has no send batch in flight (the
+    /// runtime then drops it, so unbounded room names cannot retain
+    /// hosts). Removal traffic keeps the room until its listener takes
+    /// it, and the taken batch keeps it until the sends are attempted.
     pub(crate) fn is_empty(&self) -> bool {
         self.host.is_empty()
             && self.connections.is_empty()
             && self.udp_players.is_empty()
             && self.pending_udp.values().all(VecDeque::is_empty)
+            && self.udp_inflight.is_empty()
     }
 
-    /// Whether the room is held only by undrained removal traffic: its
-    /// lifetime already ended, so no new session on any transport is
-    /// admitted into it. The listener's drain attempt drops the room,
-    /// and the next valid SYN then starts a fresh host.
+    /// Whether the room is held only by removal traffic that has not
+    /// finished its send attempt: its lifetime already ended, so no
+    /// new session on any transport is admitted into it. The listener's
+    /// finish drops the room, and the next valid SYN then starts a
+    /// fresh host.
     pub(crate) fn is_draining(&self) -> bool {
         self.host.is_empty()
             && self.connections.is_empty()
             && self.udp_players.is_empty()
-            && !self.pending_udp.values().all(VecDeque::is_empty)
+            && (!self.pending_udp.values().all(VecDeque::is_empty) || !self.udp_inflight.is_empty())
     }
 
     /// Fold one reducer batch into transport state; the returned work
@@ -306,7 +333,7 @@ impl Runtime {
         &mut self,
         room_name: RoomName,
         waiter: Arc<Notify>,
-    ) -> Result<(PlayerId, Effects), JoinError> {
+    ) -> Result<(PlayerId, Effects), JoinRefusal> {
         let now = self.now();
         let Self {
             rooms,
@@ -314,13 +341,13 @@ impl Runtime {
             outbox_capacity,
             ..
         } = self;
-        // A room held only by undrained removal traffic admits no new
-        // session: the drain attempt drops it and the next connection
-        // starts a fresh host.
+        // A room held only by removal traffic whose send attempt has
+        // not finished admits no new session: the listener's finish
+        // drops it and the next connection starts a fresh host.
         if let Some(room) = rooms.get(&room_name)
             && room.is_draining()
         {
-            return Err(JoinError::RoomDraining);
+            return Err(JoinRefusal::RoomDraining);
         }
         let room = rooms
             .entry(room_name.clone())
