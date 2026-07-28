@@ -100,7 +100,7 @@ Upstream's form declares a tentative global named `cr_t` in every translation un
 - `D_NonVanillaRecord` / `D_NonVanillaPlayback` take `char *feature`, not `const char *`. This tree's `d_loop.h` predates the const change.
 - `net_sdl_module` becomes `NET_TRANSPORT_MODULE` (see below).
 
-**`src/net_loop.c`, dropped packets are freed.** Both send paths hand `QueuePush` a `NET_PacketDup`, so the queue owns it, but upstream returns on a full ring without freeing, leaking one packet per overflow. This transport carries the in-WASM host talking to its own client, so it is on the browser network path and the leak is reachable there. `test/test_net_loop.c` pins the behaviour against a counting allocator.
+**`src/net_loop.c`, dropped packets are freed.** Both send paths hand `QueuePush` a `NET_PacketDup`, so the queue owns it, but upstream returns on a full ring without freeing, leaking one packet per overflow. This transport carries a process talking to its own client, which `d_loop.c` sets up only under `-server` or `-privateserver`, so it is reachable in a native server-role build and not from the browser product, whose loader refuses both flags. `test/test_net_loop.c` pins the behaviour against a counting allocator.
 
 **`src/net_query.c`, `src/net_server.c`.** `#include "net_sdl.h"` becomes `#include "net_transport.h"`, and `net_query.c`'s two `net_sdl_module` uses become `NET_TRANSPORT_MODULE`. Without this the browser build fails to link, because `net_sdl.c` is not compiled there.
 
@@ -155,6 +155,8 @@ It proves input history, not simulation state. This fork writes no consistancy b
 | a failed announce only prints, leaving a host that never claimed the room live and retrying forever | an announce failure takes the same terminal path, because a host the router never learned about is unreachable |
 | `net_websockets.h` uses the `NET_SDL_H` include guard | its own guard |
 
+The announce row is about the module's server-role path, which only a `-server` or `-privateserver` process reaches. The browser product never announces, because its loader emits neither flag.
+
 The socket lifecycle is deliberately terminal rather than self-healing. An in-place reconnect would have to close the old handle, drain the ring without discarding live packets, and keep callbacks from the dead handle away from the replacement's state. That is a lot of hazard for no benefit here, because the host page's model is that a relaunch tears down the whole WASM instance: a session that loses its socket is over. Failures therefore close and delete the handle, drain the queue, and refuse further use, and events arriving from a discarded handle are ignored.
 
 **`src/net_ws_frame.c`, `src/net_ws_frame.h`.** The envelope codec and bounded receive ring, split out of `net_websockets.c` so they carry no emscripten dependency and can be tested on the host. These are the parts that must reject malformed input and must drop rather than grow, so they are the parts worth testing off-target.
@@ -208,7 +210,9 @@ engine -> router:  [to u32][from u32][chocolate packet...]
 router -> engine:  [from u32][chocolate packet...]
 ```
 
-The room host is node id 1. Ids 0 and 1 are reserved; 0 because a frame addressed to it is the host claiming the room, which resets any session already there. This matches cloudflare/doom-workers `router/index.mjs` at commit `22d8665f75017c4e1971d7e93567237645916ba1`.
+The room server is node id 1, and ids 0 and 1 are reserved. The frame shape and the reserved ids match cloudflare/doom-workers `router/index.mjs` at commit `22d8665f75017c4e1971d7e93567237645916ba1`, where a frame addressed to node 0 is a client claiming the room and resets every session already in it.
+
+`doomd` does not implement that claim. Route 1 is permanently server-owned: an inbound frame whose source is 1 is rejected before any routing or third-party effect and closes only that connection, and a frame addressed to node 0 is registration-only traffic that never reaches the room role, so it resets nothing. Room lifetime is membership-driven instead: the room is dropped once it holds no member on any transport and owes no undrained removal traffic, and while it is draining that last traffic it admits no new session. The browser product is a client of that server and never sends either frame.
 
 ## Mod loading
 
@@ -354,7 +358,7 @@ The build is `MODULARIZE=1`, so `doom.js` exports an async factory rather than p
 
 Two pages in this directory do that:
 
-- `doom.html`, the contributor loader. Picks the IWAD and the ordered PWAD set with their hashes, load kinds and DEHACKED policy, chooses single player / host / join and the room URL, shows the resulting argv and the mod fingerprint, and launches.
+- `doom.html`, the contributor loader. Picks the IWAD and the ordered PWAD set with their hashes, load kinds and DEHACKED policy, chooses single player or a multiplayer room with its room URL and expected node count, shows the resulting argv and the mod fingerprint, and launches.
 - `doom-frame.html`, the engine host. The loader creates one per launch and destroys it to relaunch. Removing the iframe takes the instance, its main loop, its audio graph and its FS with it. Doom loads its WAD set once during `D_DoomMain` and has no supported path to unload one from a live session, so changing the mod set restarts the instance. That is a real restart, not a hot swap, and the loader does not claim otherwise.
 
 Serve them over `http://localhost`. Both `crypto.subtle`, used for the content hashes, and ES module imports require a secure context, so `file://` will not work.
@@ -387,6 +391,8 @@ The browser build is verified by running it. Serve `out/doom.js`, `out/doom.wasm
 
 Single player is healthy when the console carries the `DOOM Shareware` banner, `W_Init` reports ` adding doom1.wad`, startup runs through `I_Init`, `R_Init`, `P_Init`, `S_Init`, `D_CheckNetGame`, `HU_Init`, `ST_Init` with no `I_Error`, and a screenshot after roughly 15 seconds shows E1M1 rendering behind a live status bar.
 
-The network path is healthy when two instances, one launched with `-privateserver -wss <url> -nodes 2` and one with `-connect 1 -wss <url>`, both reach `D_CheckNetGame` reporting `player 1 of 2` and `player 2 of 2`. Running them in separate browser processes avoids overloading a single software-GL renderer.
+The network path is healthy when two instances, each launched with `-connect 1 -wss <url> -nodes 2`, both reach `D_CheckNetGame` reporting `player 1 of 2` and `player 2 of 2`. Every client carries `-nodes`, because the server assigns the controller and a client that never received the threshold cannot launch even after it is promoted. Running them in separate browser processes avoids overloading a single software-GL renderer.
 
-**Start the host first and let it connect before joining.** Claiming a room is a reset: the frame the host sends to node 0 disconnects every other connection already in that room, in this engine's router and in `doomd` alike. A client that connects during the host's startup is therefore dropped, and since a closed socket is terminal here, it does not recover. Observed against `doomd`: the join reported `closed (clean=1 code=1005)` and then `Failed to connect to ws node 1`, purely because its socket opened before the host had claimed the room. With the host connected first, the same pair reaches `player 1 of 2` and `player 2 of 2`.
+**Tab order does not matter.** No browser instance hosts, so there is no room to claim and no startup window in which an early joiner is reset. Both tabs address the server as node 1 and the server admits them in either order.
+
+This two-client run against `doomd` is the outstanding runtime acceptance for the client-only loader; it has not been re-run since the transition, and the loader-side contract is covered by `test/test_net_argv.mjs` in the meantime.
