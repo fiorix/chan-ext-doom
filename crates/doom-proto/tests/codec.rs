@@ -8,8 +8,8 @@ mod common;
 
 use common::{fixtures_dir, manifest_entries};
 use doom_proto::{
-    ClientPacket, ClientTic, ConnectData, DecodeError, GameDataClient, GameSettings, NET_MAGIC,
-    ServerPacket, Syn, TiccmdDiff, WireHeader,
+    ClientPacket, ClientTic, ConnectData, DecodeError, EncodeError, FullTic, GameDataClient,
+    GameDataServer, GameSettings, NET_MAGIC, ServerPacket, Syn, SynAccept, TiccmdDiff, WireHeader,
 };
 use std::fs;
 
@@ -365,17 +365,253 @@ fn count_mismatch_and_trailing_bytes_are_rejected() {
 #[test]
 fn reliable_header_shape_is_validated() {
     // Reliable bit set but the seq byte is missing.
-    let keepalive = [0x80, 0x03];
-    assert!(ClientPacket::decode(&keepalive, false).is_err());
+    let launch = [0x80, 0x0f];
+    assert!(ClientPacket::decode(&launch, false).is_err());
 
-    // Reliable framing with a seq byte parses and round-trips.
-    let (hdr, pkt) = ServerPacket::decode(&[0x80, 0x03, 0x2a], false).expect("decode");
+    // Reliable framing with a seq byte parses and round-trips on a type
+    // the matrix lists as reliable.
+    let (hdr, pkt) = ClientPacket::decode(&[0x80, 0x0f, 0x2a], false).expect("decode");
     assert_eq!(hdr, reliable(42));
-    assert_eq!(pkt, ServerPacket::Keepalive);
+    assert_eq!(pkt, ClientPacket::Launch);
     assert_eq!(
         pkt.encode(hdr, false).expect("encode"),
-        vec![0x80, 0x03, 0x2a]
+        vec![0x80, 0x0f, 0x2a]
     );
+}
+
+#[test]
+fn reliable_framing_matrix_is_enforced() {
+    // KEEPALIVE is plain in both directions: a reliable one fails to
+    // decode and to encode, even though its bytes otherwise parse.
+    let reliable_keepalive = [0x80, 0x03, 0x2a];
+    assert!(matches!(
+        ClientPacket::decode(&reliable_keepalive, false),
+        Err(DecodeError::InvalidValue { .. })
+    ));
+    assert!(matches!(
+        ServerPacket::decode(&reliable_keepalive, false),
+        Err(DecodeError::InvalidValue { .. })
+    ));
+    assert!(matches!(
+        ClientPacket::Keepalive.encode(reliable(42), false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+    assert!(matches!(
+        ServerPacket::Keepalive.encode(reliable(42), false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+
+    // A plain LAUNCH c2s is wrong; the type is reliable in 3.1.1.
+    assert!(matches!(
+        ClientPacket::decode(&[0x00, 0x0f], false),
+        Err(DecodeError::InvalidValue { .. })
+    ));
+    assert!(matches!(
+        ClientPacket::Launch.encode(NO_RELIABLE, false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+    assert!(ClientPacket::Launch.encode(reliable(0), false).is_ok());
+
+    // QUERY is plain; reliable framing must fail to encode.
+    assert!(matches!(
+        ClientPacket::Query.encode(reliable(1), false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+
+    // CONSOLE_MESSAGE and the SYN accept are reliable in s2c: plain
+    // frames must fail on both encode and decode.
+    let accept = ServerPacket::SynAccept(SynAccept {
+        version: b"Chocolate Doom 3.1.1".to_vec(),
+        protocol: b"CHOCOLATE_DOOM_0".to_vec(),
+    });
+    assert!(matches!(
+        accept.encode(NO_RELIABLE, false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+    assert!(accept.encode(reliable(0), false).is_ok());
+
+    let accept_bytes = accept.encode(reliable(0), false).expect("encode");
+    assert!(matches!(
+        ServerPacket::decode(&accept_bytes[1..], false),
+        Err(DecodeError::InvalidValue { .. })
+    ));
+
+    let msg = ServerPacket::ConsoleMessage {
+        message: b"hello".to_vec(),
+    };
+    assert!(matches!(
+        msg.encode(NO_RELIABLE, false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+    assert!(msg.encode(reliable(1), false).is_ok());
+}
+
+#[test]
+fn fulltic_player_order_and_bounds() {
+    fn server_data(players: Vec<(u8, TiccmdDiff)>) -> ServerPacket {
+        ServerPacket::GameData(GameDataServer {
+            start: 0,
+            tics: vec![FullTic {
+                latency: 0,
+                players,
+            }],
+        })
+    }
+    let fwd = |v: i8| TiccmdDiff {
+        forward: Some(v),
+        ..Default::default()
+    };
+
+    // Unsorted indices would bind diffs to the wrong players.
+    assert!(matches!(
+        server_data(vec![(1, fwd(1)), (0, fwd(2))]).encode(NO_RELIABLE, false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+
+    // Duplicates likewise.
+    assert!(matches!(
+        server_data(vec![(0, fwd(1)), (0, fwd(2))]).encode(NO_RELIABLE, false),
+        Err(EncodeError::InvalidValue { .. })
+    ));
+
+    // Index 8 is out of range.
+    assert!(matches!(
+        server_data(vec![(8, fwd(1))]).encode(NO_RELIABLE, false),
+        Err(EncodeError::CountOutOfRange { .. })
+    ));
+
+    // Every valid index, including 7, round-trips.
+    let all = server_data((0..=7).map(|i| (i, fwd(i as i8))).collect());
+    let bytes = all.encode(NO_RELIABLE, false).expect("encode");
+    let (_, decoded) = ServerPacket::decode(&bytes, false).expect("decode");
+    assert_eq!(decoded, all);
+}
+
+#[test]
+fn gamedata_tic_count_boundaries() {
+    let tic = ClientTic {
+        latency: 0,
+        diff: TiccmdDiff::default(),
+    };
+    let at_max = ClientPacket::GameData(GameDataClient {
+        ack: 0,
+        start: 0,
+        tics: vec![tic.clone(); 255],
+    });
+    let bytes = at_max.encode(NO_RELIABLE, false).expect("255 tics encodes");
+    let (_, decoded) = ClientPacket::decode(&bytes, false).expect("decode");
+    assert_eq!(decoded, at_max);
+
+    let over = ClientPacket::GameData(GameDataClient {
+        ack: 0,
+        start: 0,
+        tics: vec![tic; 256],
+    });
+    assert!(matches!(
+        over.encode(NO_RELIABLE, false),
+        Err(EncodeError::CountOutOfRange { .. })
+    ));
+
+    let full = FullTic {
+        latency: 0,
+        players: vec![(0, TiccmdDiff::default())],
+    };
+    let server_over = ServerPacket::GameData(GameDataServer {
+        start: 0,
+        tics: vec![full; 256],
+    });
+    assert!(matches!(
+        server_over.encode(NO_RELIABLE, false),
+        Err(EncodeError::CountOutOfRange { .. })
+    ));
+}
+
+#[test]
+fn lowres_turn_requires_multiple_of_256() {
+    fn with_turn(v: i16) -> ClientPacket {
+        ClientPacket::GameData(GameDataClient {
+            ack: 0,
+            start: 0,
+            tics: vec![ClientTic {
+                latency: 0,
+                diff: TiccmdDiff {
+                    turn: Some(v),
+                    ..Default::default()
+                },
+            }],
+        })
+    }
+
+    // Extrema that are exact multiples round-trip in lowres mode.
+    for v in [0, -32768, 32512, -256] {
+        let pkt = with_turn(v);
+        let bytes = pkt.encode(NO_RELIABLE, true).expect("encode");
+        let (_, decoded) = ClientPacket::decode(&bytes, true).expect("decode");
+        assert_eq!(decoded, pkt, "turn {v}");
+    }
+
+    // Non-multiples are rejected rather than truncated, and stay valid
+    // in hires mode.
+    for v in [1, -1, 255, 300, 32767] {
+        assert!(matches!(
+            with_turn(v).encode(NO_RELIABLE, true),
+            Err(EncodeError::InvalidValue { .. })
+        ));
+        assert!(with_turn(v).encode(NO_RELIABLE, false).is_ok());
+    }
+}
+
+#[test]
+fn raven_strife_pairs_are_atomic() {
+    let partials = [
+        TiccmdDiff {
+            lookfly: Some(1),
+            ..Default::default()
+        },
+        TiccmdDiff {
+            arti: Some(1),
+            ..Default::default()
+        },
+        TiccmdDiff {
+            buttons2: Some(1),
+            ..Default::default()
+        },
+        TiccmdDiff {
+            inventory: Some(1),
+            ..Default::default()
+        },
+    ];
+    for diff in partials {
+        let pkt = ClientPacket::GameData(GameDataClient {
+            ack: 0,
+            start: 0,
+            tics: vec![ClientTic { latency: 0, diff }],
+        });
+        assert!(matches!(
+            pkt.encode(NO_RELIABLE, false),
+            Err(EncodeError::InvalidValue { .. })
+        ));
+    }
+
+    // Complete pairs round-trip.
+    let full = TiccmdDiff {
+        lookfly: Some(2),
+        arti: Some(3),
+        buttons2: Some(4),
+        inventory: Some(500),
+        ..Default::default()
+    };
+    let pkt = ClientPacket::GameData(GameDataClient {
+        ack: 0,
+        start: 0,
+        tics: vec![ClientTic {
+            latency: 0,
+            diff: full,
+        }],
+    });
+    let bytes = pkt.encode(NO_RELIABLE, false).expect("encode");
+    let (_, decoded) = ClientPacket::decode(&bytes, false).expect("decode");
+    assert_eq!(decoded, pkt);
 }
 
 #[test]
@@ -417,11 +653,13 @@ fn mutations_flip_the_guards() {
     // NUL removal (see unterminated test above).
     // Count inflation (see impossible-count tests above).
 
-    // Direction swap on SYN: the accept is not a valid client SYN.
+    // Direction swap on SYN: the accept is not a valid client SYN. The
+    // framing matrix fires first (type 0 is not reliable c2s); the magic
+    // check backs it up.
     let accept = read_fixture("handshake-keepalive/001-s2c-client1-syn.bin");
     assert!(matches!(
         ClientPacket::decode(&accept, false),
-        Err(DecodeError::BadMagic { .. })
+        Err(DecodeError::InvalidValue { .. }) | Err(DecodeError::BadMagic { .. })
     ));
 
     // Reliable bit flipped off a reliable SYN accept: trailing seq
