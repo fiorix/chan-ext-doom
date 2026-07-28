@@ -29,9 +29,13 @@
 //         allocations digests identically, or nothing would ever match.
 //
 
+// dup/dup2/fileno, used to capture the report output under -std=c99.
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "d_statecanary.h"
 #include "d_democanary.h"
@@ -117,6 +121,22 @@ static void Check(boolean ok, const char *what)
 static sector_t test_sectors[3];
 static mobj_t test_mobjs[4];
 static vldoor_t test_door;
+
+// One of every other special class the serializer writes. The golden fixture
+// deliberately holds only the door, so these are linked in by the focused
+// cases below rather than by BuildState.
+static ceiling_t test_ceiling;
+static floormove_t test_floor;
+static plat_t test_plat;
+static lightflash_t test_flash;
+static strobe_t test_strobe;
+static glow_t test_glow;
+
+static void RemoveThinker(thinker_t *th)
+{
+    th->prev->next = th->next;
+    th->next->prev = th->prev;
+}
 
 static void LinkThinker(thinker_t *th, void *fn)
 {
@@ -232,6 +252,80 @@ static void BuildState(void)
     test_door.topwait = 150;
     test_door.topcountdown = 0;
     LinkThinker(&test_door.thinker, (void *) T_VerticalDoor);
+}
+
+#define DCS_SCRATCH_LEN_TEST (512 * 1024)
+
+static unsigned int ReadU32(const byte *buf, size_t offset)
+{
+    return (unsigned int) buf[offset]
+         | ((unsigned int) buf[offset + 1] << 8)
+         | ((unsigned int) buf[offset + 2] << 16)
+         | ((unsigned int) buf[offset + 3] << 24);
+}
+
+// Serialize the current state, then read the U32 at a known offset.
+static unsigned int ReadU32At(byte *buf, size_t cap, size_t offset)
+{
+    size_t len = D_StateCanarySerialize(buf, cap);
+
+    if (len < offset + 4)
+    {
+        return 0xffffffffu;
+    }
+
+    return ReadU32(buf, offset);
+}
+
+// One linker per special class. Each names its own sector field, so a struct
+// whose layout differs from its neighbours cannot be silently mis-assigned.
+
+static void LinkCeiling(void)
+{
+    memset(&test_ceiling, 0, sizeof(test_ceiling));
+    test_ceiling.sector = &test_sectors[0];
+    test_ceiling.topheight = 128;
+    LinkThinker(&test_ceiling.thinker, (void *) T_MoveCeiling);
+}
+
+static void LinkFloor(void)
+{
+    memset(&test_floor, 0, sizeof(test_floor));
+    test_floor.sector = &test_sectors[0];
+    test_floor.floordestheight = 64;
+    LinkThinker(&test_floor.thinker, (void *) T_MoveFloor);
+}
+
+static void LinkPlat(void)
+{
+    memset(&test_plat, 0, sizeof(test_plat));
+    test_plat.sector = &test_sectors[0];
+    test_plat.wait = 105;
+    LinkThinker(&test_plat.thinker, (void *) T_PlatRaise);
+}
+
+static void LinkFlash(void)
+{
+    memset(&test_flash, 0, sizeof(test_flash));
+    test_flash.sector = &test_sectors[0];
+    test_flash.maxtime = 64;
+    LinkThinker(&test_flash.thinker, (void *) T_LightFlash);
+}
+
+static void LinkStrobe(void)
+{
+    memset(&test_strobe, 0, sizeof(test_strobe));
+    test_strobe.sector = &test_sectors[0];
+    test_strobe.darktime = 15;
+    LinkThinker(&test_strobe.thinker, (void *) T_StrobeFlash);
+}
+
+static void LinkGlow(void)
+{
+    memset(&test_glow, 0, sizeof(test_glow));
+    test_glow.sector = &test_sectors[0];
+    test_glow.direction = 1;
+    LinkThinker(&test_glow.thinker, (void *) T_Glow);
 }
 
 static void DigestNow(char *out)
@@ -580,6 +674,290 @@ int main(void)
 
         Check(strcmp(clean, stale) == 0,
               "an inactive slot's stale storage and unsafe mo are not serialized");
+    }
+
+    // --- every special-writer branch ---------------------------------------
+
+    // The golden fixture carries only a door, so the other six writers were
+    // never executed. Executing them is not enough either: a branch that
+    // wrote nothing would still "run", so each case mutates a scalar that
+    // only that class serializes and requires the digest to move.
+    {
+        // Each class is linked by a small function that also gives it a real
+        // sector. Assigning through a pointer offset would be shorter and
+        // wrong: sector is not the first field after the thinker in every one
+        // of these structs, so it would silently write into type instead.
+        size_t c;
+
+        struct { const char *name; void (*link)(void); } classes[] = {
+            { "ceiling", LinkCeiling },
+            { "floor",   LinkFloor },
+            { "plat",    LinkPlat },
+            { "flash",   LinkFlash },
+            { "strobe",  LinkStrobe },
+            { "glow",    LinkGlow },
+        };
+
+        for (c = 0; c < sizeof(classes) / sizeof(classes[0]); ++c)
+        {
+            char without[DCS_DIGEST_LEN];
+            char with[DCS_DIGEST_LEN];
+            size_t len_without = 0;
+            size_t len_with = 0;
+
+            BuildState();
+            D_StateCanaryDigest(without, sizeof(without), &len_without);
+
+            BuildState();
+            classes[c].link();
+            D_StateCanaryDigest(with, sizeof(with), &len_with);
+
+            ++checks;
+            if (len_with <= len_without)
+            {
+                ++failures;
+                printf("FAIL: the %s writer added no bytes\n", classes[c].name);
+            }
+
+            ++checks;
+            if (strcmp(without, with) == 0)
+            {
+                ++failures;
+                printf("FAIL: adding a %s special did not change the digest\n",
+                       classes[c].name);
+            }
+        }
+    }
+
+    // Class-specific scalars, one per branch, so a writer that emitted the
+    // right number of bytes from the wrong fields would still fail.
+    {
+        char base[DCS_DIGEST_LEN];
+        char moved[DCS_DIGEST_LEN];
+        size_t n = 0;
+        size_t c;
+
+        struct { const char *name; int *field; } scalars[7];
+
+        BuildState();
+        LinkCeiling();
+        LinkFloor();
+        LinkPlat();
+        LinkFlash();
+        LinkStrobe();
+        LinkGlow();
+        D_StateCanaryDigest(base, sizeof(base), &n);
+
+        scalars[0].name = "ceiling topheight";   scalars[0].field = &test_ceiling.topheight;
+        scalars[1].name = "door topcountdown";   scalars[1].field = &test_door.topcountdown;
+        scalars[2].name = "floor floordestheight"; scalars[2].field = &test_floor.floordestheight;
+        scalars[3].name = "plat wait";           scalars[3].field = &test_plat.wait;
+        scalars[4].name = "flash maxtime";       scalars[4].field = &test_flash.maxtime;
+        scalars[5].name = "strobe darktime";     scalars[5].field = &test_strobe.darktime;
+        scalars[6].name = "glow direction";      scalars[6].field = &test_glow.direction;
+
+        for (c = 0; c < 7; ++c)
+        {
+            size_t m = 0;
+
+            *scalars[c].field += 7;
+            D_StateCanaryDigest(moved, sizeof(moved), &m);
+
+            ++checks;
+            if (strcmp(base, moved) == 0)
+            {
+                ++failures;
+                printf("FAIL: %s does not reach the digest\n", scalars[c].name);
+            }
+
+            *scalars[c].field -= 7;
+        }
+
+        /* back to the baseline, so the loop above really isolated each field */
+        D_StateCanaryDigest(moved, sizeof(moved), &n);
+        Check(strcmp(base, moved) == 0, "restoring every scalar restores the digest");
+    }
+
+    // The class set is written twice in the serializer: once to count the
+    // specials and once to write them. Nothing above would notice the two
+    // lists drifting apart, because a wrong count still changes the digest
+    // consistently on both peers. So read the count field back directly.
+    //
+    // Specials are the last section and the count is the U32 that opens it,
+    // so with no specials linked the whole section is that one field: it sits
+    // at the end of the stream, and it stays there when specials are added.
+    {
+        byte buf[DCS_SCRATCH_LEN_TEST];
+        size_t bare;
+        size_t offset;
+
+        BuildState();
+        RemoveThinker(&test_door.thinker);
+        bare = D_StateCanarySerialize(buf, sizeof(buf));
+        Check(bare >= 4, "a state with no specials still writes the count");
+        offset = bare - 4;
+        Check(ReadU32(buf, offset) == 0, "and that count reads zero");
+
+        BuildState();
+        Check(ReadU32At(buf, sizeof(buf), offset) == 1,
+              "the door-only fixture counts one special");
+
+        BuildState();
+        LinkCeiling();
+        LinkFloor();
+        LinkPlat();
+        LinkFlash();
+        LinkStrobe();
+        LinkGlow();
+        Check(ReadU32At(buf, sizeof(buf), offset) == 7,
+              "all seven classes are counted, not just the ones written");
+    }
+
+    // --- empty world ------------------------------------------------------
+
+    {
+        char empty[DCS_DIGEST_LEN];
+        size_t len = 0;
+
+        BuildState();
+        memset(playeringame, 0, sizeof(playeringame));
+        numsectors = 0;
+        thinkercap.next = &thinkercap;
+        thinkercap.prev = &thinkercap;
+
+        Check(D_StateCanaryDigest(empty, sizeof(empty), &len),
+              "an empty world still digests");
+        Check(len > 0, "an empty world has a nonzero header");
+        Check(strlen(empty) == DCS_DIGEST_LEN - 1, "and a full-length digest");
+    }
+
+    // --- an active player with no body ------------------------------------
+
+    // MutPlayerInGame reaches this branch, but only as a side effect. Named
+    // here so the contract is explicit rather than incidental.
+    {
+        char bodied[DCS_DIGEST_LEN];
+        char bodiless[DCS_DIGEST_LEN];
+        size_t a = 0;
+        size_t b = 0;
+
+        BuildState();
+        D_StateCanaryDigest(bodied, sizeof(bodied), &a);
+
+        BuildState();
+        players[0].mo = NULL;
+        Check(D_StateCanaryDigest(bodiless, sizeof(bodiless), &b),
+              "an in-game player with no body still digests");
+        Check(strcmp(bodied, bodiless) != 0,
+              "losing a body changes the digest");
+        Check(b < a, "and writes fewer bytes, since no position is recorded");
+    }
+
+    // --- a state too large for the scratch buffer -------------------------
+
+    // The serializer refuses rather than truncating. A truncated digest would
+    // be the worst possible outcome: a stable, comparable, wrong answer. So
+    // the refusal must be total -- no digest, no byte count, and above all no
+    // sha256= token on the wire that the verdict layer could parse.
+    {
+        // The scratch size is private to the serializer, so this is sized
+        // from the documented 512 KiB contract rather than from the macro. If
+        // that buffer ever grows, the refusal assertions below fail loudly
+        // instead of quietly testing nothing.
+        size_t huge_count = ((512 * 1024) / 8) + 4096;
+        sector_t *huge = calloc(huge_count, sizeof(sector_t));
+        char digest[DCS_DIGEST_LEN];
+        size_t len = 12345;
+        size_t fitted = 0;
+        char fitted_digest[DCS_DIGEST_LEN];
+
+        if (huge == NULL)
+        {
+            ++failures;
+            printf("FAIL: could not allocate the oversize fixture\n");
+        }
+        else
+        {
+            size_t i;
+
+            /* a digest from a state that does fit, to compare against */
+            BuildState();
+            D_StateCanaryDigest(fitted_digest, sizeof(fitted_digest), &fitted);
+
+            BuildState();
+            for (i = 0; i < huge_count; ++i)
+            {
+                huge[i].floorheight = (fixed_t) i;
+                huge[i].lightlevel = (short)(i & 0xff);
+            }
+            numsectors = (int) huge_count;
+            sectors = huge;
+
+            Check(D_StateCanarySerialize(NULL, 0) == 0,
+                  "serializing an oversize state into no buffer writes nothing");
+
+            memset(digest, '@', sizeof(digest));
+            Check(!D_StateCanaryDigest(digest, sizeof(digest), &len),
+                  "an oversize state refuses to digest");
+            Check(len == 12345, "and leaves the byte count untouched");
+
+            for (i = 0; i < sizeof(digest); ++i)
+            {
+                if (digest[i] != '@') break;
+            }
+            Check(i == sizeof(digest),
+                  "and does not write a single byte of the digest buffer");
+
+            // The report is the only thing the verdict layer ever sees, so
+            // assert on its actual output rather than on the return path.
+            {
+                const char *path = "/tmp/dcs_oversize_report.txt";
+                char buf[512];
+                FILE *f;
+                size_t n = 0;
+
+                int saved = dup(fileno(stdout));
+
+                fflush(stdout);
+                if (freopen(path, "w", stdout) != NULL)
+                {
+                    D_StateCanaryReport("exit");
+                    fflush(stdout);
+                }
+                /* put the real stdout back, however the runner supplied it */
+                dup2(saved, fileno(stdout));
+                close(saved);
+                clearerr(stdout);
+
+                f = fopen(path, "r");
+                if (f != NULL)
+                {
+                    n = fread(buf, 1, sizeof(buf) - 1, f);
+                    fclose(f);
+                }
+                buf[n] = '\0';
+                remove(path);
+
+                Check(strstr(buf, "state did not fit, no digest") != NULL,
+                      "the oversize report names the refusal");
+                Check(strstr(buf, "sha256=") == NULL,
+                      "and emits no sha256= token the verdict could parse");
+                Check(strstr(buf, "bytes=") == NULL,
+                      "and no byte count either");
+            }
+
+            /* the successful path is unaffected by the failed one */
+            free(huge);
+            BuildState();
+            {
+                char again[DCS_DIGEST_LEN];
+                size_t n = 0;
+                Check(D_StateCanaryDigest(again, sizeof(again), &n),
+                      "a fitting state still digests after a refusal");
+                Check(strcmp(again, fitted_digest) == 0 && n == fitted,
+                      "and produces exactly the same result as before it");
+            }
+        }
     }
 
     printf("%d checks, %d failures\n", checks, failures);

@@ -537,5 +537,161 @@ for (const [first, second] of [["A", "B"], ["B", "A"]]) {
         "and only the newest peer report");
 }
 
+// --- a refused digest can never become a MATCH -----------------------------
+
+// When the exit state does not fit the serializer's scratch buffer the engine
+// prints a refusal instead of a result. That line carries no digest, so there
+// is nothing to compare; the danger would be treating "both sides said the
+// same thing" as agreement. Silence is not agreement.
+
+const REFUSAL = "STATE CANARY: exit: state did not fit, no digest";
+
+{
+  // Both peers refuse, with byte-identical text.
+  const w = pairedWorld();
+  w.line("A", `DEMO CANARY: exit bytes=1200 sha256=${H1}`);
+  w.line("A", REFUSAL);
+  w.drain();
+  w.line("B", `DEMO CANARY: exit bytes=1200 sha256=${H1}`);
+  w.line("B", REFUSAL);
+  w.drain();
+
+  check(w.verdict("A") === VERDICT.PENDING && w.verdict("B") === VERDICT.PENDING,
+        "two identical refusals are not a MATCH");
+  check(!w.hasReport("A") && !w.hasReport("B"),
+        "a refusal never completes a report");
+}
+
+{
+  // One peer refuses, the other produces a real result.
+  const w = pairedWorld();
+  w.finishExit("A", 1000);
+  w.drain();
+  w.line("B", `DEMO CANARY: exit bytes=1200 sha256=${H1}`);
+  w.line("B", REFUSAL);
+  const { drained } = w.drain();
+
+  check(drained, "a one-sided refusal still settles");
+  check(w.verdict("B") === VERDICT.PENDING,
+        "the refusing page cannot match a complete peer");
+  check(w.verdict("A") === VERDICT.PENDING,
+        "and the complete page keeps waiting rather than matching a refusal");
+}
+
+{
+  // The refusal must not be parsed into a partial state half either.
+  const w = pairedWorld();
+  check(w.line("A", REFUSAL) === "line:not-a-result",
+        "the refusal is not a result line");
+
+  // Truncated and malformed digests are equally inert.
+  for (const bad of [
+    "STATE CANARY: exit episode=1 map=1 gametic=10 bytes=655 sha256=",
+    "STATE CANARY: exit episode=1 map=1 gametic=10 bytes=655 sha256=abc",
+    `STATE CANARY: exit episode=1 map=1 gametic=10 sha256=${H2}`,
+    `STATE CANARY: exit episode=1 map=1 gametic=10 bytes= sha256=${H2}`,
+  ]) {
+    check(w.line("A", bad) === "line:not-a-result",
+          `an incomplete result is rejected: ${bad.slice(30, 70)}`);
+  }
+  check(w.verdict("A") === VERDICT.PENDING,
+        "and none of them moved the verdict");
+}
+
+// --- known, deliberately unauthenticated boundaries ------------------------
+
+// These two cases are not defects being fixed. They are the honest edges of a
+// protocol that authenticates nobody, pinned here so they stay visible as
+// known behavior instead of being rediscovered later as surprises, or worse,
+// described as something the protocol protects against.
+
+{
+  // Forged replacement: any same-origin script can read a session id off the
+  // channel, name the live partner in `replaces`, take its place, and then
+  // reflect a report back. The victim displays a perfectly stable MATCH that
+  // means nothing, and the real peer is locked out.
+  const w = pairedWorld();
+  w.finishExit("A", 1000);
+  w.drain();
+  w.finishExit("B", 1000);
+  w.drain();
+  check(w.verdict("A") === VERDICT.MATCH, "the honest pair matches first");
+
+  const bSession = w.pages.get("B").session;
+
+  // A third page displaces B by naming B's session, which it can simply read
+  // off the shared channel.
+  w.add("X", "X1");
+  w.send("X", { type: "arm", session: "X2", replaces: bSession });
+  w.drain();
+  check(w.partner("A") === "X2",
+        "BOUNDARY: a same-origin page can displace the live partner");
+
+  // Adopting a new partner clears both reports, so the reflection is not
+  // instant: the victim first has to finish another exit and publish it.
+  check(w.verdict("A") === VERDICT.PENDING,
+        "the displaced pairing at least resets the victim to PENDING");
+
+  w.finishExit("A", 2000, "5".repeat(64), "6".repeat(64));
+  w.drain();
+  const aState = w.pages.get("A");
+
+  // Now the attacker echoes the victim's own report back at it.
+  w.send("X", { type: "report", session: "X2", partner: aState.session,
+                input: aState.myReport.input, state: aState.myReport.state });
+  w.drain();
+  check(w.verdict("A") === VERDICT.MATCH,
+        "BOUNDARY: a reflected report yields a stable but meaningless MATCH");
+
+  // The displaced honest peer can no longer reach A.
+  w.finishExit("B", 2000, "5".repeat(64), "6".repeat(64));
+  w.drain();
+  check(w.partner("A") === "X2",
+        "BOUNDARY: the real peer stays locked out");
+  // Documented in docs/provenance.md: the verdict is evidence only when every
+  // script on the served origin is trusted. No in-protocol fix exists, since a
+  // token would be readable through the same origin.
+}
+
+{
+  // Asymmetric full reload: F5 on one window only. The reloaded page loses its
+  // session and correctly shows PENDING. The surviving page is NOT reset --
+  // it keeps its old MATCH against a session that no longer exists, and will
+  // hold it indefinitely.
+  const w = pairedWorld();
+  w.finishExit("A", 1000);
+  w.drain();
+  w.finishExit("B", 1000);
+  w.drain();
+  check(w.verdict("A") === VERDICT.MATCH && w.verdict("B") === VERDICT.MATCH,
+        "both windows match before the reload");
+
+  const deadSession = w.pages.get("B").session;
+
+  // B is reloaded from scratch: a brand new page, no memory, no `replaces`.
+  w.pages.delete("B");
+  w.add("B", "B-reloaded");
+  w.drain();
+
+  check(w.verdict("B") === VERDICT.PENDING,
+        "the reloaded window is PENDING, having lost its identity");
+  check(w.verdict("A") === VERDICT.MATCH,
+        "BOUNDARY: the surviving window retains a MATCH for a dead session");
+  check(w.pages.get("A").partner === deadSession,
+        "BOUNDARY: the survivor still points at the session that no longer exists");
+  check(w.partner("B") !== deadSession,
+        "and the reloaded page did not recover the old pairing");
+
+  // Hence the acceptance rule recorded in docs/provenance.md: a single
+  // window showing MATCH proves nothing. Both live windows must show MATCH
+  // simultaneously after the same shared exit. Recovery is reloading or
+  // relaunching both windows, never adopting a partner on a timeout, which
+  // would reopen third-page takeover.
+  w.relaunch("A", "A-relaunched");
+  w.drain();
+  check(w.verdict("A") === VERDICT.PENDING,
+        "relaunching the survivor clears the stale MATCH");
+}
+
 console.log(`${checks} checks, ${failures} failures`);
 process.exit(failures === 0 ? 0 : 1);
