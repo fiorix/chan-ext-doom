@@ -108,12 +108,22 @@ list(REMOVE_ITEM ENGINE_SOURCES ${ENGINE_ROOT}/src/net_sdl.c)
 
 add_executable(doom ${ENGINE_SOURCES})
 
-# GCC 15 and Clang 19 default to C23, which rejects this tree's legacy
-# doomtype.h enum member named false. The reference recipe is explicit about
-# the language version and this must be too, rather than inheriting whatever
-# the toolchain's default happens to become.
+# Both build routes pin GNU C99 explicitly, and the recipe in
+# docs/provenance.md passes the same -std=gnu99. Leaving either on the
+# compiler default is what made the two routes diverge: the default moved to
+# C23, which rejects this tree's legacy doomtype.h enum member named false,
+# and comparing a defaulted build against a pinned one attributed a language
+# difference to the linker.
+#
+# The extensions are not incidental. sdl_mixer/music.c calls strtok_r, which
+# strict -std=c99 hides behind __STRICT_ANSI__, so C_EXTENSIONS OFF does not
+# build. It is set explicitly rather than left to CMake's default so the
+# emitted -std cannot change underneath the comparison.
 
-set_target_properties(doom PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED YES)
+set_target_properties(doom PROPERTIES
+    C_STANDARD 99
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS ON)
 
 # -Wno-#warnings must be quoted: CMake would otherwise treat the # as the
 # start of a comment and pass the invalid flag -Wno- to the compiler.

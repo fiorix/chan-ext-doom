@@ -253,7 +253,7 @@ Run from `engine/`. Outputs land in `engine/out/`, which is a build directory an
 ```sh
 source ~/dev/emsdk/emsdk_env.sh
 mkdir -p out
-emcc -Oz \
+emcc -Oz -std=gnu99 \
   '-Wno-#warnings' -Wno-macro-redefined -Wno-switch \
   -Igifenc -Iopl -Isdl_mixer -Isrc -Isrc/doom \
   $(find gifenc opl sdl_mixer src -name '*.c' -not -name 'net_sdl.c' | LC_ALL=C sort) \
@@ -266,11 +266,13 @@ emcc -Oz \
   -o out/doom.js
 ```
 
-Three parts of that line are load-bearing:
+Four parts of that line are load-bearing:
+
+- `-std=gnu99` pins the language mode. Without it the compiler default applies, and that default has moved to C23, which rejects this tree's legacy `doomtype.h` enum member named `false`. It must be GNU C99 rather than strict C99: `sdl_mixer/music.c` calls `strtok_r`, which `-std=c99` hides behind `__STRICT_ANSI__`. This flag is also what keeps this recipe comparable with the CMake route, which pins the same mode; when only one route pinned it, the resulting size difference looked like a linker artifact and was misattributed to one.
 
 - `-not -name net_sdl.c` keeps the UDP transport out of the browser build. It needs SDL_net, which emscripten does not provide, and `net_transport.h` selects the WebSocket module here anyway. There is no native build to mirror this: see "Native build" below.
 - `-lwebsocket.js` links emscripten's WebSocket implementation. Without it the transport's symbols are undefined at link time.
-- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1187974 to 1689618 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
+- `-s ASYNCIFY` lets `I_Sleep` yield to the browser event loop. Without it the network waits cannot make progress and every connect times out. It costs about 41% in wasm size (1195049 to 1689701 bytes), which is the price of the connect path working at all. `ASYNCIFY_ONLY` could narrow the instrumentation later; it has not been tuned.
 
 `LC_ALL=C sort` is also load-bearing. Bare `find` emits readdir order, which varies by filesystem and by the order files were created, and emcc assigns wasm function indices and `EM_ASM` string addresses in command-line order. Without the sort the same source tree produces a different `doom.wasm` on every machine. With it, the build is bit-reproducible.
 
@@ -288,14 +290,23 @@ cmake --build build
 
 **It is an Emscripten-only entry point and refuses anything else.** A non-Emscripten toolchain fails at configure time with a deliberate diagnostic, before CMake compiles even its compiler-identification program and long before anything probes for SDL. That refusal is a statement about the source, not about the host: see "Native build" below.
 
-Executed and compared. Configure and a full link complete with emsdk 6.0.3, and the result is deterministic: two fresh configure-and-build cycles produce an identical `doom.wasm`. Against the single-`emcc` reference from the same clean archive:
+Executed and compared. Configure and a full link complete with emsdk 6.0.3, and both routes are deterministic: two fresh clean-archive builds of each produce identical bytes.
 
-| artifact | reference | CMake |
+Both routes pin `-std=gnu99`, and that is the precondition for the comparison meaning anything. An earlier version of this document got it wrong: the CMake target pinned GNU C99 while the recipe carried no `-std` at all and took the compiler default, so the two builds were not compiled in the same language mode. The resulting size difference was then attributed entirely to linking, which was false. With the language mode equal on both sides:
+
+| artifact | recipe | CMake |
 | --- | --- | --- |
 | `doom.js` | 188756 bytes | byte-identical |
-| `doom.wasm` | 1689618 bytes | 1689704 bytes, +86 |
+| `doom.wasm` | 1689701 bytes | 1689704 bytes, +3 |
 
-The `doom.js` files are the same bytes. The `doom.wasm` files are the same program with a different layout, and the difference is accounted for rather than assumed: the type, import, function, table, memory, global, export and element sections are identical in size, both modules declare 1896 functions and carry 1896 code bodies and 2160 data segments, the memory declarations are identical, and neither contains a string the other lacks, so no build path leaks in. The whole delta is `code` +83 and `data` +3, and it starts at a data-segment header whose `i32.const` offset differs by four. CMake compiles each translation unit to its own object and `wasm-ld` merges them at object granularity, while the recipe hands every source to one `emcc` invocation that packs the data more tightly; the shifted segment changes the magnitude of address constants embedded in the code, which changes their LEB128 encoding widths. The pinned hashes therefore stay the recipe's, which reproduces them exactly.
+The `doom.js` files are the same bytes. For `doom.wasm`, what the evidence establishes and no more:
+
+- The type, import, table, memory, global and data-count sections are byte-identical.
+- The code sections are the **same size**, 1396766 bytes, and carry 1896 function bodies each, with equal total body bytes at 1393411 and an identical sorted body-length multiset. They are not byte-identical: 283 bodies match in place, and 661 appear in one and not the other. Equal counts and equal length multisets are consistent with the same functions emitted in a different order with call-target indices renumbered, but this comparison does not on its own prove the two modules semantically identical.
+- The function, export and element sections are likewise equal in size and different in bytes, which is what a different function ordering produces.
+- The data sections carry the whole +3. Both declare 2160 segments; the first difference is a segment header whose `i32.const` offset differs by four and whose declared length differs, so the two link steps split the segments at different boundaries. The section tails are identical.
+
+CMake compiles each translation unit to its own object and `wasm-ld` merges them, while the recipe hands every source to one `emcc` invocation; a different segment split and a different function order are the expected consequence of that. The pinned hashes are the recipe's, and the recipe is the reference.
 
 ### Expected output
 
@@ -304,7 +315,7 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
 | doom.js | 188756 | b375a1eadb9c8cb5c90c7e5231b360792e52e49c5c9d5ac1750692e1a2ae56a5 |
-| doom.wasm | 1689618 | a3b8ca1ef3e7f0a4db88096d0cd02be1534ac28cfe68da44146a58b43f66aee4 |
+| doom.wasm | 1689701 | 9301edfe9ef92a297c390cc1b16ebec26dfc6d619225f4c340675931eb59db61 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
