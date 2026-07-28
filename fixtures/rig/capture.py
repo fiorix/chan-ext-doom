@@ -14,6 +14,8 @@ Subcommands:
   run      capture one session into a scratch directory
   export   curate a captured session into the fixtures tree and
            regenerate fixtures/manifest.json
+  craft    build a documented probe packet (e.g. a SYN with chosen
+           gamemode/gamemission) for injection with ``run --inject``
 
 Python 3 standard library only; no third-party dependencies.
 
@@ -285,6 +287,26 @@ def cmd_run(args):
         log = open(os.path.join(out, f"{spec['name']}.log"), "w")
         clients.append({**spec, "argv": argv, "env": env, "log": log, "proc": None})
 
+    # Scheduled crafted-packet injections: (at_s, path, note). Each is sent
+    # from its own scratch socket so the relay and server treat it as a new
+    # client. Provenance for every injected datagram lands in session.json.
+    injects = []
+    for spec in args.inject:
+        at_s, path, note = spec.split(":", 2)
+        with open(path, "rb") as f:
+            payload = f.read()
+        injects.append(
+            {
+                "at_s": float(at_s),
+                "file": os.path.abspath(path),
+                "note": note,
+                "payload": payload,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "sock": None,
+                "peer": None,
+            }
+        )
+
     t_start = time.monotonic()
     server = subprocess.Popen(
         server_argv, stdout=server_log, stderr=subprocess.STDOUT, env=env_base
@@ -312,11 +334,20 @@ def cmd_run(args):
                     if c["proc"].poll() is None:
                         sig = signal.SIGTERM if c["signal"] == "term" else signal.SIGKILL
                         c["proc"].send_signal(sig)
+            for inj in injects:
+                if inj["sock"] is None and elapsed >= inj["at_s"]:
+                    inj["sock"] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    inj["sock"].sendto(inj["payload"], (LOOPBACK, DEFAULT_PORT))
+                    # The relay assigns the peer name in join order.
+                    inj["peer"] = f"client{len(clients) + injects.index(inj) + 1}"
             if now >= deadline:
                 break
             relay.poll(min(0.25, max(0.0, deadline - now)))
     finally:
         relay.close()
+        for inj in injects:
+            if inj["sock"] is not None:
+                inj["sock"].close()
         for c in clients:
             if c["proc"] is None:  # never started (short capture)
                 c["exit_code"] = None
@@ -358,6 +389,16 @@ def cmd_run(args):
         "duration_s": args.duration,
         "packet_count": len(relay.packets),
         "server_exit_code": server_rc,
+        "injects": [
+            {
+                "at_s": inj["at_s"],
+                "file": inj["file"],
+                "sha256": inj["sha256"],
+                "peer": inj["peer"],
+                "note": inj["note"],
+            }
+            for inj in injects
+        ],
     }
     with open(os.path.join(out, "session.json"), "w") as f:
         json.dump(session, f, indent=2)
@@ -531,6 +572,64 @@ def write_manifest(fixtures_dir):
         json.load(f)
 
 
+def cmd_craft(args):
+    """Build a documented probe packet (currently: a SYN with chosen
+    gamemode/gamemission). The layout is exactly the c2s SYN documented
+    in docs/protocol.md section 4, so the server's parser walks it like
+    a real client's packet and only the chosen fields differ."""
+    wad_sha1 = bytes(20)
+    deh_sha1 = bytes(20)
+    if args.checksums_from:
+        with open(args.checksums_from, "rb") as f:
+            ref = f.read()
+        # Documented SYN offsets: connect data starts at 45, wad sha1 at
+        # 51, deh sha1 at 71 (see docs/protocol.md section 4).
+        wad_sha1 = ref[51:71]
+        deh_sha1 = ref[71:91]
+        if len(wad_sha1) != 20 or len(deh_sha1) != 20:
+            print("rig: --checksums-from file is not a c2s SYN", file=sys.stderr)
+            return 1
+
+    def u16be(v):
+        return bytes([(v >> 8) & 0xFF, v & 0xFF])
+
+    def u32be(v):
+        return bytes(
+            [(v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF]
+        )
+
+    def z(s):
+        return s.encode("ascii") + b"\x00"
+
+    pkt = b"".join(
+        [
+            u16be(0),
+            u32be(1454104972),  # NET_MAGIC_NUMBER
+            z("Chocolate Doom 3.1.1"),
+            b"\x01",
+            z("CHOCOLATE_DOOM_0"),
+            bytes(
+                [
+                    args.gamemode & 0xFF,
+                    args.gamemission & 0xFF,
+                    0,  # lowres_turn
+                    0,  # drone
+                    4,  # max_players
+                    0,  # is_freedoom
+                ]
+            ),
+            wad_sha1,
+            deh_sha1,
+            b"\x00",  # player_class
+            z(args.player_name),
+        ]
+    )
+    with open(args.out, "wb") as f:
+        f.write(pkt)
+    print(f"rig: crafted SYN ({len(pkt)} bytes) -> {args.out}")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -582,6 +681,14 @@ def main(argv=None):
         default=6.0,
         help="seconds after start to signal the client",
     )
+    pr.add_argument(
+        "--inject",
+        action="append",
+        default=[],
+        metavar="AT:FILE:NOTE",
+        help="send FILE's bytes as a crafted datagram AT seconds in "
+        "(repeatable); NOTE goes into session.json provenance",
+    )
     pr.set_defaults(func=cmd_run)
 
     pe = sub.add_parser("export", help="curate a capture into the fixtures tree")
@@ -596,6 +703,22 @@ def main(argv=None):
         "and drift between runs — inspect before exporting.",
     )
     pe.set_defaults(func=cmd_export)
+
+    pc = sub.add_parser(
+        "craft", help="build a documented probe packet for --inject"
+    )
+    pc.add_argument("--kind", choices=["syn"], required=True)
+    pc.add_argument("--gamemode", type=int, default=0)
+    pc.add_argument("--gamemission", type=int, default=0)
+    pc.add_argument("--player-name", default="RigProbe")
+    pc.add_argument(
+        "--checksums-from",
+        default=None,
+        help="a real c2s SYN fixture to copy the wad/deh sha1 fields from, "
+        "so only the chosen fields differ from a real client packet",
+    )
+    pc.add_argument("--out", required=True)
+    pc.set_defaults(func=cmd_craft)
 
     args = ap.parse_args(argv)
     return args.func(args)
