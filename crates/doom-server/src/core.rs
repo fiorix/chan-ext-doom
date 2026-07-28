@@ -760,6 +760,31 @@ mod tests {
     }
 
     #[test]
+    fn relay_overflow_still_removes_at_exactly_capacity_plus_one() {
+        // Peer-to-peer relay never enters a host batch: the exact
+        // per-packet 64/65 policy is unchanged by the batch semantics.
+        let mut registry = registry_with_capacity(64);
+        let sender = registry.join(room()).expect("sender joins");
+        let recipient = registry.join(room()).expect("recipient joins");
+
+        for _ in 0..64 {
+            assert_eq!(
+                registry
+                    .relay(sender, recipient, 11, b"relay")
+                    .expect("relay succeeds"),
+                RelayOutcome::Queued(recipient)
+            );
+        }
+        assert_eq!(
+            registry
+                .relay(sender, recipient, 11, b"overflow")
+                .expect("the 65th applies the removal policy"),
+            RelayOutcome::SlowConsumerDisconnected(recipient)
+        );
+        assert!(!registry.contains(recipient));
+    }
+
+    #[test]
     fn host_batch_boundary_is_the_pre_batch_occupancy() {
         let mut registry = registry_with_capacity(2);
         let player = registry.join(room()).expect("player joins");
