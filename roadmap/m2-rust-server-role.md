@@ -40,6 +40,7 @@ The room core continues to own names, membership, stable connection identities, 
 - Accept an explicit peer identity, packet bytes or decoded client packet, and monotonic time; return explicit actions such as send, disconnect, and room/lobby updates.
 - Implement negotiation, rejection, waiting-room state, controller launch, authoritative GAMESTART, ticcmd fan-out, acknowledgement windows, resend requests, reliable sequencing and retries, keepalives, timeouts, disconnect handshakes, and query responses.
 - Preserve the room core's eight-connection bound while enforcing the Doom engine's four-player game limit from client capabilities.
+- Bound each peer's reliable FIFO at 64 entries. The 65th enqueue disconnects that peer without growing the queue, an intentional abuse-path deviation from upstream's unbounded list.
 - Validate IWAD, DEH, protocol, mission, game mode, and launch settings before admitting or starting peers.
 - Keep simulation in the engines. The Rust server never advances Doom game state.
 
@@ -48,8 +49,8 @@ The room core continues to own names, membership, stable connection identities, 
 - Make the Rust server role the virtual room endpoint currently addressed as route ID 1. Browser clients keep the asymmetric little-endian WebSocket envelope, but no browser connection claims or implements the server route.
 - Keep source-route ownership, room isolation, queue bounds, payload limits, and reset/disconnect behavior explicit when replacing the in-browser host.
 - Add a UDP adapter that maps native datagram addresses to the same peer and server actions used by WebSocket clients.
-- Expose both bindings from `doomd serve` with explicit listen configuration and no chan dependency.
-- Prove that browser and native clients can reach the same server implementation. A mixed-transport lobby or GAMESTART is preferred acceptance evidence because it catches binding-specific semantic drift.
+- Expose both bindings from `doomd serve` with explicit listen configuration and no chan dependency. Each UDP listener maps unambiguously to one named room because the Chocolate datagram carries no room name.
+- Use one room host and one server-role instance for WebSocket and UDP peers in the same named room. A mixed-transport lobby and GAMESTART are required evidence because they catch binding-specific semantic drift.
 
 ### Engine and loader transition
 
