@@ -246,7 +246,8 @@
       import { classifyMessage, GATE } from "./message_gate.js";
       import {
         parseCanaryLine, channelName, isComplete, compareReports,
-        acceptsReport, classifyArm, addCanaryLine, LABEL, ARM, VERDICT,
+        addCanaryLine, receiveMessage, armMessage, publishOutbound,
+        armAdopts, LABEL, VERDICT,
       } from "./canary_verdict.js";
 
       const el = (id) => document.getElementById(id);
@@ -534,13 +535,17 @@
       // alone let a page holding a stale report answer a peer's fresh run,
       // because two different runs can reach the same exit on the same tic.
       let canaryChannel = null;
-      let session = null;
-      let partner = null;
-      let myReport = null;
-      let peerReport = null;
+      // The protocol state the step function operates on. Held as one object
+      // so the page and the system simulator run the same code over the same
+      // shape, rather than a model that agrees with the page only by
+      // inspection.
+      let peer = {
+        session: null, replaces: null, partner: null,
+        myReport: null, peerReport: null,
+      };
 
       function renderVerdict() {
-        const v = compareReports(myReport, peerReport);
+        const v = compareReports(peer.myReport, peer.peerReport);
         const cls = { MATCH: "match", MISMATCH: "mismatch", PENDING: "pending" };
 
         el("verdict-input").textContent = v.labels.input;
@@ -553,9 +558,9 @@
           note = "Both peers agree on the input history and the exit state.";
         } else if (v.aggregate === VERDICT.MISMATCH) {
           note = "The peers disagree. This run desynced.";
-        } else if (!partner) {
+        } else if (!peer.partner) {
           note = "Waiting for the other window to join this room.";
-        } else if (!isComplete(myReport)) {
+        } else if (!isComplete(peer.myReport)) {
           note = "Play to the level exit in both windows.";
         } else {
           note = "Waiting for the other window's result.";
@@ -564,26 +569,15 @@
 
         window.__doomVerdict = v;
         window.__doomPairing = {
-          session, partner,
-          mine: isComplete(myReport), peer: isComplete(peerReport),
+          session: peer.session, partner: peer.partner,
+          mine: isComplete(peer.myReport), peer: isComplete(peer.peerReport),
           channel: !!canaryChannel,
         };
       }
 
-      function announceArm() {
-        if (!canaryChannel || !session) return;
-        canaryChannel.postMessage({ type: "arm", session });
-      }
-
-      function publishReport() {
-        // Addressed to the current partner. An unpartnered page has nobody to
-        // address, so it publishes nothing rather than broadcasting a report
-        // any stale page could pick up.
-        if (!canaryChannel || !partner || !isComplete(myReport)) return;
-        canaryChannel.postMessage({
-          type: "report", session, partner,
-          input: myReport.input, state: myReport.state,
-        });
+      function send(msgs) {
+        if (!canaryChannel) return;
+        for (const m of msgs) canaryChannel.postMessage(m);
       }
 
       // A line that passed the message gate is still only text. It becomes a
@@ -593,34 +587,18 @@
         const parsed = parseCanaryLine(text);
         if (!parsed) return;
 
-        const before = myReport;
-        myReport = addCanaryLine(myReport, parsed);
+        const before = peer.myReport;
+        peer.myReport = addCanaryLine(peer.myReport, parsed);
 
         // A second exit within one launch starts a fresh report, so a peer
         // never sees a new input paired with the previous exit's state.
-        if (before && isComplete(before) && !isComplete(myReport)) {
-          peerReport = null;
+        if (before && isComplete(before) && !isComplete(peer.myReport)) {
+          peer.peerReport = null;
         }
 
-        if (isComplete(myReport)) publishReport();
+        if (isComplete(peer.myReport)) send(publishOutbound(peer));
         renderVerdict();
       }
-
-      function adoptPartner(theirSession) {
-        // A new pairing invalidates everything from the old one on this side,
-        // including our own report: it was produced against a run the other
-        // page is no longer in.
-        partner = theirSession;
-        peerReport = null;
-        myReport = null;
-        announceArm();
-        renderVerdict();
-      }
-
-      // Publishing is driven by our own state changing, never by receiving a
-      // peer report. Answering a report with a report makes the two pages
-      // trade messages forever, and the storm was enough to starve the arm
-      // handling that a relaunch depends on.
 
       function openCanaryChannel(room) {
         if (canaryChannel) {
@@ -632,22 +610,18 @@
 
         canaryChannel = new BroadcastChannel(channelName(room));
         canaryChannel.onmessage = (e) => {
-          const data = e.data;
+          const before = peer;
+          const r = receiveMessage(peer, e.data);
+          peer = r.state;
+          window.__doomLastAction = r.action;
+          send(r.outbound);
 
-          const armVerdict = classifyArm(data, { session, partner });
-          if (armVerdict === ARM.ADOPT) {
-            adoptPartner(data.session);
-            return;
-          }
-          if (armVerdict !== ARM.IGNORE_INVALID) return;
-
-          if (!acceptsReport(data, { session, partner })) return;
-
-          peerReport = data;
-          renderVerdict();
+          // A partner change discards the pairing's state, so anything we had
+          // published is no longer ours to stand behind.
+          if (armAdopts(r.action) || r.state !== before) renderVerdict();
         };
 
-        announceArm();
+        send([armMessage(peer)]);
       }
 
       let frame = null;
@@ -706,12 +680,20 @@
         // Everything about the previous run is discarded here, which is what
         // makes a stale result impossible: a new peer id, no report of our
         // own, nothing remembered from the other window, and a fresh channel.
-        session = (crypto.randomUUID
-          ? crypto.randomUUID()
-          : String(currentRun) + ":" + Math.random() + ":" + performance.now());
-        partner = null;
-        myReport = null;
-        peerReport = null;
+        // The previous session is carried into the first arm of this launch,
+        // so the page that was partnered with it can tell our relaunch apart
+        // from an unrelated page arriving. Without that name, a partnered
+        // page has no safe way to distinguish the two, and adopting both is
+        // what made three pages cycle forever.
+        peer = {
+          session: (crypto.randomUUID
+            ? crypto.randomUUID()
+            : String(currentRun) + ":" + Math.random() + ":" + performance.now()),
+          replaces: peer.session,
+          partner: null,
+          myReport: null,
+          peerReport: null,
+        };
         openCanaryChannel(mode() === "single" ? "" : el("room").value.trim());
         renderVerdict();
 

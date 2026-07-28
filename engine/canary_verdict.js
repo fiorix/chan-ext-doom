@@ -145,9 +145,14 @@ export function isValidReport(r) {
   return true;
 }
 
+// `replaces` names the session this launch supersedes, so a partner can tell
+// a relaunch of its own peer from an unrelated page appearing. Absent or null
+// on a first launch; a bounded session id otherwise.
 export function isValidArm(a) {
-  return !!a && typeof a === "object" && a.type === "arm" &&
-    isSessionId(a.session);
+  if (!a || typeof a !== "object" || a.type !== "arm") return false;
+  if (!isSessionId(a.session)) return false;
+  if (a.replaces === undefined || a.replaces === null) return true;
+  return isSessionId(a.replaces);
 }
 
 //
@@ -168,21 +173,50 @@ export function acceptsReport(received, ctx) {
 }
 
 // How a page should react to an arm. Returning an explicit action keeps the
-// page from re-deriving the rules and lets the tests name them.
+// page from re-deriving the rules and lets tests and diagnostics name the
+// reason rather than observe silence.
 export const ARM = {
   IGNORE_INVALID: "arm:invalid",
   IGNORE_SELF: "arm:self",
   IGNORE_KNOWN: "arm:already-partnered",
+  IGNORE_UNRELATED: "arm:unrelated",
   ADOPT: "arm:adopt",
+  REPLACE: "arm:replace",
 };
 
+// Partnership is sticky, and that is what makes the protocol terminate.
+//
+// Adopting every unfamiliar arm does not: with three pages, each adoption
+// clears state and announces again, and the three cycle partners forever.
+// Measured on the previous rules, a three-page queue was still growing after
+// 2000 deliveries and 1058 adoptions.
+//
+// So an unpartnered page takes the first valid peer, a partnered page ignores
+// anyone unrelated, and the only way to displace an existing partner is an
+// arm that names it: a relaunching page announces the session it supersedes,
+// which its actual partner recognises and nobody else does.
 export function classifyArm(received, ctx) {
   if (!isValidArm(received)) return ARM.IGNORE_INVALID;
   if (received.session === ctx.session) return ARM.IGNORE_SELF;
-  // A repeat from the partner we already hold must not re-clear state or
-  // trigger another reply, or two pages ping-pong forever.
+
+  // Idempotent: a repeat from the partner we already hold must not re-clear
+  // state or trigger another reply.
   if (received.session === ctx.partner) return ARM.IGNORE_KNOWN;
-  return ARM.ADOPT;
+
+  if (!ctx.partner) return ARM.ADOPT;
+
+  // Only our current partner's own relaunch may take its place.
+  if (received.replaces && received.replaces === ctx.partner) {
+    return ARM.REPLACE;
+  }
+
+  return ARM.IGNORE_UNRELATED;
+}
+
+// Whether an action means the page changes partner, which is also the only
+// case that clears the pairing's state and announces again.
+export function armAdopts(action) {
+  return action === ARM.ADOPT || action === ARM.REPLACE;
 }
 
 function compareOne(mine, theirs) {
@@ -228,4 +262,62 @@ export function addCanaryLine(report, parsed) {
     return parsed.kind === "input" ? { input: parsed } : { ...report };
   }
   return { ...(report || {}), [parsed.kind]: parsed };
+}
+
+//
+// The page's reaction to one delivered message, as a pure step.
+//
+// Kept here rather than in the page so the simulator drives the same code the
+// browser runs. A protocol that converges in a hand-written model but not in
+// the page would be worth nothing, and the storm above was only visible at
+// system level: every individual classification was correct.
+//
+// state: { session, partner, myReport, peerReport }
+// Returns { action, state, outbound } where outbound is a list of messages to
+// broadcast. Receiving a report never produces a report: answering one with
+// another is what made two pages trade messages forever.
+//
+
+export function armMessage(state) {
+  return { type: "arm", session: state.session, replaces: state.replaces || null };
+}
+
+export function reportMessage(state) {
+  return {
+    type: "report",
+    session: state.session,
+    partner: state.partner,
+    input: state.myReport.input,
+    state: state.myReport.state,
+  };
+}
+
+export function receiveMessage(state, msg) {
+  const action = classifyArm(msg, state);
+
+  if (armAdopts(action)) {
+    // A new pairing invalidates everything from the old one on this side,
+    // including our own report: it was produced against a run the other page
+    // has left.
+    const next = { ...state, partner: msg.session, myReport: null, peerReport: null };
+    return { action, state: next, outbound: [armMessage(next)] };
+  }
+
+  if (action !== ARM.IGNORE_INVALID) {
+    // A known, self, or unrelated arm changes nothing at all. In particular
+    // an unrelated third page must not disturb an established verdict.
+    return { action, state, outbound: [] };
+  }
+
+  if (!acceptsReport(msg, state)) {
+    return { action: "report:rejected", state, outbound: [] };
+  }
+
+  return { action: "report:accepted", state: { ...state, peerReport: msg }, outbound: [] };
+}
+
+// Publishing is driven by our own state changing, never by a received report.
+export function publishOutbound(state) {
+  if (!state.partner || !isComplete(state.myReport)) return [];
+  return [reportMessage(state)];
 }

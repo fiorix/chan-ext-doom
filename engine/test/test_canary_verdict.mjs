@@ -284,9 +284,20 @@ const mkReport = (session, partner, inSha, stSha, over = {}) => ({
   check(classifyArm({ type: "arm", session: "you" },
                     { session: "me", partner: "you" }) === ARM.IGNORE_KNOWN,
         "a repeat from our current partner is ignored, so arms cannot ping-pong");
+  // Sticky: an unrelated page cannot displace an existing partner, which is
+  // what stops three pages cycling partners forever.
   check(classifyArm({ type: "arm", session: "other" },
-                    { session: "me", partner: "you" }) === ARM.ADOPT,
-        "a different peer's arm replaces the partner");
+                    { session: "me", partner: "you" }) === ARM.IGNORE_UNRELATED,
+        "an unrelated arm does not displace the current partner");
+  check(classifyArm({ type: "arm", session: "other", replaces: "you" },
+                    { session: "me", partner: "you" }) === ARM.REPLACE,
+        "an arm naming our partner replaces it");
+  check(classifyArm({ type: "arm", session: "other", replaces: "somebody" },
+                    { session: "me", partner: "you" }) === ARM.IGNORE_UNRELATED,
+        "an arm naming a session that is not our partner is ignored");
+  check(classifyArm({ type: "arm", session: "other", replaces: null },
+                    { session: "me", partner: null }) === ARM.ADOPT,
+        "an unpartnered page adopts the first valid peer");
 
   for (const junk of [null, "arm", { type: "report", session: "x" },
                       { type: "arm" }, { type: "arm", session: 5 },
@@ -298,6 +309,16 @@ const mkReport = (session, partner, inSha, stSha, over = {}) => ({
   check(isValidArm({ type: "arm", session: "x" }), "a well-formed arm validates");
   check(!isValidArm({ type: "arm", session: "x".repeat(200) }),
         "an oversized arm session is rejected");
+  check(isValidArm({ type: "arm", session: "x", replaces: null }),
+        "a null replaces is allowed");
+  check(isValidArm({ type: "arm", session: "x", replaces: "y" }),
+        "a session-shaped replaces is allowed");
+  check(!isValidArm({ type: "arm", session: "x", replaces: 7 }),
+        "a non-string replaces is rejected");
+  check(!isValidArm({ type: "arm", session: "x", replaces: "" }),
+        "an empty replaces is rejected");
+  check(!isValidArm({ type: "arm", session: "x", replaces: "y".repeat(200) }),
+        "an oversized replaces is rejected");
 }
 
 // --- the stale-correlation scenario this protocol exists for -----------------
@@ -348,9 +369,12 @@ const mkReport = (session, partner, inSha, stSha, over = {}) => ({
   const A1 = "A1", B1 = "B1", B2 = "B2", A2 = "A2";
 
   // One-sided: B relaunches. A adopts B2, which must clear A's partner state.
+  check(classifyArm({ type: "arm", session: B2, replaces: B1 },
+                    { session: A1, partner: B1 }) === ARM.REPLACE,
+        "a partner's relaunch, naming the session it supersedes, is adopted");
   check(classifyArm({ type: "arm", session: B2 },
-                    { session: A1, partner: B1 }) === ARM.ADOPT,
-        "a partner's relaunch is adopted as a new pairing");
+                    { session: A1, partner: B1 }) === ARM.IGNORE_UNRELATED,
+        "a relaunch that does not name what it supersedes is ignored");
   check(!acceptsReport(mkReport(B1, A1, H1, H2), { session: A1, partner: B2 }),
         "after adopting the new pairing, the old partner's report is rejected");
 
@@ -362,8 +386,8 @@ const mkReport = (session, partner, inSha, stSha, over = {}) => ({
 
   // A third page joining replaces the partner rather than being ignored.
   check(classifyArm({ type: "arm", session: "C1" },
-                    { session: A1, partner: B1 }) === ARM.ADOPT,
-        "a different partner replaces the current one");
+                    { session: A1, partner: B1 }) === ARM.IGNORE_UNRELATED,
+        "a third page does not replace the current partner");
   check(!acceptsReport(mkReport(B1, A1, H1, H2), { session: A1, partner: "C1" }),
         "the replaced partner's report is no longer accepted");
 }

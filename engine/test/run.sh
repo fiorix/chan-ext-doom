@@ -73,6 +73,11 @@ node test/test_message_gate.mjs
 # cases get the most attention.
 node test/test_canary_verdict.mjs
 
+# The arm/session protocol at system level. Three pages storming forever was a
+# property of how correct decisions compose, so a queue simulator over the same
+# step function the page runs is the only thing that could see it.
+node test/test_verdict_system.mjs
+
 # Address ownership contract, guarded mechanically because getting it wrong
 # is silent: NET_RecvPacket in net_io.c takes the one reference consumers
 # release, so a transport module that also references leaks one refcount per
