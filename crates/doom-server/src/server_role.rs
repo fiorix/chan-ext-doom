@@ -17,8 +17,9 @@
 //! slots, 8 room connections (enforced by the registry), 4 Doom players
 //! (from client capability), 30 s receive-silence timeout, 1 s keepalive,
 //! 1 s reliable head retry, 1 s WAITING_DATA cadence, 5 initiated
-//! DISCONNECT retries, and a per-peer reliable FIFO cap of 64, the one
-//! deliberate abuse-path deviation from upstream's unbounded list.
+//! DISCONNECT sends at 1 s intervals, 5 s disconnected-sleep, and a
+//! per-peer reliable FIFO cap of 64, the one deliberate abuse-path
+//! deviation from upstream's unbounded list.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -38,17 +39,19 @@ const MODE_INDETERMINED: u8 = 4;
 
 /// Reliable FIFO cap per peer. The 65th enqueue removes the peer.
 const RELIABLE_CAP: usize = 64;
-/// Silence after which a peer is dropped (CONNECTION_TIMEOUT_LEN).
+/// Silence after which a connected peer is dropped (CONNECTION_TIMEOUT_LEN).
 const TIMEOUT_MS: u64 = 30_000;
 /// Send-idle period after which a bare keepalive goes out.
 const KEEPALIVE_MS: u64 = 1_000;
-/// Age of the reliable head after which it is retried.
+/// Age of the reliable head after which it is retried in place.
 const RELIABLE_RETRY_MS: u64 = 1_000;
 /// Lobby update cadence while waiting for launch.
 const WAITDATA_MS: u64 = 1_000;
 /// Initiated DISCONNECT sends before forcing removal (MAX_RETRIES).
 const DISCONNECT_SENDS: u8 = 5;
 const DISCONNECT_RETRY_MS: u64 = 1_000;
+/// How long a remotely disconnected identity lingers for ACK re-sends.
+const SLEEP_MS: u64 = 5_000;
 
 /// Server identity sent in the SYN accept and the query response.
 const SERVER_VERSION: &[u8] = b"doomit doom-server (Chocolate 3.1.1 compatible)";
@@ -61,8 +64,9 @@ const SERVER_DESCRIPTION: &[u8] = b"doomit room server";
 #[derive(Clone, Debug)]
 pub enum Input {
     /// A peer the room host has already admitted. `addr_label` is opaque
-    /// transport metadata (at most 29 bytes) echoed back in lobby updates;
-    /// the role never interprets it.
+    /// transport metadata echoed back in lobby updates; it must encode as
+    /// a bounded wire string (no NUL, at most 29 bytes), and the role
+    /// validates that here rather than letting an unencodable action out.
     Join {
         player: PlayerId,
         addr_label: Vec<u8>,
@@ -103,14 +107,18 @@ pub enum Action {
         header: WireHeader,
         packet: ServerPacket,
     },
-    /// Remove the peer from the room. The role has already cleared
-    /// everything it holds for the peer.
+    /// Remove the peer from the room. `terminal` is the final packet the
+    /// peer is owed (a REJECTED or an acknowledgement): the binding must
+    /// deliver it before closing, because the role's state for the peer
+    /// is already gone and no later send will ever be produced for it.
     Disconnect {
         player: PlayerId,
         reason: DisconnectReason,
+        terminal: Option<Box<(WireHeader, ServerPacket)>>,
     },
     /// The room returns to waiting-for-launch (startup aborted or no
-    /// players remain). Drone cleanup actions precede it.
+    /// players remain). Initiated-disconnect actions for survivors
+    /// precede it.
     GameEnded,
 }
 
@@ -121,6 +129,8 @@ pub enum DisconnectReason {
     ReliableOverflow,
     Remote,
     GameEnded,
+    /// An input that could never encode (for example a label with NUL).
+    MalformedInput,
 }
 
 /// Room-level state (`net_server_state_t`).
@@ -131,8 +141,26 @@ pub enum ServerState {
     InGame,
 }
 
-/// One reliable outbox entry. The head is emitted once, then retried in
-/// place; retries never add entries.
+/// The pinned connection lifecycle for one peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Conn {
+    Connected,
+    /// We initiated: five sends at 1 s intervals, then forced removal.
+    /// The retry clock starts at the actual first send.
+    Disconnecting {
+        sends: u8,
+        last: Milliseconds,
+        reason: DisconnectReason,
+    },
+    /// The peer sent DISCONNECT: acknowledged, then the identity lingers
+    /// so a lost ACK can be re-sent to a duplicate DISCONNECT.
+    Sleeping {
+        until: Milliseconds,
+    },
+}
+
+/// One reliable outbox entry. Only the head is ever emitted: a new entry
+/// behind an unacknowledged head waits.
 #[derive(Clone, Debug, PartialEq)]
 struct ReliableEntry {
     seq: u8,
@@ -140,18 +168,14 @@ struct ReliableEntry {
     last_retry: Option<Milliseconds>,
 }
 
-/// Initiated-disconnect progress (`NET_CONN_STATE_DISCONNECTING`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DisconnectProgress {
-    sends: u8,
-    last: Milliseconds,
-    reason: DisconnectReason,
-}
-
 /// Per-peer protocol state.
 #[derive(Clone, Debug)]
 struct Peer {
-    established: bool,
+    /// A valid SYN has been accepted. Before that, the peer is a room
+    /// member but not a Chocolate client: only the SYN/refusal and QUERY
+    /// paths exist for it (pinned unknown-address handling).
+    syn: bool,
+    conn: Conn,
     name: Vec<u8>,
     addr_label: Vec<u8>,
     lowres_turn: bool,
@@ -169,13 +193,13 @@ struct Peer {
     last_recv: Milliseconds,
     last_send: Milliseconds,
     last_waitdata: Milliseconds,
-    disconnecting: Option<DisconnectProgress>,
 }
 
 impl Peer {
     fn admitted(now: Milliseconds, order: u64, addr_label: Vec<u8>) -> Self {
         Peer {
-            established: false,
+            syn: false,
+            conn: Conn::Connected,
             name: Vec::new(),
             addr_label,
             lowres_turn: false,
@@ -193,13 +217,18 @@ impl Peer {
             last_recv: now,
             last_send: now,
             last_waitdata: now,
-            disconnecting: None,
         }
     }
 
-    /// A SYN-accepted non-drone.
+    /// The pinned `ClientConnected`: protocol client that is not in the
+    /// process of disconnecting.
+    fn connected(&self) -> bool {
+        self.syn && matches!(self.conn, Conn::Connected)
+    }
+
+    /// A connected non-drone player.
     fn is_player(&self) -> bool {
-        self.established && !self.drone
+        self.connected() && !self.drone
     }
 }
 
@@ -212,9 +241,7 @@ pub struct ServerRole {
     settings: Option<GameSettings>,
     peers: BTreeMap<PlayerId, Peer>,
     next_order: u64,
-    /// The time of the input currently being handled. Reliable first
-    /// transmissions are emitted within the same pump, as upstream's
-    /// same-iteration connection run does.
+    /// The time of the input currently being handled.
     clock: Milliseconds,
 }
 
@@ -248,7 +275,7 @@ impl ServerRole {
         self.peers.len()
     }
 
-    /// Number of SYN-accepted non-drone players.
+    /// Number of connected non-drone players.
     pub fn player_count(&self) -> usize {
         self.peers.values().filter(|peer| peer.is_player()).count()
     }
@@ -266,10 +293,9 @@ impl ServerRole {
     /// Handle one input against the caller's clock.
     pub fn handle(&mut self, now: Milliseconds, input: Input) -> Vec<Action> {
         self.clock = now;
-        self.clock = now;
         match input {
             Input::Join { player, addr_label } => self.on_join(player, addr_label, now),
-            Input::Leave { player } => self.remove_peer(player, DisconnectReason::Remote, None),
+            Input::Leave { player } => self.on_leave(player),
             Input::Packet {
                 player,
                 header,
@@ -280,7 +306,22 @@ impl ServerRole {
         }
     }
 
+    // --- admission and removal -------------------------------------------
+
     fn on_join(&mut self, player: PlayerId, addr_label: Vec<u8>, now: Milliseconds) -> Vec<Action> {
+        // A duplicate admission must not replace live protocol state.
+        if self.peers.contains_key(&player) {
+            return Vec::new();
+        }
+        // Labels must encode as bounded wire strings; an unencodable
+        // label is rejected here rather than surfacing inside an action.
+        if addr_label.contains(&0) {
+            return vec![Action::Disconnect {
+                player,
+                reason: DisconnectReason::MalformedInput,
+                terminal: None,
+            }];
+        }
         let mut label = addr_label;
         label.truncate(MAX_NAME_LEN - 1);
         self.next_order += 1;
@@ -289,59 +330,107 @@ impl ServerRole {
         Vec::new()
     }
 
-    /// The single removal path. `cause_message`, when present, is the
-    /// console text broadcast to the remaining established peers before
-    /// the abort rules run (upstream's timeout broadcast).
-    fn remove_peer(
+    fn on_leave(&mut self, player: PlayerId) -> Vec<Action> {
+        let Some(peer) = self.peers.get(&player) else {
+            return Vec::new();
+        };
+        // A member that never completed SYN is not a protocol client: its
+        // removal carries no abort or game-end effects.
+        if !peer.syn {
+            self.peers.remove(&player);
+            return vec![Action::Disconnect {
+                player,
+                reason: DisconnectReason::Remote,
+                terminal: None,
+            }];
+        }
+        self.remove_connected(player, DisconnectReason::Remote, None, None)
+    }
+
+    /// The single removal path for protocol-connected peers.
+    /// `cause_message` is a console broadcast to the remaining connected
+    /// peers (the timeout broadcast); `terminal` is the final packet owed
+    /// to the removed peer itself.
+    fn remove_connected(
         &mut self,
         player: PlayerId,
         reason: DisconnectReason,
         cause_message: Option<Vec<u8>>,
+        terminal: Option<Box<(WireHeader, ServerPacket)>>,
     ) -> Vec<Action> {
         let Some(peer) = self.peers.remove(&player) else {
             return Vec::new();
         };
 
-        let mut actions = vec![Action::Disconnect { player, reason }];
+        let mut actions = vec![Action::Disconnect {
+            player,
+            reason,
+            terminal,
+        }];
         if let Some(message) = cause_message {
             self.broadcast_console(&mut actions, message);
         }
 
         if self.state == ServerState::WaitingStart && peer.is_player() {
             // A non-drone loss while waiting for GAMESTART aborts startup
-            // (pinned behavior): broadcast the abort, then end the game.
+            // (pinned behavior): the broadcast goes out first, then the
+            // game ends and every survivor is disconnected.
             let mut message = b"Game startup aborted because player '".to_vec();
             message.extend_from_slice(&peer.name);
             message.extend_from_slice(b"' disconnected.");
             self.broadcast_console(&mut actions, message);
             actions.extend(self.end_game());
         } else if self.player_count() == 0 {
-            // No players remain: the room ends and leftover drones are
-            // cleaned up (pinned behavior).
+            // No players remain: the room ends and every survivor is
+            // disconnected (pinned NET_SV_GameEnded, which fires at any
+            // room state once no players are left).
             actions.extend(self.end_game());
         }
 
         actions
     }
 
+    /// Pinned `NET_SV_GameEnded`: reset to waiting-for-launch and
+    /// disconnect EVERY remaining client. Protocol-connected survivors
+    /// get the initiated-disconnect lifecycle; members that never
+    /// completed SYN are removed silently.
     fn end_game(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         self.state = ServerState::WaitingLaunch;
         self.gamemode = None;
         self.settings = None;
 
-        let drones: Vec<PlayerId> = self
-            .peers
-            .iter()
-            .filter(|(_, peer)| peer.established && peer.drone)
-            .map(|(player, _)| *player)
-            .collect();
-        for drone in drones {
-            self.start_disconnect(&mut actions, drone, DisconnectReason::GameEnded);
+        let survivors: Vec<PlayerId> = self.peers.keys().copied().collect();
+        for survivor in survivors {
+            let Some(peer) = self.peers.get(&survivor) else {
+                continue;
+            };
+            match (peer.syn, peer.conn) {
+                // Protocol-connected survivors get the initiated
+                // disconnect lifecycle.
+                (true, Conn::Connected) => {
+                    self.start_disconnect(&mut actions, survivor, DisconnectReason::GameEnded);
+                }
+                // Members that never completed SYN are removed silently.
+                (false, Conn::Connected) => {
+                    self.peers.remove(&survivor);
+                    actions.push(Action::Disconnect {
+                        player: survivor,
+                        reason: DisconnectReason::GameEnded,
+                        terminal: None,
+                    });
+                }
+                // Already disconnecting or asleep: the lifecycle in
+                // progress is left alone (upstream's repeated GameEnded
+                // calls never restart it either).
+                _ => {}
+            }
         }
         actions.push(Action::GameEnded);
         actions
     }
+
+    // --- packet handling ---------------------------------------------------
 
     fn on_packet(
         &mut self,
@@ -354,6 +443,50 @@ impl ServerRole {
             return Vec::new();
         };
         peer.last_recv = now;
+
+        // Pinned unknown-address handling: before a valid SYN there is no
+        // protocol client, so only the SYN/refusal path and QUERY exist.
+        if !peer.syn {
+            return match packet {
+                ClientPacket::Syn(syn) => self.on_syn(player, syn),
+                ClientPacket::Query => {
+                    let packet = self.query_response();
+                    vec![self.emit(player, plain(), packet)]
+                }
+                _ => Vec::new(),
+            };
+        }
+
+        // A peer we are disconnecting hears only its own lifecycle: the
+        // final ACK completes removal; everything else is dropped.
+        let disconnecting = self
+            .peers
+            .get(&player)
+            .is_some_and(|peer| matches!(peer.conn, Conn::Disconnecting { .. }));
+        if disconnecting {
+            return match packet {
+                ClientPacket::DisconnectAck => {
+                    self.remove_connected(player, DisconnectReason::Remote, None, None)
+                }
+                _ => Vec::new(),
+            };
+        }
+
+        // A remotely disconnected peer is asleep: a duplicate DISCONNECT
+        // is re-acknowledged (the first ACK may have been lost), nothing
+        // else is processed.
+        let sleeping = self
+            .peers
+            .get(&player)
+            .is_some_and(|peer| matches!(peer.conn, Conn::Sleeping { .. }));
+        if sleeping {
+            return match packet {
+                ClientPacket::Disconnect => {
+                    vec![self.emit(player, plain(), ServerPacket::DisconnectAck)]
+                }
+                _ => Vec::new(),
+            };
+        }
 
         let mut actions = Vec::new();
 
@@ -371,31 +504,25 @@ impl ServerRole {
                     (expected, false)
                 }
             };
-            actions.push(self.send_plain(
-                player,
-                ServerPacket::ReliableAck {
-                    next_seq: ack_value,
-                },
-            ));
+            let packet = ServerPacket::ReliableAck {
+                next_seq: ack_value,
+            };
+            actions.push(self.emit(player, plain(), packet));
             if !in_sequence {
                 return actions;
             }
         }
 
         match packet {
-            ClientPacket::Syn(syn) => {
-                if self.peers.get(&player).is_some_and(|peer| peer.established) {
-                    // Duplicate SYN from an established peer: drop.
-                    return actions;
-                }
-                actions.extend(self.on_syn(player, syn));
+            ClientPacket::Syn(_) => {
+                // Duplicate SYN from an established peer: drop.
             }
             ClientPacket::Keepalive => {}
             ClientPacket::Launch => {
                 if self.state == ServerState::WaitingLaunch && self.controller() == Some(player) {
                     self.state = ServerState::WaitingStart;
                     let num_players = self.player_count() as u8;
-                    for target in self.established_peers() {
+                    for target in self.connected_peers() {
                         self.enqueue_reliable(
                             &mut actions,
                             target,
@@ -410,28 +537,23 @@ impl ServerRole {
                 }
             }
             ClientPacket::Disconnect => {
-                actions.push(self.send_plain(player, ServerPacket::DisconnectAck));
-                actions.extend(self.remove_peer(player, DisconnectReason::Remote, None));
+                actions.push(self.emit(player, plain(), ServerPacket::DisconnectAck));
+                if let Some(peer) = self.peers.get_mut(&player) {
+                    peer.conn = Conn::Sleeping {
+                        until: Milliseconds(now.0 + SLEEP_MS),
+                    };
+                }
             }
             ClientPacket::DisconnectAck => {
-                if self
-                    .peers
-                    .get(&player)
-                    .is_some_and(|peer| peer.disconnecting.is_some())
-                {
-                    actions.extend(self.remove_peer(player, DisconnectReason::Remote, None));
-                }
+                // An ACK we were not waiting for is ignored (upstream's
+                // disconnect-ack only completes a local disconnect).
             }
             ClientPacket::ReliableAck { next_seq } => {
-                if let Some(peer) = self.peers.get_mut(&player)
-                    && let Some(front) = peer.reliable_outbox.front()
-                    && next_seq == front.seq.wrapping_add(1)
-                {
-                    peer.reliable_outbox.pop_front();
-                }
+                actions.extend(self.on_reliable_ack(player, next_seq));
             }
             ClientPacket::Query => {
-                actions.push(self.send_plain(player, self.query_response()));
+                let packet = self.query_response();
+                actions.push(self.emit(player, plain(), packet));
             }
             ClientPacket::GameData(_)
             | ClientPacket::GameDataAck { .. }
@@ -515,7 +637,7 @@ impl ServerRole {
                 .peers
                 .get_mut(&player)
                 .expect("the peer was admitted by the room host");
-            peer.established = true;
+            peer.syn = true;
             peer.name = {
                 let mut name = syn.player_name;
                 name.truncate(MAX_NAME_LEN - 1);
@@ -530,16 +652,24 @@ impl ServerRole {
             peer.player_class = syn.connect.player_class;
         }
 
-        let mut out = Vec::new();
         self.enqueue_reliable(
-            &mut out,
+            &mut actions,
             player,
             ServerPacket::SynAccept(doom_proto::SynAccept {
                 version: SERVER_VERSION.to_vec(),
                 protocol: PROTOCOL_NAME.to_vec(),
             }),
         );
-        actions.extend(out);
+
+        // Pinned first-update behavior: the new client's last_send_time
+        // starts unset, so its first WAITING_DATA leaves in the same
+        // server run as the accept, right after it.
+        let data = self.waiting_data(player);
+        actions.push(self.emit(player, plain(), ServerPacket::WaitingData(data)));
+        if let Some(peer) = self.peers.get_mut(&player) {
+            peer.last_waitdata = self.clock;
+        }
+
         actions
     }
 
@@ -560,7 +690,13 @@ impl ServerRole {
             peer.ready = true;
         }
 
-        if !self.peers.is_empty() && self.peers.values().all(|peer| peer.ready) {
+        let all_ready = !self.peers.is_empty()
+            && self
+                .peers
+                .values()
+                .filter(|peer| peer.syn)
+                .all(|peer| peer.ready);
+        if all_ready && self.peers.values().any(|peer| peer.syn) {
             return self.start_game();
         }
 
@@ -569,12 +705,12 @@ impl ServerRole {
         for target in self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.ready)
+            .filter(|(_, peer)| peer.connected() && peer.ready)
             .map(|(player, _)| *player)
             .collect::<Vec<_>>()
         {
             let data = self.waiting_data(target);
-            actions.push(self.send_plain(target, ServerPacket::WaitingData(data)));
+            actions.push(self.emit(target, plain(), ServerPacket::WaitingData(data)));
         }
         actions
     }
@@ -587,7 +723,14 @@ impl ServerRole {
             return actions;
         };
 
-        settings.lowres_turn = self.peers.values().any(|peer| peer.lowres_turn) as u8;
+        // lowres_turn comes from the players (sv_players), never drones.
+        // The server's stored settings take the computed value, as
+        // upstream's StartGame writes it before broadcasting.
+        settings.lowres_turn = self
+            .peers
+            .values()
+            .filter(|peer| peer.is_player())
+            .any(|peer| peer.lowres_turn) as u8;
         settings.player_classes = self
             .established_players()
             .iter()
@@ -598,11 +741,19 @@ impl ServerRole {
                     .player_class
             })
             .collect();
+        self.settings = Some(settings.clone());
 
-        for target in self.established_peers() {
+        for target in self.connected_peers() {
             let mut per_recipient = settings.clone();
             per_recipient.consoleplayer = self.player_index(target);
             self.enqueue_reliable(&mut actions, target, ServerPacket::GameStart(per_recipient));
+
+            // Overflow is transactional: if the enqueue removed the
+            // target or ended the room, the transition does not continue
+            // and the state must not be overwritten back to InGame.
+            if !self.peers.contains_key(&target) || self.state != ServerState::WaitingStart {
+                return actions;
+            }
         }
 
         self.state = ServerState::InGame;
@@ -625,18 +776,72 @@ impl ServerRole {
         }
     }
 
+    // --- timers --------------------------------------------------------------
+
     fn on_timer(&mut self, now: Milliseconds) -> Vec<Action> {
         let mut actions = Vec::new();
 
         for player in self.peers.keys().copied().collect::<Vec<_>>() {
-            let Some(peer) = self.peers.get(&player) else {
-                continue;
+            let (syn, conn, idle_recv, idle_send, idle_waitdata, connected, name) = {
+                let Some(peer) = self.peers.get(&player) else {
+                    continue;
+                };
+                (
+                    peer.syn,
+                    peer.conn,
+                    now.0.saturating_sub(peer.last_recv.0),
+                    now.0.saturating_sub(peer.last_send.0),
+                    now.0.saturating_sub(peer.last_waitdata.0),
+                    peer.connected(),
+                    peer.name.clone(),
+                )
             };
-            let idle_recv = now.0.saturating_sub(peer.last_recv.0);
-            let idle_send = now.0.saturating_sub(peer.last_send.0);
-            let idle_waitdata = now.0.saturating_sub(peer.last_waitdata.0);
-            let established = peer.established;
-            let name = peer.name.clone();
+
+            // Members that never completed SYN are binding-level: no
+            // protocol timers exist for them.
+            if !syn {
+                continue;
+            }
+
+            match conn {
+                Conn::Connected => {}
+                Conn::Disconnecting {
+                    sends,
+                    last,
+                    reason,
+                } => {
+                    let idle = now.0.saturating_sub(last.0);
+                    if idle > DISCONNECT_RETRY_MS {
+                        if sends < DISCONNECT_SENDS {
+                            if let Some(peer) = self.peers.get_mut(&player) {
+                                peer.conn = Conn::Disconnecting {
+                                    sends: sends + 1,
+                                    last: now,
+                                    reason,
+                                };
+                            }
+                            let packet = ServerPacket::Disconnect;
+                            actions.push(self.emit(player, plain(), packet));
+                        } else {
+                            actions.extend(self.remove_connected(player, reason, None, None));
+                        }
+                    }
+                    // No keepalive, reliable retry, WAITING_DATA, or lobby
+                    // broadcast while disconnecting (pinned).
+                    continue;
+                }
+                Conn::Sleeping { until } => {
+                    if now >= until {
+                        actions.extend(self.remove_connected(
+                            player,
+                            DisconnectReason::Remote,
+                            None,
+                            None,
+                        ));
+                    }
+                    continue;
+                }
+            }
 
             // 30 s of receive silence drops the peer and broadcasts to the
             // rest (pinned timeout behavior; nothing is sent to the dead
@@ -645,27 +850,28 @@ impl ServerRole {
                 let mut message = b"Client '".to_vec();
                 message.extend_from_slice(&name);
                 message.extend_from_slice(b"' timed out and disconnected");
-                actions.extend(self.remove_peer(player, DisconnectReason::Timeout, Some(message)));
+                actions.extend(self.remove_connected(
+                    player,
+                    DisconnectReason::Timeout,
+                    Some(message),
+                    None,
+                ));
                 continue;
             }
 
             // 1 s of send silence emits a bare keepalive.
             if idle_send > KEEPALIVE_MS {
-                actions.push(self.send_plain(player, ServerPacket::Keepalive));
-                if let Some(peer) = self.peers.get_mut(&player) {
-                    peer.last_send = now;
-                }
+                actions.push(self.emit(player, plain(), ServerPacket::Keepalive));
             }
 
-            // Reliable head: emit once, then retry in place.
+            // Reliable head retry, in place; the queue never grows here.
             let retry = {
                 let Some(peer) = self.peers.get_mut(&player) else {
                     continue;
                 };
-                match peer.reliable_outbox.front_mut() {
+                match peer.reliable_outbox.front() {
                     Some(front) => match front.last_retry {
                         Some(last) if now.0.saturating_sub(last.0) > RELIABLE_RETRY_MS => {
-                            front.last_retry = Some(now);
                             Some((front.seq, front.packet.clone()))
                         }
                         _ => None,
@@ -674,63 +880,25 @@ impl ServerRole {
                 }
             };
             if let Some((seq, packet)) = retry {
-                actions.push(Action::Send {
+                if let Some(peer) = self.peers.get_mut(&player)
+                    && let Some(front) = peer.reliable_outbox.front_mut()
+                {
+                    front.last_retry = Some(now);
+                }
+                actions.push(self.emit(
                     player,
-                    header: WireHeader {
+                    WireHeader {
                         reliable_seq: Some(seq),
                     },
                     packet,
-                });
-            }
-
-            // Initiated DISCONNECT: five sends, then a forced removal.
-            enum DisconnectStep {
-                Send,
-                Remove(DisconnectReason),
-                Wait,
-            }
-            let step = {
-                let Some(peer) = self.peers.get_mut(&player) else {
-                    continue;
-                };
-                match peer.disconnecting {
-                    Some(progress)
-                        if progress.sends < DISCONNECT_SENDS
-                            && now.0.saturating_sub(progress.last.0) > DISCONNECT_RETRY_MS =>
-                    {
-                        peer.disconnecting = Some(DisconnectProgress {
-                            sends: progress.sends + 1,
-                            last: now,
-                            reason: progress.reason,
-                        });
-                        DisconnectStep::Send
-                    }
-                    Some(progress)
-                        if progress.sends >= DISCONNECT_SENDS
-                            && now.0.saturating_sub(progress.last.0) > DISCONNECT_RETRY_MS =>
-                    {
-                        DisconnectStep::Remove(progress.reason)
-                    }
-                    _ => DisconnectStep::Wait,
-                }
-            };
-            match step {
-                DisconnectStep::Send => {
-                    actions.push(self.send_plain(player, ServerPacket::Disconnect));
-                }
-                DisconnectStep::Remove(reason) => {
-                    actions.extend(self.remove_peer(player, reason, None));
-                }
-                DisconnectStep::Wait => {}
+                ));
             }
 
             // Lobby cadence while waiting for launch.
-            if established
-                && self.state == ServerState::WaitingLaunch
-                && idle_waitdata > WAITDATA_MS
+            if connected && self.state == ServerState::WaitingLaunch && idle_waitdata > WAITDATA_MS
             {
                 let data = self.waiting_data(player);
-                actions.push(self.send_plain(player, ServerPacket::WaitingData(data)));
+                actions.push(self.emit(player, plain(), ServerPacket::WaitingData(data)));
                 if let Some(peer) = self.peers.get_mut(&player) {
                     peer.last_waitdata = now;
                 }
@@ -740,30 +908,134 @@ impl ServerRole {
         actions
     }
 
+    // --- reliable mechanics --------------------------------------------------
+
+    /// Queue a reliable packet. Only the head is ever emitted: an empty
+    /// FIFO emits the new head in the same pump; an enqueue behind an
+    /// unacknowledged head emits nothing. The 65th enqueue removes the
+    /// peer without allocating or emitting to it.
+    fn enqueue_reliable(
+        &mut self,
+        actions: &mut Vec<Action>,
+        player: PlayerId,
+        packet: ServerPacket,
+    ) {
+        let Some(peer) = self.peers.get_mut(&player) else {
+            return;
+        };
+
+        if peer.reliable_outbox.len() >= RELIABLE_CAP {
+            let name = peer.name.clone();
+            let mut message = b"Client '".to_vec();
+            message.extend_from_slice(&name);
+            message.extend_from_slice(b"' disconnected");
+            actions.extend(self.remove_connected(
+                player,
+                DisconnectReason::ReliableOverflow,
+                Some(message),
+                None,
+            ));
+            return;
+        }
+
+        let empty = peer.reliable_outbox.is_empty();
+        let seq = peer.reliable_send_seq;
+        peer.reliable_send_seq = peer.reliable_send_seq.wrapping_add(1);
+        peer.reliable_outbox.push_back(ReliableEntry {
+            seq,
+            packet: packet.clone(),
+            last_retry: None,
+        });
+        if empty {
+            if let Some(front) = self
+                .peers
+                .get_mut(&player)
+                .and_then(|peer| peer.reliable_outbox.front_mut())
+            {
+                front.last_retry = Some(self.clock);
+            }
+            actions.push(self.emit(
+                player,
+                WireHeader {
+                    reliable_seq: Some(seq),
+                },
+                packet,
+            ));
+        }
+    }
+
+    /// Exact-head acknowledgement: pop the head and emit the next one
+    /// immediately, with its retry clock starting now (pinned semantics).
+    fn on_reliable_ack(&mut self, player: PlayerId, next_seq: u8) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let Some(peer) = self.peers.get_mut(&player) else {
+            return actions;
+        };
+
+        let Some(front) = peer.reliable_outbox.front() else {
+            return actions;
+        };
+        if next_seq != front.seq.wrapping_add(1) {
+            return actions;
+        }
+        peer.reliable_outbox.pop_front();
+
+        let next = peer
+            .reliable_outbox
+            .front()
+            .map(|front| (front.seq, front.packet.clone()));
+        if let Some((seq, packet)) = next {
+            if let Some(front) = peer.reliable_outbox.front_mut() {
+                front.last_retry = Some(self.clock);
+            }
+            actions.push(self.emit(
+                player,
+                WireHeader {
+                    reliable_seq: Some(seq),
+                },
+                packet,
+            ));
+        }
+        actions
+    }
+
     // --- helpers -----------------------------------------------------------
 
-    /// Every SYN-accepted peer, players and drones, in admit order.
-    fn established_peers(&self) -> Vec<PlayerId> {
+    /// Every actual send updates the peer's keepalive-send clock. All
+    /// emission is centralized here so accounting cannot be forgotten.
+    fn emit(&mut self, player: PlayerId, header: WireHeader, packet: ServerPacket) -> Action {
+        if let Some(peer) = self.peers.get_mut(&player) {
+            peer.last_send = self.clock;
+        }
+        Action::Send {
+            player,
+            header,
+            packet,
+        }
+    }
+
+    /// Every protocol-connected peer, players and drones, in admit order.
+    fn connected_peers(&self) -> Vec<PlayerId> {
         let mut peers: Vec<_> = self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.established)
+            .filter(|(_, peer)| peer.connected())
             .map(|(player, peer)| (peer.order, *player))
             .collect();
         peers.sort_unstable();
         peers.into_iter().map(|(_, player)| player).collect()
     }
 
-    /// SYN-accepted non-drone players in admit order.
+    /// Connected non-drone players in admit order.
     fn established_players(&self) -> Vec<PlayerId> {
-        self.established_peers()
+        self.connected_peers()
             .into_iter()
             .filter(|player| self.peers.get(player).is_some_and(|peer| !peer.drone))
             .collect()
     }
 
     fn max_players(&self) -> usize {
-        self.established_peers()
+        self.connected_peers()
             .first()
             .and_then(|player| self.peers.get(player))
             .map(|peer| peer.max_players as usize)
@@ -801,7 +1073,7 @@ impl ServerRole {
             num_drones: self
                 .peers
                 .values()
-                .filter(|peer| peer.established && peer.drone)
+                .filter(|peer| peer.syn && peer.drone)
                 .count() as u8,
             ready_players: self
                 .peers
@@ -836,86 +1108,41 @@ impl ServerRole {
 
     fn reject(&mut self, actions: &mut Vec<Action>, player: PlayerId, mut reason: Vec<u8>) {
         reason.truncate(256);
-        actions.push(self.send_plain(player, ServerPacket::Rejected { reason }));
-        actions.extend(self.remove_peer(player, DisconnectReason::Remote, None));
+        let terminal = Box::new((
+            WireHeader { reliable_seq: None },
+            ServerPacket::Rejected { reason },
+        ));
+        actions.extend(self.remove_connected(
+            player,
+            DisconnectReason::Remote,
+            None,
+            Some(terminal),
+        ));
     }
 
-    /// Begin an initiated DISCONNECT (drones on game end): five sends,
-    /// then a forced removal. The first send goes out immediately, as
-    /// upstream's first connection run does.
+    /// Begin an initiated DISCONNECT: five sends at one-second intervals
+    /// whose clock starts at this actual first send, then a forced
+    /// removal. The peer leaves every connected set immediately and gets
+    /// no non-disconnect traffic while it drains.
     fn start_disconnect(
         &mut self,
         actions: &mut Vec<Action>,
         player: PlayerId,
         reason: DisconnectReason,
     ) {
-        actions.push(self.send_plain(player, ServerPacket::Disconnect));
+        let packet = ServerPacket::Disconnect;
+        actions.push(self.emit(player, plain(), packet));
         if let Some(peer) = self.peers.get_mut(&player) {
-            peer.disconnecting = Some(DisconnectProgress {
+            peer.conn = Conn::Disconnecting {
                 sends: 1,
-                last: peer.last_send,
+                last: self.clock,
                 reason,
-            });
+            };
         }
-    }
-
-    fn send_plain(&self, player: PlayerId, packet: ServerPacket) -> Action {
-        Action::Send {
-            player,
-            header: WireHeader { reliable_seq: None },
-            packet,
-        }
-    }
-
-    /// Queue a reliable packet and emit its first transmission in the
-    /// same pump, as upstream's same-iteration connection run does. The
-    /// retry clock starts at `now`; a later timer retries the head in
-    /// place. The 65th enqueue removes the peer instead of allocating.
-    fn enqueue_reliable(
-        &mut self,
-        actions: &mut Vec<Action>,
-        player: PlayerId,
-        packet: ServerPacket,
-    ) {
-        let Some(peer) = self.peers.get_mut(&player) else {
-            return;
-        };
-
-        if peer.reliable_outbox.len() >= RELIABLE_CAP {
-            // The 65th enqueue removes the peer immediately: no
-            // allocation, no explanatory enqueue to the already
-            // unacknowledging peer.
-            let name = peer.name.clone();
-            let mut message = b"Client '".to_vec();
-            message.extend_from_slice(&name);
-            message.extend_from_slice(b"' disconnected");
-            actions.extend(self.remove_peer(
-                player,
-                DisconnectReason::ReliableOverflow,
-                Some(message),
-            ));
-            return;
-        }
-
-        let seq = peer.reliable_send_seq;
-        peer.reliable_send_seq = peer.reliable_send_seq.wrapping_add(1);
-        peer.reliable_outbox.push_back(ReliableEntry {
-            seq,
-            packet: packet.clone(),
-            last_retry: Some(self.clock),
-        });
-        peer.last_send = self.clock;
-        actions.push(Action::Send {
-            player,
-            header: WireHeader {
-                reliable_seq: Some(seq),
-            },
-            packet,
-        });
     }
 
     fn broadcast_console(&mut self, actions: &mut Vec<Action>, message: Vec<u8>) {
-        for target in self.established_peers() {
+        for target in self.connected_peers() {
             self.enqueue_reliable(
                 actions,
                 target,
@@ -925,6 +1152,11 @@ impl ServerRole {
             );
         }
     }
+}
+
+/// A plain (non-reliable) frame.
+fn plain() -> WireHeader {
+    WireHeader { reliable_seq: None }
 }
 
 /// `D_ValidGameMode` (d_mode.c): valid mission/mode pairs.
@@ -947,8 +1179,18 @@ fn valid_game_mode(mission: u8, mode: u8) -> bool {
     )
 }
 
-/// `D_ValidEpisodeMap` (d_mode.c): per mission/mode, the max episode and map.
+/// `D_ValidEpisodeMap` (d_mode.c): per mission/mode, the max episode and
+/// map, including the two Heretic exceptions (registered episode 4 is
+/// E4M1 only; retail episode 6 is E6M1 through E6M3).
 fn valid_episode_map(mission: u8, mode: u8, episode: u8, map: u8) -> bool {
+    if mission == 6 {
+        if mode == 3 && episode == 6 {
+            return (1..=3).contains(&map);
+        }
+        if mode == 1 && episode == 4 {
+            return map == 1;
+        }
+    }
     let Some((max_episode, max_map)) = (match (mission, mode) {
         (0, 0) => Some((1, 9)),
         (0, 1) => Some((3, 9)),
