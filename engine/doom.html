@@ -3,10 +3,10 @@
   Contributor loader for the doomit engine build.
 
   This page is the lobby: it picks the IWAD and the ordered PWAD set, chooses
-  single player / host / join and the room URL, and turns all of that into an
-  argv. Nothing here needs a hand-edited command line, and nothing here is
-  part of the engine: the engine runs in doom-frame.html, which this page
-  creates and destroys.
+  single player or a multiplayer room with its room URL and expected node
+  count, and turns all of that into an argv. Nothing here needs a hand-edited
+  command line, and nothing here is part of the engine: the engine runs in
+  doom-frame.html, which this page creates and destroys.
 
   Mod changes restart the instance. Doom loads its WAD set once during
   D_DoomMain and has no supported path to unload one from a live session, so
@@ -191,8 +191,7 @@
       <fieldset>
         <legend>Session</legend>
         <label><input type="radio" name="mode" value="single" checked> Single player</label>
-        <label><input type="radio" name="mode" value="host"> Host a room</label>
-        <label><input type="radio" name="mode" value="join"> Join a room</label>
+        <label><input type="radio" name="mode" value="multiplayer"> Multiplayer room</label>
         <label>Room WebSocket URL
           <input type="text" id="room" placeholder="ws://127.0.0.1:8080/ws/room" disabled>
         </label>
@@ -244,6 +243,7 @@
         createSelectionGuard, iwadArgv, IWAD_PIN, IWAD_PATH,
       } from "./mod_order.js";
       import { classifyMessage, GATE } from "./message_gate.js";
+      import { netArgv, networkBlockedReason } from "./net_argv.js";
       import {
         parseCanaryLine, channelName, isComplete, compareReports,
         receiveMessage, receiveCanaryLine, armMessage,
@@ -473,19 +473,27 @@
           argv.push("-record", "canary", "-verifydemo", "-maxdemo", "1024");
         }
 
-        const m = mode();
-        if (m === "host") {
-          // -privateserver implies -server and skips registering the room
-          // with the public chocolate master server, which is not reachable
-          // through a room router anyway.
-          argv.push("-privateserver", "-wss", el("room").value.trim(),
-                    "-nodes", el("nodes").value);
-        } else if (m === "join") {
-          // The room host is always node 1; the router keys on node ids.
-          argv.push("-connect", "1", "-wss", el("room").value.trim());
+        // Route 1 belongs to the Rust room server, so every tab joins as a
+        // client and none hosts. netArgv rejects incomplete input, which
+        // blockedReason has already reported, so a half-filled form yields the
+        // content argv alone rather than a partly formed launch.
+        try {
+          argv.push(...netArgv(mode(), el("room").value, el("nodes").value));
+        } catch {
+          return argv;
         }
 
         return argv;
+      }
+
+      // Fail closed on what is actually about to launch, not on what the
+      // builder above intended. A server flag would start a second server role
+      // against the route the Rust server already owns, so that tab cannot
+      // join; a launch that quietly lost its network arguments joins nothing
+      // either. Both are refusals rather than surprises at runtime.
+      function networkReason() {
+        return networkBlockedReason(
+          mode(), el("room").value, el("nodes").value, buildArgv());
       }
 
       function blockedReason() {
@@ -494,7 +502,8 @@
         if (!iwad.ok) return iwad.reason;
         const pwads = validatePwads(state.pwads);
         if (!pwads.ok) return pwads.reason;
-        if (mode() !== "single" && !el("room").value.trim()) return "no room URL";
+        const network = networkReason();
+        if (network) return network;
         return "";
       }
 
@@ -515,7 +524,7 @@
           state.pwads.length ? fingerprint(state.pwads, dehlump) : "(no mods)";
 
         el("room").disabled = mode() === "single";
-        el("nodes").disabled = mode() !== "host";
+        el("nodes").disabled = mode() === "single";
 
         const argv = buildArgv();
         el("argv").textContent = argv.length ? argv.join(" ") : "(no arguments)";

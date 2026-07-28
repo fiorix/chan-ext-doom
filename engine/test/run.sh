@@ -78,6 +78,10 @@ node test/test_mod_order.mjs
 # able to inject a log line could forge acceptance evidence.
 node test/test_message_gate.mjs
 
+# The loader's network arguments and the client-only guard: route 1 belongs to
+# the Rust room server, so no browser argv may carry a server flag.
+node test/test_net_argv.mjs
+
 # The automatic MATCH/MISMATCH verdict. A verdict that reads MATCH when the
 # peers disagree is worse than no verdict, so the missing/stale/half-known
 # cases get the most attention.
