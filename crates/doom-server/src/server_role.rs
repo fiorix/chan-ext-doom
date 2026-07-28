@@ -1051,7 +1051,7 @@ impl ServerRole {
         peers.into_iter().map(|(_, player)| player).collect()
     }
 
-    /// Connected non-drone players in admit order.
+    /// Connected non-drone players in slot order.
     fn established_players(&self) -> Vec<PlayerId> {
         self.connected_peers()
             .into_iter()
