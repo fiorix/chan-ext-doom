@@ -124,10 +124,16 @@ pub enum MalformedClass {
 /// What the role wants the room host to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    /// Queue a fully framed server packet for one peer.
+    /// Queue a fully framed server packet for one peer. `lowres` is
+    /// the codec context that was authoritative when the role produced
+    /// the packet: the reducer encodes with exactly this width, and
+    /// the tag travels with the bytes through the outbox and any
+    /// removal capture, so a later settings reset can never rewrite
+    /// the context of an already-produced packet.
     Send {
         player: PlayerId,
         header: WireHeader,
+        lowres: bool,
         packet: ServerPacket,
     },
     /// Remove the peer from the room. `terminal` is the final packet the
@@ -1761,7 +1767,9 @@ impl ServerRole {
     // --- helpers -----------------------------------------------------------
 
     /// Every actual send updates the peer's keepalive-send clock. All
-    /// emission is centralized here so accounting cannot be forgotten.
+    /// emission is centralized here so accounting cannot be forgotten,
+    /// and every packet carries the codec width authoritative at this
+    /// exact production point.
     fn emit(&mut self, player: PlayerId, header: WireHeader, packet: ServerPacket) -> Action {
         if let Some(peer) = self.peers.get_mut(&player) {
             peer.last_send = self.clock;
@@ -1769,6 +1777,7 @@ impl ServerRole {
         Action::Send {
             player,
             header,
+            lowres: self.lowres_turn(),
             packet,
         }
     }

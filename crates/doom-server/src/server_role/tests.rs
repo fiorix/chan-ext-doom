@@ -2273,6 +2273,7 @@ fn established_old_magic_rejects_without_removing() {
             player,
             header,
             packet: ServerPacket::Rejected { reason },
+            ..
         } => {
             assert_eq!(*player, alice);
             assert_eq!(header.reliable_seq, None);

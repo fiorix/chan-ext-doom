@@ -666,3 +666,116 @@ fn removal_effect_carries_the_owed_prefix_with_metadata_and_tags() {
     // Nothing further can be sent to the removed target.
     assert!(h.pop_outbound(target).is_none());
 }
+
+// Addenda 3/4 (followup-lead-server-23): one timer pass emits the
+// drone's GAMEDATA while the room is lowres, then times out the room's
+// only player, and end_game resets the live width to wide in the same
+// action list. The GAMEDATA must still encode at its production width:
+// the action carries the tag, and the reducer never re-reads the live
+// role width. A mutation encoding with the live (post-reset) width
+// must fail this test.
+#[test]
+fn gamedata_produced_before_a_same_batch_reset_encodes_at_production_width() {
+    fn syn_drone_lowres(name: &str) -> ClientPacket {
+        let ClientPacket::Syn(mut syn) = syn_lowres(name) else {
+            unreachable!()
+        };
+        syn.connect.drone = 1;
+        ClientPacket::Syn(syn)
+    }
+    fn diff_turn() -> doom_proto::TiccmdDiff {
+        doom_proto::TiccmdDiff {
+            turn: Some(0x100),
+            ..Default::default()
+        }
+    }
+
+    let mut h = host(16);
+    // The drone is the lower PlayerId (the timer visits it first), the
+    // room's only player second. Both negotiate lowres.
+    let drone = join(&mut h);
+    let player = join(&mut h);
+    // The player SYNs first: upstream rejects a drone that arrives
+    // before any player with "Game mismatch" (pinned quirk), so the
+    // drone holds the lower PlayerId but completes SYN second.
+    h.packet(T0, player, plain(), syn_lowres("Player"));
+    h.packet(T0, drone, plain(), syn_drone_lowres("Observer"));
+    h.packet(T0, player, reliable(0), ClientPacket::Launch);
+    h.packet(
+        T0,
+        player,
+        reliable(1),
+        ClientPacket::GameStart(settings(0, 1)),
+    );
+    h.packet(
+        T0,
+        drone,
+        reliable(0),
+        ClientPacket::GameStart(settings(0, 1)),
+    );
+    assert!(h.lowres_turn(), "the room adopted lowres");
+
+    // Playable tics from the player, drained from the drone's outbox,
+    // so the pump's sendqueue holds entries and the final tick's
+    // current slot is present.
+
+    for tic in 0..6u8 {
+        h.packet(
+            T0,
+            player,
+            plain(),
+            upload(0, tic, vec![(tic as i16, diff_turn())]),
+        );
+        h.tick(Milliseconds(T0.0 + 30 * u64::from(tic)));
+    }
+    while h.pop_outbound(drone).is_some() {}
+    // One more upload covers the slot the final tick's pump needs.
+    h.packet(T0, player, plain(), upload(0, 6, vec![(6, diff_turn())]));
+    // The drone stays fresh; the player goes silent. At 25 s the drone
+    // pings; past 30 s the player has timed out but the drone has not.
+    h.packet(
+        Milliseconds(T0.0 + 25_000),
+        drone,
+        plain(),
+        ClientPacket::Keepalive,
+    );
+    // One timer pass: the drone's pump emits first (still lowres),
+    // then the player's timeout ends the game and initiates the
+    // drone's disconnect, in the same reduction.
+    let effect = h.tick(Milliseconds(T0.0 + 31_000));
+    assert!(effect.game_ended, "the only player timed out");
+    assert!(!h.lowres_turn(), "the role reset to wide");
+
+    // The drone's final fan-out encodes at its production width even
+    // though the role finished the batch wide.
+    let mut gamedata = None;
+    while let Some(packet) = h.pop_outbound(drone) {
+        if matches!(
+            ServerPacket::decode(packet.payload(), true),
+            Ok((_, ServerPacket::GameData(_)))
+        ) {
+            gamedata = Some(packet);
+        }
+    }
+    let gamedata = gamedata.expect("the drone had a fan-out queued");
+    assert_eq!(
+        gamedata.lowres(),
+        Some(true),
+        "the tag is the production width"
+    );
+    let (_, ServerPacket::GameData(data)) =
+        ServerPacket::decode(gamedata.payload(), true).expect("decodes lowres")
+    else {
+        unreachable!()
+    };
+    assert!(
+        data.tics
+            .iter()
+            .any(|tic| tic.players.iter().any(|(_, d)| d.turn == Some(0x100))),
+        "the narrow turn survived"
+    );
+    assert!(
+        ServerPacket::decode(gamedata.payload(), false).is_err(),
+        "the bytes are not wide-encoded"
+    );
+}

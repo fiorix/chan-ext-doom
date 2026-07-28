@@ -316,13 +316,13 @@ impl<Metadata: Clone + PartialEq> RoomHost<Metadata> {
                     Action::Send {
                         player,
                         header,
+                        lowres,
                         packet,
                     } => {
                         // The codec context is stamped at production
                         // time: the bytes and their width tag travel
                         // together through the outbox and any removal
                         // capture, never re-read from the live role.
-                        let lowres = self.role.lowres_turn();
                         let bytes = packet
                             .encode(header, lowres)
                             .expect("role outputs always encode");
