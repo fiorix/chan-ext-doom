@@ -159,6 +159,31 @@ pub enum RelayOutcome {
     SlowConsumerDisconnected(PlayerId),
 }
 
+/// Observable result of queueing one host-originated packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostOutcome {
+    /// The packet entered the recipient's FIFO outbox.
+    Queued(PlayerId),
+    /// The recipient's full outbox caused it to be removed from the room.
+    SlowConsumerDisconnected(PlayerId),
+}
+
+/// Why a host-originated packet could not be queued.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum HostError {
+    /// The recipient is no longer joined.
+    #[error("player is not joined")]
+    UnknownPlayer,
+    /// The opaque payload exceeded the memory-bound limit.
+    #[error("payload is {len} bytes; maximum is {max}")]
+    PayloadTooLarge {
+        /// Observed payload size.
+        len: usize,
+        /// Maximum payload size.
+        max: usize,
+    },
+}
+
 /// A registry of named, protocol-agnostic relay rooms.
 #[derive(Debug)]
 pub struct Registry<Metadata = ()> {
@@ -268,6 +293,53 @@ impl<Metadata> Registry<Metadata> {
             .expect("the sender membership was checked above");
         self.remove_player(&room_name, recipient);
         Ok(RelayOutcome::SlowConsumerDisconnected(recipient))
+    }
+
+    /// Queues one host-originated packet for a player, reusing the relay
+    /// payload limit, FIFO order, exact capacity, and the policy that
+    /// the next packet onto a full outbox removes the recipient. No
+    /// sender membership is required: the host is not a room member.
+    pub fn queue_host(
+        &mut self,
+        recipient: PlayerId,
+        metadata: Metadata,
+        payload: &[u8],
+    ) -> Result<HostOutcome, HostError> {
+        if payload.len() > MAX_PAYLOAD_LEN {
+            return Err(HostError::PayloadTooLarge {
+                len: payload.len(),
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+
+        {
+            let room_name = self
+                .memberships
+                .get(&recipient)
+                .ok_or(HostError::UnknownPlayer)?;
+            let recipient_player = self
+                .rooms
+                .get_mut(room_name)
+                .expect("a membership always points to an existing room")
+                .players
+                .get_mut(&recipient)
+                .expect("a membership always points to an existing player");
+            if recipient_player.outbox.len() < self.outbox_capacity.get() {
+                recipient_player.outbox.push_back(OutboundPacket {
+                    metadata,
+                    payload: payload.to_vec(),
+                });
+                return Ok(HostOutcome::Queued(recipient));
+            }
+        }
+
+        let room_name = self
+            .memberships
+            .get(&recipient)
+            .cloned()
+            .expect("the recipient membership was checked above");
+        self.remove_player(&room_name, recipient);
+        Ok(HostOutcome::SlowConsumerDisconnected(recipient))
     }
 
     /// Removes and returns the oldest pending packet for a player.
@@ -499,6 +571,83 @@ mod tests {
             })
         );
         assert!(registry.pop_outbound(recipient).is_none());
+    }
+
+    #[test]
+    fn host_queue_preserves_fifo_order_and_metadata_without_a_sender() {
+        let mut registry = Registry::<u32>::default();
+        let recipient = registry.join(room()).expect("recipient joins");
+
+        for (metadata, payload) in [(1, b"first".as_slice()), (2, b"second".as_slice())] {
+            assert_eq!(
+                registry
+                    .queue_host(recipient, metadata, payload)
+                    .expect("host queue succeeds"),
+                HostOutcome::Queued(recipient)
+            );
+        }
+
+        let first = registry
+            .pop_outbound(recipient)
+            .expect("first packet is queued");
+        let second = registry
+            .pop_outbound(recipient)
+            .expect("second packet is queued");
+        assert_eq!(*first.metadata(), 1);
+        assert_eq!(first.payload(), b"first");
+        assert_eq!(*second.metadata(), 2);
+        assert_eq!(second.payload(), b"second");
+        assert!(registry.pop_outbound(recipient).is_none());
+    }
+
+    #[test]
+    fn host_queue_disconnects_slow_consumer_at_the_exact_bound() {
+        let mut registry = registry_with_capacity(2);
+        let slow = registry.join(room()).expect("slow consumer joins");
+
+        for payload in [b"one".as_slice(), b"two".as_slice()] {
+            assert_eq!(
+                registry
+                    .queue_host(slow, 1, payload)
+                    .expect("host queue fits in the bounded outbox"),
+                HostOutcome::Queued(slow)
+            );
+        }
+        assert_eq!(
+            registry
+                .queue_host(slow, 1, b"overflow")
+                .expect("overflow applies the disconnect policy"),
+            HostOutcome::SlowConsumerDisconnected(slow)
+        );
+        assert!(!registry.contains(slow));
+        assert!(registry.pop_outbound(slow).is_none());
+        assert_eq!(registry.room_size(&room()), 0);
+
+        let replacement = registry.join(room()).expect("slot is released");
+        assert!(replacement > slow);
+    }
+
+    #[test]
+    fn host_queue_rejects_unknown_player_and_oversized_before_mutation() {
+        let mut registry = Registry::<u32>::default();
+        let recipient = registry.join(room()).expect("recipient joins");
+        let gone = registry.join(room()).expect("second player joins");
+        assert!(registry.leave(gone));
+
+        assert_eq!(
+            registry.queue_host(gone, 1, b"nope"),
+            Err(HostError::UnknownPlayer)
+        );
+        let oversized = vec![0; MAX_PAYLOAD_LEN + 1];
+        assert_eq!(
+            registry.queue_host(recipient, 1, &oversized),
+            Err(HostError::PayloadTooLarge {
+                len: MAX_PAYLOAD_LEN + 1,
+                max: MAX_PAYLOAD_LEN,
+            })
+        );
+        assert!(registry.pop_outbound(recipient).is_none());
+        assert!(registry.contains(recipient));
     }
 
     #[test]
