@@ -58,6 +58,16 @@ project(doomit-engine C)
 
 include(CheckCSourceCompiles)
 
+# check_c_source_compiles skips the compile entirely when its result variable
+# already exists, which means the caller can simply supply the answer:
+# -DDOOMIT_COMPILER_IS_EMSCRIPTEN=TRUE on the command line, or a stale TRUE
+# left in the cache of a build directory whose toolchain has since changed.
+# Clearing both forms first makes the probe test the compiler that is actually
+# configured, on every configure, rather than whatever the cache remembers.
+
+unset(DOOMIT_COMPILER_IS_EMSCRIPTEN)
+unset(DOOMIT_COMPILER_IS_EMSCRIPTEN CACHE)
+
 check_c_source_compiles(
     "#ifndef __EMSCRIPTEN__
      #error the configured compiler is not emcc
