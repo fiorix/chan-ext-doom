@@ -5,7 +5,7 @@ This document is the owned inventory of the Chocolate Doom network protocol as i
 - **[observed]**: seen in the committed captures under `fixtures/` (index in `fixtures/manifest.json`; reproduction path in `docs/verification.md`).
 - **[reference]**: read from the pinned upstream C source (chocolate-doom `410d96855b5df5410ff591a90efeafa889119224`, tag `chocolate-doom-3.1.1`). Used for interoperability only; no C code is ported into `crates/`.
 - **[unknown]**: not present in committed evidence and not verified.
-- **[integration]**: exercised live by the repository: the browser engine and `doomd` path including its binding tests, and the pinned native engine running against `doomd` over UDP and WebSocket. Never stored as packet bytes in the native UDP fixture corpus.
+- **[integration]**: exercised live by the repository: the browser engine running against `doomd` over WebSocket, the pinned native engine running against `doomd` over UDP, and the `doomd` binding tests. Never stored as packet bytes in the native UDP fixture corpus.
 - **capture-time note**: seen in raw capture logs that are not committed (scratch `packets.jsonl` with `t_ms`). The committed fixtures retain packet order, direction, and bytes, but no timestamps, so rates and intervals quoted this way are not independently reproducible from the committed evidence alone.
 
 Capture source of truth: `fixtures/` and `fixtures/rig/capture.py`. All captures are native UDP loopback, chocolate-doom 3.1.1 client against chocolate-server 3.1.1, shareware doom1.wad (sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, which is never committed). The committed fixture corpus is exactly seven native UDP sessions and 113 curated packets; runtime traces from live runs (strace logs, scratch `packets.jsonl`) are evidence notes, never committed fixtures.
@@ -29,8 +29,13 @@ sequenceDiagram
     EB->>D: WS connect to room; SYN [to=1][from=M]
     D->>EB: SYN accept, WAITING_DATA
     Note over EA,EB: Chocolate packets inside the WS envelope; route 1 is server-owned
-    EA->>D: LAUNCH, GAMESTART (controller client)
-    D->>EB: LAUNCH, GAMESTART (authoritative broadcast)
+    EA->>D: LAUNCH (controller client)
+    D->>EA: LAUNCH (broadcast)
+    D->>EB: LAUNCH (broadcast)
+    EA->>D: GAMESTART (settings, readiness)
+    EB->>D: GAMESTART (settings, readiness)
+    D->>EA: GAMESTART (authoritative, personalized)
+    D->>EB: GAMESTART (authoritative, personalized)
     loop 35 Hz lockstep
         EA->>D: GAMEDATA (ticcmds)
         EB->>D: GAMEDATA (ticcmds)
