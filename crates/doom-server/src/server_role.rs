@@ -2049,12 +2049,14 @@ fn mission_name(mission: u8) -> &'static str {
         1 => "doom2",
         2 => "tnt",
         3 => "plutonia",
-        4 => "hacx",
-        5 => "chex",
+        4 => "chex",
+        5 => "hacx",
         6 => "heretic",
         7 => "hexen",
         8 => "strife",
-        _ => "unknown",
+        // D_GameMissionString's default (d_mode.c): every other
+        // ordinal renders "none", never "unknown".
+        _ => "none",
     }
 }
 
@@ -2064,7 +2066,9 @@ fn mode_name(mode: u8) -> &'static str {
         1 => "registered",
         2 => "commercial",
         3 => "retail",
-        _ => "indetermined",
+        // D_GameModeString's default (d_mode.c): every other value,
+        // including indetermined = 4, renders "unknown".
+        _ => "unknown",
     }
 }
 

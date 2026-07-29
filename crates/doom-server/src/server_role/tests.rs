@@ -480,7 +480,10 @@ fn invalid_connect_data_is_dropped_silently() {
 #[test]
 fn drone_first_is_rejected_like_upstream() {
     // Upstream quirk: with no non-drone player adopted yet, the mode is
-    // indeterminate and a drone-first connection mismatches it.
+    // indeterminate and a drone-first connection mismatches it. The
+    // reason is byte-exact with the pinned server: the still-default
+    // mode renders through D_GameModeString's default as "unknown",
+    // and the client's concrete mode names itself (net_server.c:721).
     let mut h = Harness::new();
     let drone = h.join("d");
     let actions = h.role.handle(
@@ -491,11 +494,102 @@ fn drone_first_is_rejected_like_upstream() {
             packet: ClientPacket::Syn(syn_value("Observer", 0, 0, 1)),
         },
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::Disconnect {
-        terminal: Some(terminal),
-        ..
-    } if matches!(&terminal.1, ServerPacket::Rejected { reason }
-        if reason.starts_with(b"Game mismatch:")))));
+    assert!(actions.iter().any(|a| is_reject_with(
+        a,
+        b"Game mismatch: server is doom (unknown), client is doom (shareware)"
+    )));
+}
+
+#[test]
+fn game_mismatch_reason_names_chex_and_hacx_correctly() {
+    // pack_chex is mission 4 and pack_hacx is mission 5 (d_mode.h); a
+    // swap in either mapping fails this test by name.
+    for (mode, mission, server_side) in [(3, 4, "chex (retail)"), (2, 5, "hacx (commercial)")] {
+        let mut h = Harness::new();
+        let first = h.join("a");
+        h.role.handle(
+            T0,
+            Input::Packet {
+                player: first,
+                header: WireHeader { reliable_seq: None },
+                packet: ClientPacket::Syn(syn_value("First", mode, mission, 0)),
+            },
+        );
+        let second = h.join("b");
+        let actions = h.role.handle(
+            T0,
+            Input::Packet {
+                player: second,
+                header: WireHeader { reliable_seq: None },
+                packet: ClientPacket::Syn(syn_value("Second", 0, 0, 0)),
+            },
+        );
+        let expected =
+            format!("Game mismatch: server is {server_side}, client is doom (shareware)");
+        assert!(
+            actions
+                .iter()
+                .any(|a| is_reject_with(a, expected.as_bytes())),
+            "the mismatch reason names {server_side}"
+        );
+    }
+}
+
+#[test]
+fn mission_and_mode_names_match_upstream_strings() {
+    // D_GameMissionString / D_GameModeString (d_mode.c): the named
+    // ordinals keep their names; every other mission renders "none"
+    // and every other mode renders "unknown", so neither default can
+    // silently return to the old rendering.
+    let missions = [
+        "doom", "doom2", "tnt", "plutonia", "chex", "hacx", "heretic", "hexen", "strife",
+    ];
+    for (ordinal, name) in missions.iter().enumerate() {
+        assert_eq!(mission_name(ordinal as u8), *name);
+    }
+    for ordinal in [9u8, 10, 11, 255] {
+        assert_eq!(mission_name(ordinal), "none", "mission {ordinal}");
+    }
+    let modes = ["shareware", "registered", "commercial", "retail"];
+    for (ordinal, name) in modes.iter().enumerate() {
+        assert_eq!(mode_name(ordinal as u8), *name);
+    }
+    for ordinal in [4u8, 5, 255] {
+        assert_eq!(mode_name(ordinal), "unknown", "mode {ordinal}");
+    }
+}
+
+#[test]
+fn valid_mode_table_matches_chocolate_311_exactly() {
+    // The pinned 13 valid mission/mode pairs from Chocolate Doom 3.1.1
+    // D_ValidGameMode, exhaustive over the byte: the Crispy-lineage
+    // NERVE/MASTER ordinals 9 and 10 must NOT be admitted (ordinal 9
+    // means doom2f to the pinned 3.1.1 oracle; deferred per the lead
+    // reconciliation of follow-up 20).
+    let valid = [
+        (0, 0),
+        (0, 1),
+        (0, 3),
+        (1, 2),
+        (2, 2),
+        (3, 2),
+        (4, 3),
+        (5, 2),
+        (6, 0),
+        (6, 1),
+        (6, 3),
+        (7, 2),
+        (8, 2),
+    ];
+    for mission in 0..=u8::MAX {
+        for mode in 0..=u8::MAX {
+            assert_eq!(
+                valid_game_mode(mission, mode),
+                valid.contains(&(mission, mode)),
+                "pair ({mission}, {mode})"
+            );
+        }
+    }
 }
 
 // --- LAUNCH and GAMESTART ----------------------------------------------------
