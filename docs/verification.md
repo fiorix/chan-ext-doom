@@ -12,6 +12,8 @@ Committed:
 - `fixtures/rig/capture.py`: the capture rig (Python 3 standard library only).
 - `docs/protocol.md`: the inventory these fixtures ground.
 
+The committed corpus is exactly **113 packets in seven sessions**: `console-message`, `drone-disconnect`, `gamestart-gamedata`, `handshake-keepalive`, `query`, `rejected-game-mismatch`, `rejected-in-game`.
+
 Never committed: the IWAD, built binaries, upstream clones, raw `packets.jsonl` and process logs, pcaps. Those live in scratch only.
 
 ## 2. Independent validation of the committed fixtures
@@ -211,3 +213,31 @@ Re-running the rig does **not** reproduce the committed bytes exactly: player na
 - Rig exits immediately with a bind error: UDP port 2342 is taken (`ss -lunp | grep 2342`); stop the other server or rig.
 - Client dies instantly: check `<out>/client1.log`; usually a missing IWAD (path or sha1) or missing `SDL_VIDEODRIVER=dummy` (the rig sets it).
 - `Failed to get I/O port permissions for 0x388` in the client log is harmless (OPL MIDI); captures are unaffected.
+
+## 6. Current repository checks
+
+Each repository suite provides distinct evidence beyond the fixture validation of section 2:
+
+- `cargo test -p doom-proto --locked`: codec round-trip of the packet layouts in `docs/protocol.md` section 4, plus malformed-input guards.
+- `cargo test -p doom-server --locked`: the sans-I/O server role (protocol lifecycle, tic windows) and the shared WebSocket/UDP binding and CLI surface of `doomd`.
+- `./scripts/gate.sh`: the workspace gate, `cargo fmt --check` plus `cargo clippy --all-targets -- -D warnings` plus `cargo test`.
+- `npm test` from `engine/`: the engine loader and page canary suites.
+
+None of these captures packets: they are code-level evidence and complement, never substitute for, the committed fixtures.
+
+## 7. Live native interoperability (integration evidence, not fixtures)
+
+This recipe reproduces the accepted native UDP interoperability shape against `doomd`. It is live integration evidence, kept deliberately separate from the fixture sections above: nothing it produces is a committed fixture, and scratch traffic counts (for example strace logs) must never be cited as golden packet evidence.
+
+Prerequisites: the native engine artifact, built as recorded in `engine/docs/provenance.md`, and the pinned shareware IWAD of section 3.1.
+
+```sh
+cd doomit
+cargo build --locked -p doom-server --bin doomd
+./target/debug/doomd serve --listen 127.0.0.1:0 --udp arena=127.0.0.1:0
+# read the advertised UDP endpoint from the startup lines
+/path/to/native-doom -iwad /path/to/doom1.wad -nosound -nomusic \
+  -connect 127.0.0.1:<advertised-udp-port> -nodes 1 -deathmatch
+```
+
+Expected: the client console shows the handshake (`NET_CL_ParseSYN`, `D_InitNetGame: Connected`; a program-name version note about the server string is expected and is wording only), then `NET_WaitForLaunch: starting with 1 nodes`, `startskill 2 deathmatch: 1`, and the personalized GAMESTART line `player 1 of 1 (1 nodes)`. The running game is itself sustained bidirectional GAMEDATA: the Chocolate lockstep advances only while tic data flows in both directions. For packet-level confirmation, `strace -f -e trace=sendto,recvfrom` on the client shows GAMEDATA both ways; those logs stay in scratch. A negative control (`-connect` to an unbound port) fails with `D_InitNetGame: Failed to connect`, which proves the positive run talked to `doomd`.

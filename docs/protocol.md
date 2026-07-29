@@ -5,47 +5,47 @@ This document is the owned inventory of the Chocolate Doom network protocol as i
 - **[observed]**: seen in the committed captures under `fixtures/` (index in `fixtures/manifest.json`; reproduction path in `docs/verification.md`).
 - **[reference]**: read from the pinned upstream C source (chocolate-doom `410d96855b5df5410ff591a90efeafa889119224`, tag `chocolate-doom-3.1.1`). Used for interoperability only; no C code is ported into `crates/`.
 - **[unknown]**: not present in committed evidence and not verified.
-- **[integration]**: exercised by the repository's live browser engine and `doomd` path, including its binding tests, but not stored as packet bytes in the native UDP fixture corpus.
+- **[integration]**: exercised live by the repository: the browser engine and `doomd` path including its binding tests, and the pinned native engine running against `doomd` over UDP and WebSocket. Never stored as packet bytes in the native UDP fixture corpus.
 - **capture-time note**: seen in raw capture logs that are not committed (scratch `packets.jsonl` with `t_ms`). The committed fixtures retain packet order, direction, and bytes, but no timestamps, so rates and intervals quoted this way are not independently reproducible from the committed evidence alone.
 
-Capture source of truth: `fixtures/` and `fixtures/rig/capture.py`. All captures are native UDP loopback, chocolate-doom 3.1.1 client against chocolate-server 3.1.1, shareware doom1.wad (sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, which is never committed).
+Capture source of truth: `fixtures/` and `fixtures/rig/capture.py`. All captures are native UDP loopback, chocolate-doom 3.1.1 client against chocolate-server 3.1.1, shareware doom1.wad (sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, which is never committed). The committed fixture corpus is exactly seven native UDP sessions and 113 curated packets; runtime traces from live runs (strace logs, scratch `packets.jsonl`) are evidence notes, never committed fixtures.
 
-## Current flow through the room relay
+## Current flow through doomd
 
-Two browser windows each run an engine instance (WASM) launched by its loader page. The engines speak the Chocolate net protocol inside the WebSocket envelope of section 6 through `doomd`, a protocol-agnostic WebSocket room relay that forwards binary frames by node id and neither simulates the game nor computes any verdict. At the level exit each engine computes its input-history and exit-state digests, and the two loader pages compare those digests over a same-origin `BroadcastChannel`.
+Two browser windows each run an engine instance (WASM) launched by its loader page; both engines are Chocolate protocol clients, and a native UDP client can join the same named room (section 7). `doomd` owns the WebSocket adapter and the UDP adapter of each room and runs one shared `RoomHost` with the Rust `ServerRole` per named room: it performs the protocol lifecycle (SYN mode/mission adoption, lobby state, LAUNCH, GAMESTART) and the tic fan-out, and it never simulates the game. At the level exit each engine computes its input-history and exit-state digests, and the two loader pages compare those digests over a same-origin `BroadcastChannel`, outside `doomd`.
 
 ```mermaid
 sequenceDiagram
-    participant HA as host page (doom.html)
-    participant HE as host engine (WASM)
-    participant R as doomd room relay
-    participant JE as join engine (WASM)
-    participant JP as join page (doom.html)
+    participant PA as page A (doom.html)
+    participant EA as engine A (WASM Chocolate client)
+    participant D as doomd (WS/UDP adapters + RoomHost/ServerRole)
+    participant EB as engine B (WASM Chocolate client)
+    participant PB as page B (doom.html)
 
-    HA->>HE: launch (IWAD, room URL, recording on)
-    JP->>JE: launch (same set)
-    HE->>R: connect; claim room: [to=0][from=1]
-    JE->>R: connect: [to=1][from=N]
-    Note over HE,JE: Chocolate packets inside the WS envelope
-    JE->>R: SYN
-    R->>HE: forward
-    HE->>R: SYN accept, WAITING_DATA
-    R->>JE: forward
-    HE->>R: LAUNCH, GAMESTART
-    R->>JE: forward
+    PA->>EA: launch (IWAD, room URL, recording on)
+    PB->>EB: launch (same set)
+    EA->>D: WS connect to room; SYN [to=1][from=N]
+    D->>EA: SYN accept, WAITING_DATA
+    EB->>D: WS connect to room; SYN [to=1][from=M]
+    D->>EB: SYN accept, WAITING_DATA
+    Note over EA,EB: Chocolate packets inside the WS envelope; route 1 is server-owned
+    EA->>D: LAUNCH, GAMESTART (controller client)
+    D->>EB: LAUNCH, GAMESTART (authoritative broadcast)
     loop 35 Hz lockstep
-        JE->>R: GAMEDATA (ticcmds)
-        R->>HE: fan-out
-        HE->>R: GAMEDATA (fan-out)
-        R->>JE: forward
+        EA->>D: GAMEDATA (ticcmds)
+        EB->>D: GAMEDATA (ticcmds)
+        D->>EA: fan-out
+        D->>EB: fan-out
     end
-    Note over HE,JE: both engines reach the exit anchor (ga_completed)
-    HE->>HA: DEMO CANARY and STATE CANARY lines
-    JE->>JP: DEMO CANARY and STATE CANARY lines
-    HA->>JP: BroadcastChannel: arm/session, then reports
-    JP->>HA: BroadcastChannel: reports
-    Note over HA,JP: pages compare digests and render the verdict
+    Note over EA,EB: both engines reach the exit anchor (ga_completed); doomd never simulates the game
+    EA->>PA: DEMO CANARY and STATE CANARY lines
+    EB->>PB: DEMO CANARY and STATE CANARY lines
+    PA->>PB: BroadcastChannel: arm/session, then reports
+    PB->>PA: BroadcastChannel: reports
+    Note over PA,PB: pages compare digests and render the verdict, outside doomd
 ```
+
+Live status `[integration]`: a pinned native engine reaches GAMESTART and sustains bidirectional UDP tic exchange against `doomd`; a mixed room (one native UDP client, one browser WebSocket client) personalizes both players (1/2 and 2/2), broadcasts `deathmatch=1` authoritatively to the peer that never passed the flag, and sustains traffic in both directions; an authoritative lowres GAMESTART is separately proven from a native `-record` run. Bilateral exit digests between two browser engines remain a separate browser acceptance item.
 
 ## 1. Transport and framing
 
@@ -66,7 +66,7 @@ sequenceDiagram
 Observed end-to-end in `gamestart-gamedata`:
 
 1. `SYN` (c2s), then `SYN` accept (s2c, reliable), then `WAITING_DATA` (s2c), then `RELIABLE_ACK` (c2s).
-2. Lobby: the server re-sends `WAITING_DATA` on a 1 s cadence (section 7); both sides keepalive.
+2. Lobby: the server re-sends `WAITING_DATA` on a 1 s cadence (section 8); both sides keepalive.
 3. The controller client sends `LAUNCH` (c2s, reliable); the server broadcasts `LAUNCH` (s2c, reliable, u8 player count).
 4. The controller sends `GAMESTART` (c2s, reliable, settings); the server marks it ready and, when all nodes are ready, broadcasts `GAMESTART` (s2c, reliable, authoritative settings).
 5. In game: `GAMEDATA` both ways, `GAMEDATA_ACK` (c2s), `GAMEDATA_RESEND` both ways on gaps.
@@ -143,8 +143,11 @@ A rejection instead sends REJECTED (2): `u16 type` then `str reason`. `[observed
 
 - Join after GAMESTART (`rejected-in-game/273-…`, 48 B): a client connecting while the server is in game receives "Server is not currently accepting connections". Captured with two unmodified clients.
 - Mismatched game mode/mission (`rejected-game-mismatch/011-…`, 74 B): a lobby SYN advertising `gamemode = 2` (commercial) and `gamemission = 1` (doom2) against a doom/shareware lobby receives "Game mismatch: server is doom (shareware), client is doom2 (commercial)". The triggering SYN was crafted at the documented layout (capture provenance in the session file); the server response is unmodified chocolate-server output.
+- Drone before adoption (no committed capture; `[reference]`, pinned by a committed Rust role test): the room's mode/mission pair is adopted by the first non-drone SYN that finds zero non-drone players, so a drone SYN that completes before any player has adopted faces the still-indetermined server mode, and any concrete client mode mismatches. The reason renders the indetermined mode with the pinned upstream wording: `Game mismatch: server is doom (unknown), client is doom (shareware)`. Join and slot order are irrelevant to this predicate: a drone may join first and hold the earlier slot as long as a player completes SYN before the drone; only a drone-first completed SYN is rejected.
 
 Other rejection paths in the pinned source (old magic number, no common protocol, server full) remain `[reference]` only: they are not in committed evidence.
+
+The admitted mission/mode pairs are exactly the 13 of pinned Chocolate Doom 3.1.1; NERVE and MASTER missions and the wider Crispy-lineage mission set are not admitted. The interoperability contract here is pinned Chocolate Doom 3.1.1, and the product path is the pinned shareware IWAD. `[reference]`
 
 ### WAITING_DATA (4) s2c, lobby state, re-sent every 1 s
 
@@ -270,7 +273,7 @@ The fixture tests therefore assert structure (header, length, hash of the commit
 
 ## 6. WebSocket transport envelope (browser path)
 
-This envelope is **not** part of the Chocolate packet format: it is a transport wrapper added and removed around the packets of section 4, and the wrapped bytes are unchanged. It does not appear in the native UDP fixture corpus, so the layout below is `[reference]` at source level, verified against both pinned upstream sources (engine module and router). It is also exercised live: the browser engine completes the two-node path through the committed `doomd` room relay, and the `doomd` binding tests cover the envelope behavior, so this section is additionally `[integration]`.
+This envelope is **not** part of the Chocolate packet format: it is a transport wrapper added and removed around the packets of section 4, and the wrapped bytes are unchanged. It does not appear in the native UDP fixture corpus, so the layout below is `[reference]` at source level, verified against both pinned upstream sources (engine module and router). It is also exercised live: the browser engine completes the two-node path through `doomd`, and the `doomd` binding tests cover the envelope behavior, so this section is additionally `[integration]`.
 
 Pins for this evidence:
 
@@ -284,9 +287,21 @@ Frame shapes (each binary WebSocket message):
 - The u32 ids are host-order values on little-endian infrastructure (engine: `memcpy` on wasm32; router: `Uint32Array` over the frame), so they are **little-endian**, unlike the big-endian packet payload they wrap. Ids are per-instance (`instanceUID`), assigned by the hosting side.
 - **Registration/reset**: an in-WASM server role announces itself with an 8-byte frame `to = 0`, `from = instanceUID` and an empty payload (sent by the engine's server-init). The pinned router special-cases `from == 1 && to == 0` as a server restart: it closes every session and clears its client table. Instance id 1 is the server role by that router's convention.
 
-This repository's `doomd` implements the same envelope `[integration]`: the asymmetric 8-byte and 4-byte forms, a nonzero source route id bound per connection (with a change of source rejected), route id 1 reserved for the room host by the same convention, and the exact reset marker (frame with `to` absent, `from` equal to 1, and an empty payload), which resets the room and disconnects its current members. The `doomd` binding tests exercise the route envelope, source binding, the reset marker, and relay behavior, and the browser engine's two-node path through `doomd` completes with both instances reporting their player assignments.
+`doomd` speaks this envelope under its own current contract `[integration]`, which differs from the pinned router in ownership. Every client frame targets route 1 (`to = 1`): route 1 is permanently owned by the room's Rust `ServerRole`, there is no in-WASM server role, and no browser host claim exists. A client that sends `from = 1` has only its own connection closed: the offender drops, the room is unaffected. The legacy registration/reset marker (an empty-payload frame with `to = 0`, `from = 1`) is inert and resets nothing. Room lifetime is membership plus owed-removal traffic (section 7). The `doomd` binding tests exercise the route envelope, source binding, and fan-out, and the browser engine's two-node path through `doomd` completes with both instances reporting their player assignments.
 
-## 7. Timing and reliability parameters
+## 7. UDP binding (doomd)
+
+`doomd` also terminates native Chocolate UDP clients directly. The wire format on this path is exactly sections 1 and 4: one packet per datagram, no added framing. Everything in this section is `[integration]`: exercised by the `doomd` binding tests and by live native runs, with no committed UDP captures of this path.
+
+- **Binding**: the repeatable `--udp ROOM=ADDR` flag binds one UDP listener at `ADDR` and attaches it to the named room `ROOM`. UDP and WebSocket peers of the same room share one `RoomHost` and `ServerRole`, so the protocol lifecycle and tic fan-out are identical across transports.
+- **Peer identity**: a UDP peer is identified by the listener-scoped pair `(listener, remote SocketAddr)`; the same socket address on a different listener is a different peer.
+- **Unknown traffic silence**: datagrams that are not valid protocol traffic from a known or admissible peer are dropped without any reply.
+- **Stateless QUERY**: QUERY (13) is answered with QUERY_RESPONSE (14) without allocating a `PlayerId`; a query never becomes room membership.
+- **Size rule**: a datagram of exactly 1500 bytes is accepted; oversized input is rejected.
+- **GAMEDATA adaptation**: a GAMEDATA datagram that exceeds the room bound is adapted to its newest complete suffix of tics. The bound is selected by the width tag stamped at production time: 78 tics and 1486 bytes at wide width, 88 tics and 1500 bytes at lowres width. The omitted older prefix is not lost: the peer recovers it through the ordinary GAMEDATA_RESEND path.
+- **Removal**: removals are processed FIFO; packets already owed to a leaving peer are attempted before its terminal packet, and room cleanup runs only after those send attempts. A room therefore lives for its membership plus any owed-removal traffic, with no browser host claim (section 6).
+
+## 8. Timing and reliability parameters
 
 | parameter | value | status |
 |---|---|---|
@@ -299,11 +314,14 @@ This repository's `doomd` implements the same envelope `[integration]`: the asym
 | receive window | BACKUPTICS = 128 tics | [reference] |
 | NET_MAXPLAYERS | 8 (net layer); doom engine caps at 4 on the wire (`max_players = 4` in SYN) | [observed, reference] |
 
-## 8. Current boundaries
+## 9. Current boundaries
 
-- REJECTED is observed for two causes (join after GAMESTART, game mode/mission mismatch). The remaining rejection paths in the pinned source (old magic number, no common protocol, server full) are `[reference]` only.
+These are fixture-corpus boundaries, stated explicitly even where Rust tests or live integration cover the behavior: `[integration]` evidence and committed role tests are not committed captures.
+
+- REJECTED is observed for two causes (join after GAMESTART, game mode/mission mismatch). The drone-first rejection of section 4 is pinned by a committed Rust role test but has no committed capture; the remaining rejection paths in the pinned source (old magic number, no common protocol, server full) are `[reference]` only.
 - Clean client-initiated DISCONNECT (menu quit) is not captured: it requires UI input, which the headless rig cannot produce. The same applies to NAT_HOLE_PUNCH, which needs real NAT.
-- Rich ticcmd diffs (movement and buttons), ticdup above 1, extratics, and deathmatch flags in GAMESTART are not covered: every committed fixture is an idle single-player co-op run.
-- Multi-player GAMESTART (`num_players > 1`, per-client `consoleplayer`) is not covered: committed fixtures carry single-player GAMESTART only.
+- Deathmatch flags in GAMESTART and multi-player GAMESTART (`num_players > 1`, per-client `consoleplayer`) are still absent from the committed native fixtures: every committed fixture is an idle single-player co-op run. Both now have `[integration]` evidence from the mixed native UDP and browser WebSocket room (personalized players 1/2 and 2/2, authoritative `deathmatch=1`).
+- Rich ticcmd diffs (movement and buttons), ticdup above 1, and extratics remain outside the fixture corpus.
 - RESEND under real loss and reliable resend on the wire are not observed: the loopback path is lossless and the rig has no loss-injecting scenario.
 - The WebSocket envelope bytes of section 6 are absent from the native UDP fixture corpus: no committed WebSocket packet capture exists. The envelope is exercised by the live browser path through `doomd` and by the `doomd` binding tests, which is integration evidence rather than a stored capture.
+- The UDP binding of section 7 has no committed packet captures either: its evidence is the live native interoperability runs and the `doomd` binding tests. `[integration]`
