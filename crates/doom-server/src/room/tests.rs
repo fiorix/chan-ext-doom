@@ -159,6 +159,29 @@ fn drain(host: &mut RoomHost<u32>, player: PlayerId) {
 }
 
 #[test]
+fn relay_metadata_equal_to_server_metadata_stays_opaque() {
+    let mut h = host(8);
+    let alice = join(&mut h);
+    let bob = join(&mut h);
+
+    let (outcome, _) = h
+        .relay(T0, alice, bob, 1, b"opaque relay")
+        .expect("relay succeeds");
+    assert_eq!(outcome, RelayOutcome::Queued(bob));
+    h.packet(T0, bob, plain(), syn("Bob"));
+
+    let relay = h.pop_outbound(bob).expect("relay remains first");
+    assert_eq!(relay.payload(), b"opaque relay");
+    let first_host = h.pop_outbound(bob).expect("SYN_ACCEPT follows");
+    let second_host = h.pop_outbound(bob).expect("WAITING_DATA follows");
+    assert_eq!(
+        [relay.lowres(), first_host.lowres(), second_host.lowres()],
+        [None, Some(false), Some(false)],
+        "metadata equality must not shift host tags onto opaque relays"
+    );
+}
+
+#[test]
 fn join_then_syn_queues_accept_and_first_waiting_data_from_the_host() {
     let mut h = host(8);
     let alice = join(&mut h);
