@@ -67,26 +67,28 @@ async fn main() -> Result<()> {
             udp,
         } => {
             // Every specification is validated and every conflict
-            // rejected before anything is bound.
+            // rejected before anything is bound. Only concrete
+            // addresses participate in duplicate rejection: an
+            // ephemeral (port zero) bind can never collide — the OS
+            // assigns a distinct port to each socket.
             let mut seen = std::collections::HashSet::new();
             for spec in &udp {
-                if spec.addr == listen {
+                if listen.port() != 0 && spec.addr == listen {
                     bail!("UDP bind {} conflicts with the WebSocket listen", spec.addr);
                 }
-                if !seen.insert(spec.addr) {
+                if spec.addr.port() != 0 && !seen.insert(spec.addr) {
                     bail!("duplicate UDP bind address {}", spec.addr);
                 }
             }
 
+            // Bind every configured socket successfully BEFORE printing
+            // any startup line: a bind failure must never follow a line
+            // claiming the process is serving.
             let listener = TcpListener::bind(listen)
                 .await
                 .with_context(|| format!("failed to bind {listen}"))?;
-            let local_address = listener
-                .local_addr()
-                .context("failed to read bound address")?;
-            eprintln!("doomd listening at ws://{local_address}/ws/<room>");
-
             let mut udp_listeners = Vec::new();
+            let mut udp_lines = Vec::new();
             for spec in udp {
                 let socket = UdpSocket::bind(spec.addr)
                     .await
@@ -94,8 +96,19 @@ async fn main() -> Result<()> {
                 let local = socket
                     .local_addr()
                     .context("failed to read bound UDP address")?;
-                eprintln!("doomd listening at udp://{local} room {}", spec.room);
+                udp_lines.push(format!(
+                    "doomd listening at udp://{local} room {}",
+                    spec.room
+                ));
                 udp_listeners.push((spec.room, socket));
+            }
+
+            let local_address = listener
+                .local_addr()
+                .context("failed to read bound address")?;
+            eprintln!("doomd listening at ws://{local_address}/ws/<room>");
+            for line in udp_lines {
+                eprintln!("{line}");
             }
 
             doom_server::serve(listener, udp_listeners, outbox_capacity)
