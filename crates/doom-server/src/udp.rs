@@ -64,6 +64,56 @@ fn adapt_gamedata(bytes: &[u8], lowres: bool) -> Option<Vec<u8>> {
     None
 }
 
+/// One drain pass of the listener loop, with the send itself injected
+/// so the take/send/finish ordering is testable without a real socket
+/// race. Phase one takes the batch under the lock; every send attempt
+/// happens with the lock RELEASED; phase two runs only after the last
+/// attempt.
+///
+/// The send future's `()` output is the production contract: a failing
+/// send is indistinguishable from a succeeding one by design (the real
+/// closure ignores `send_to` errors), so `finish_udp` always runs. No
+/// path between take and finish can early-return.
+///
+/// Cancellation note: dropping this future between take and finish
+/// skips `finish_udp` and leaves `udp_inflight` set, pinning the room.
+/// That is safe only because the first-listener supervisor resolves the
+/// whole serve future when any listener ends (`runtime.rs`), so the
+/// runtime holding the in-flight state is dropped with it. It is not a
+/// recovery path; if that supervisor rule ever changes, `finish_udp`
+/// needs a drop guard here.
+pub(crate) async fn drain_once<S, F>(
+    state: &SharedState,
+    listener_id: ListenerId,
+    room_name: &RoomName,
+    mut send: S,
+) where
+    S: FnMut(SocketAddr, Vec<u8>) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let (datagrams, effects, taken) = {
+        let mut runtime = state.0.lock().await;
+        runtime.take_udp(listener_id, room_name)
+    };
+    for waiter in effects.ws_waiters {
+        waiter.notify_one();
+    }
+    for waiter in effects.udp_waiters {
+        waiter.notify_one();
+    }
+    for (address, bytes) in datagrams {
+        // Send failures are isolated and bounded: the datagram is
+        // dropped, role state is untouched, no queue is retained.
+        send(address, bytes).await;
+    }
+    // Phase two after the actual send attempts: clear this batch's
+    // tombstones and drop the room if nothing retains it.
+    {
+        let mut runtime = state.0.lock().await;
+        runtime.finish_udp(listener_id, room_name, taken);
+    }
+}
+
 /// One listener task per configured `--udp ROOM=ADDR` bind: receives
 /// datagrams for its pinned room, drives the shared runtime, and sends
 /// every queued datagram FIFO as individual packets. It is the only
@@ -99,27 +149,16 @@ pub(crate) async fn listener(
             }
             _ = notifier.notified() => {}
         }
-        let (datagrams, effects, taken) = {
-            let mut runtime = state.0.lock().await;
-            runtime.take_udp(listener_id, &room_name)
-        };
-        for waiter in effects.ws_waiters {
-            waiter.notify_one();
-        }
-        for waiter in effects.udp_waiters {
-            waiter.notify_one();
-        }
-        for (address, bytes) in datagrams {
-            // Send failures are isolated and bounded: the datagram is
-            // dropped, role state is untouched, no queue is retained.
-            let _ = socket.send_to(&bytes, address).await;
-        }
-        // Phase two after the actual send attempts: clear this batch's
-        // tombstones and drop the room if nothing retains it.
-        {
-            let mut runtime = state.0.lock().await;
-            runtime.finish_udp(listener_id, &room_name, taken);
-        }
+        let socket = &socket;
+        drain_once(
+            &state,
+            listener_id,
+            &room_name,
+            |address, bytes| async move {
+                let _ = socket.send_to(&bytes, address).await;
+            },
+        )
+        .await;
     }
 }
 
@@ -1162,6 +1201,129 @@ mod tests {
         // A live-width lookup would fail to decode the lowres bytes as
         // wide and drop the owed batch on the producer-error path.
     }
+
+    /// `syn_bytes` with the drone bit set (engine-35 Low 1).
+    fn syn_bytes_drone(name: &str, lowres: u8) -> Vec<u8> {
+        let ClientPacket::Syn(mut value) = syn(name, lowres) else {
+            unreachable!()
+        };
+        value.connect.drone = 1;
+        ClientPacket::Syn(value)
+            .encode(WireHeader { reliable_seq: None }, false)
+            .expect("syn encodes")
+    }
+
+    /// A standalone GAMEDATA_ACK, the only upload path a drone has.
+    fn gamedata_ack_bytes(ack: u8) -> Vec<u8> {
+        ClientPacket::GameDataAck { ack }
+            .encode(WireHeader { reliable_seq: None }, true)
+            .expect("gamedata ack encodes")
+    }
+
+    /// `drive_three_player_ingame` with a fourth, lowres drone peer.
+    /// The drone SYNs after a player exists (the pinned first-SYN quirk
+    /// rejects an earlier drone) and acknowledges every step: the pump
+    /// gates on `sendseq - min_ack`, a minimum across peers, so a
+    /// silent drone would drag the room into the 40-tic stall and no
+    /// oversize span would ever be produced (engine-35).
+    fn drive_ingame_with_drone(
+        rt: &mut Runtime,
+        listener: ListenerId,
+        steps: usize,
+    ) -> ([SocketAddr; 3], SocketAddr) {
+        let addrs: [SocketAddr; 3] = [
+            "127.0.0.1:24001".parse().expect("valid addr"),
+            "127.0.0.1:24002".parse().expect("valid addr"),
+            "127.0.0.1:24003".parse().expect("valid addr"),
+        ];
+        let drone: SocketAddr = "127.0.0.1:24004".parse().expect("valid addr");
+        for (index, address) in addrs.iter().enumerate() {
+            let name = format!("p{index}");
+            rt.udp_datagram(listener, &room(), *address, &syn_bytes(&name, 0, 0, 1));
+        }
+        rt.udp_datagram(listener, &room(), drone, &syn_bytes_drone("observer", 1));
+        for address in addrs {
+            rt.udp_datagram(listener, &room(), address, &ack_bytes(1));
+        }
+        rt.udp_datagram(listener, &room(), drone, &ack_bytes(1));
+        rt.udp_datagram(listener, &room(), addrs[0], &launch_bytes(0));
+        for address in addrs {
+            rt.udp_datagram(listener, &room(), address, &ack_bytes(2));
+        }
+        rt.udp_datagram(listener, &room(), drone, &ack_bytes(2));
+        rt.udp_datagram(listener, &room(), addrs[0], &settings_bytes_ext(1, 0, 127));
+        rt.udp_datagram(listener, &room(), addrs[1], &settings_bytes(0, 0));
+        rt.udp_datagram(listener, &room(), addrs[2], &settings_bytes(0, 0));
+        rt.udp_datagram(listener, &room(), drone, &settings_bytes(0, 0));
+        for step in 0..steps {
+            play_step(rt, listener, &addrs, 1, step);
+            rt.udp_datagram(listener, &room(), drone, &gamedata_ack_bytes(step as u8));
+            drain(rt, listener, &room());
+        }
+        (addrs, drone)
+    }
+
+    // Engine-35 Low 1 (followup-lead-server-24 addendum 3): the
+    // LIVE-outbox adaptation site reads the packet's production tag,
+    // never the live room width. The final span is left undrained, all
+    // three players leave — ending the game and resetting the live
+    // width to wide — and the still-mapped drone's outbox drains
+    // through the live site. Its oversize lowres span adapts to exactly
+    // 62 tics / 1492 bytes / start 69, decodes lowres, and FAILS to
+    // decode wide. A mutation of only the live-outbox site to the live
+    // width fails this test by name; the pending-site mutation stays
+    // killed by lowres_gamedata_keeps_its_width_tag_across_a_role_reset.
+    #[test]
+    fn live_outbox_oversize_adapts_by_packet_tag_after_role_reset() {
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let (addrs, drone) = drive_ingame_with_drone(&mut rt, listener, 130);
+        // One final span, undrained, with the drone's ack current.
+        play_step(&mut rt, listener, &addrs, 1, 130);
+        rt.udp_datagram(listener, &room(), drone, &gamedata_ack_bytes(130));
+
+        // Every player leaves: the game ends and the live width resets
+        // to wide. The drone is not a player: it survives the end_game
+        // as a mapped member with its outbox intact.
+        for address in addrs {
+            let player = rt.rooms[&room()].udp_addresses[&(listener, address)];
+            rt.leave(&room(), player);
+        }
+        let bind_room = rt.rooms.get(&room()).expect("the drone retains the room");
+        assert!(!bind_room.host.lowres_turn(), "the role reset to wide");
+        assert!(
+            bind_room.udp_addresses.contains_key(&(listener, drone)),
+            "the drone is still mapped"
+        );
+
+        let (datagrams, _) = drain(&mut rt, listener, &room());
+        let mut spans = Vec::new();
+        for (address, bytes) in &datagrams {
+            assert!(bytes.len() <= MAX_DATAGRAM_LEN);
+            if *address == drone
+                && let Ok((_, ServerPacket::GameData(_))) = ServerPacket::decode(bytes, true)
+            {
+                spans.push(bytes);
+            }
+        }
+        let [span] = spans.as_slice() else {
+            panic!("exactly one live drone span, got {}", spans.len())
+        };
+        assert_eq!(span.len(), 1492, "the live-site adapted length");
+        let ServerPacket::GameData(data) = decode_server(span, true) else {
+            unreachable!()
+        };
+        assert_eq!(data.tics.len(), 62, "the live-site adapted suffix");
+        assert_eq!(
+            data.start, 69,
+            "the suffix start advances by the omitted count"
+        );
+        assert!(
+            ServerPacket::decode(span, false).is_err(),
+            "the adapted span is not wide-decodable: the tag, not the live width, drove it"
+        );
+    }
+
     // --- H4: pending traffic in room lifetime ------------------------------
 
     /// The draining-room refusals that must hold from the removal
@@ -1247,6 +1409,87 @@ mod tests {
             panic!("query response")
         };
         assert_eq!(query.num_players, 1);
+    }
+
+    // Engine-35 Low 2 (followup-lead-server-24 addendum 3): the REAL
+    // drain ordering through the production `drain_once` seam with the
+    // send injected. During every send attempt the runtime lock is
+    // acquirable, the room is still alive, and admission is still
+    // refused; after the pass the room is dropped and admission
+    // recovers. A mutation moving `finish_udp` before the sends fails
+    // this test by name; a mutation holding the mutex across the sends
+    // hits the timeout instead of hanging the suite.
+    #[tokio::test]
+    async fn listener_finishes_only_after_the_send_attempts() {
+        // One pending removal batch: the peer times out in a tick
+        // reduction, which captures its owed accept/waiting into the
+        // draining state (the same construction as
+        // pending_removal_traffic_holds_room_until_listener_attempt).
+        let mut rt = runtime();
+        let (listener, _notifier) = rt.register_listener();
+        let from = addr();
+        rt.udp_datagram(listener, &room(), from, &fixture_syn());
+        rt.started = rt
+            .started
+            .checked_sub(Duration::from_secs(31))
+            .expect("backdate the clock past the receive timeout");
+        rt.tick();
+        assert!(rt.rooms[&room()].udp_draining.contains(&(listener, from)));
+        assert!(!rt.rooms[&room()].pending_udp[&listener].is_empty());
+
+        let state = SharedState(Arc::new(tokio::sync::Mutex::new(rt)));
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send = {
+            let state = state.clone();
+            let observations = observations.clone();
+            move |address: SocketAddr, _bytes: Vec<u8>| {
+                let state = state.clone();
+                let observations = observations.clone();
+                async move {
+                    let mut rt = state.0.lock().await;
+                    let alive = rt.rooms.contains_key(&room());
+                    let refused = matches!(
+                        rt.join(room(), Arc::new(Notify::new())),
+                        Err(JoinRefusal::RoomDraining)
+                    );
+                    observations
+                        .lock()
+                        .expect("observations lock")
+                        .push((alive, refused, address));
+                }
+            }
+        };
+        timeout(
+            Duration::from_secs(5),
+            drain_once(&state, listener, &room(), send),
+        )
+        .await
+        .expect("the lock must be free during sends; a hang here means it was held");
+
+        {
+            let observations = observations.lock().expect("observations lock");
+            assert!(
+                observations.len() >= 2,
+                "the accept and waiting datagrams were attempted"
+            );
+            for (alive, refused, address) in observations.iter() {
+                assert!(alive, "the room was still alive at the send to {address}");
+                assert!(
+                    refused,
+                    "admission was still refused at the send to {address}"
+                );
+            }
+        }
+
+        let mut rt = state.0.lock().await;
+        assert!(
+            !rt.rooms.contains_key(&room()),
+            "finish dropped the emptied room"
+        );
+        assert!(
+            rt.join(room(), Arc::new(Notify::new())).is_ok(),
+            "admission recovered after the pass"
+        );
     }
 
     #[test]

@@ -899,3 +899,76 @@ fn recursive_leave_flips_width_mid_reduce_but_gamedata_keeps_production_width() 
         "the bytes are not wide-encoded"
     );
 }
+
+// Structural-origin capture quadrant (engine-36 probes, lifted verbatim
+// from dev/doomit-team/engine-structural-origin-probes.md).
+#[test]
+fn capture_path_keeps_colliding_relay_opaque_and_host_tags_structural() {
+    let mut h = host(16);
+    let alice = join(&mut h);
+    let target = join(&mut h);
+
+    // Queue, in order, for the still pre-SYN target: one relay whose
+    // public metadata EQUALS the server metadata (1), one relay from a
+    // distinct route, then two host QUERY_RESPONSE packets. The
+    // committed capture test only covers the non-colliding relay; the
+    // committed collision regression only covers the pop path. This
+    // drives the collision through the CAPTURE path.
+    let colliding = b"colliding-relay";
+    let distinct = b"distinct-relay";
+    let (outcome, _) = h
+        .relay(T0, alice, target, 1, colliding)
+        .expect("colliding relay queues");
+    assert_eq!(outcome, RelayOutcome::Queued(target));
+    let (outcome, _) = h
+        .relay(T0, alice, target, 20, distinct)
+        .expect("distinct relay queues");
+    assert_eq!(outcome, RelayOutcome::Queued(target));
+    let first_query = h.packet(T0, target, plain(), ClientPacket::Query);
+    assert!(first_query.wakes.contains(&target));
+    let second_query = h.packet(T0, target, plain(), ClientPacket::Query);
+    assert!(second_query.wakes.contains(&target));
+
+    // The old-magic classification is a terminal REJECTED removal for
+    // the pre-SYN target; the reduction captures the owed prefix.
+    let effect = h.malformed(T0, target, MalformedClass::Syn { old_magic: true });
+    assert!(!h.contains(target));
+    let owed = effect
+        .removal_owed
+        .iter()
+        .find(|(player, _)| *player == target)
+        .map(|(_, packets)| packets)
+        .expect("the owed prefix is captured");
+    assert_eq!(owed.len(), 4);
+    // The colliding relay stays opaque with its binding metadata and
+    // payload intact: origin must be structural, never inferred from
+    // metadata equality.
+    assert_eq!(owed[0].metadata(), &1);
+    assert_eq!(owed[0].payload(), colliding);
+    assert_eq!(owed[0].lowres(), None, "colliding relay tagged as host");
+    assert_eq!(owed[1].metadata(), &20);
+    assert_eq!(owed[1].payload(), distinct);
+    assert_eq!(owed[1].lowres(), None, "distinct relay tagged as host");
+    // The host packets keep the server route and their production-time
+    // wide tag.
+    assert_eq!(owed[2].metadata(), &1);
+    assert_eq!(owed[2].lowres(), Some(false));
+    assert_eq!(owed[3].metadata(), &1);
+    assert_eq!(owed[3].lowres(), Some(false));
+}
+
+#[test]
+fn popped_colliding_relay_keeps_binding_metadata_and_payload() {
+    let mut h = host(8);
+    let alice = join(&mut h);
+    let bob = join(&mut h);
+
+    let (outcome, _) = h
+        .relay(T0, alice, bob, 1, b"pop-colliding")
+        .expect("relay queues");
+    assert_eq!(outcome, RelayOutcome::Queued(bob));
+    let popped = h.pop_outbound(bob).expect("the relay is owed");
+    assert_eq!(popped.metadata(), &1);
+    assert_eq!(popped.payload(), b"pop-colliding");
+    assert_eq!(popped.lowres(), None);
+}
