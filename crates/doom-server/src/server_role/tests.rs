@@ -1073,6 +1073,68 @@ fn timeout_removes_and_broadcasts_only_to_survivors() {
     assert!(Harness::sends_to(&all, alice).is_empty());
 }
 
+// followup-lead-server-24 addendum 2 / proto-38: the client-visible
+// slot-reuse discriminator. "first" takes slot 0, "second" slot 1;
+// "first" leaves with "second" present; "third" reuses slot 0. Slot
+// order is [third, second] while PlayerId order is [second, third],
+// permanently. One timer pass times both survivors out: pinned
+// NET_SV_Run order expires the reused slot 0 first, so "second" is
+// told about "third" and "third" hears nothing. A mutation restoring
+// ascending-PlayerId traversal expires "second" first and sends
+// "third" the 'second' message instead; it fails this test by name.
+#[test]
+fn slot_reuse_timeout_broadcast_follows_protocol_slot_order() {
+    let mut h = Harness::new();
+    let first = h.join("a");
+    let second = h.join("b");
+    h.syn(first, "first");
+    h.syn(second, "second");
+
+    // "first" leaves with "second" still present: slot 0 frees for
+    // reuse and no abort or end-game fires (one player remains).
+    h.role.handle(T0, Input::Leave { player: first });
+    let third = h.join("c");
+    h.syn(third, "third");
+
+    // Both survivors acknowledge their accepts so the timeout broadcast
+    // emits immediately, aligning both receive clocks on T0.
+    h.ack(second, 1);
+    h.ack(third, 1);
+
+    // One pass at 30 s times out both Connected peers in a single
+    // batch. The reused slot 0 expires first: its broadcast reaches the
+    // still-connected "second"; the later one reaches no one.
+    let actions = h.tick(30_001);
+
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::Disconnect { player, .. } if *player == third
+    )));
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::Disconnect { player, .. } if *player == second
+    )));
+    let console: Vec<(PlayerId, &Vec<u8>)> = actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                player,
+                packet: ServerPacket::ConsoleMessage { message },
+                ..
+            } => Some((*player, message)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(console.len(), 1, "exactly one timeout broadcast emits");
+    assert_eq!(console[0].0, second);
+    assert_eq!(
+        console[0].1.as_slice(),
+        b"Client 'third' timed out and disconnected"
+    );
+    // Nothing was sent to the peer that expired first.
+    assert!(Harness::sends_to(&actions, third).is_empty());
+}
+
 #[test]
 fn keepalive_after_one_second_send_idle() {
     let mut h = Harness::new();

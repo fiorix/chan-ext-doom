@@ -1197,18 +1197,15 @@ impl ServerRole {
     fn on_timer(&mut self, now: Milliseconds) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Deterministic visitation order (lowest PlayerId first): the
-        // role's effects are order-sensitive within one batch, so the
-        // timer must not depend on hash iteration.
-        let mut timer_peers: Vec<PlayerId> = self.peers.keys().copied().collect();
-        timer_peers.sort_unstable();
-        for player in timer_peers {
-            let (syn, conn, idle_recv, idle_send, idle_waitdata, connected, name) = {
+        // Pinned NET_SV_Run walks the reusable clients[] array: the
+        // timer visits every SYN-accepted peer in protocol-slot order,
+        // and the role's effects are order-sensitive within one batch.
+        for player in self.timer_peers() {
+            let (conn, idle_recv, idle_send, idle_waitdata, connected, name) = {
                 let Some(peer) = self.peers.get(&player) else {
                     continue;
                 };
                 (
-                    peer.syn,
                     peer.conn,
                     now.0.saturating_sub(peer.last_recv.0),
                     now.0.saturating_sub(peer.last_send.0),
@@ -1217,12 +1214,6 @@ impl ServerRole {
                     peer.name.clone(),
                 )
             };
-
-            // Members that never completed SYN are binding-level: no
-            // protocol timers exist for them.
-            if !syn {
-                continue;
-            }
 
             match conn {
                 Conn::Connected => {}
@@ -1792,6 +1783,22 @@ impl ServerRole {
         (0..MAX_NODES)
             .find(|slot| !self.peers.values().any(|peer| peer.slot == Some(*slot)))
             .expect("SYN capacity is checked before acceptance")
+    }
+
+    /// Every SYN-accepted peer — Connected, Disconnecting, and Sleeping
+    /// alike — in reusable protocol-slot order (pinned `NET_SV_Run`
+    /// walking the `clients[]` array). Draining peers still carry timer
+    /// work, so this is not `connected_peers()`; pre-SYN members hold
+    /// no slot and stay timer-silent.
+    fn timer_peers(&self) -> Vec<PlayerId> {
+        let mut peers: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.syn)
+            .map(|(player, peer)| (peer.slot.expect("SYN-accepted peers hold slots"), *player))
+            .collect();
+        peers.sort_unstable();
+        peers.into_iter().map(|(_, player)| player).collect()
     }
 
     /// Every protocol-connected peer, players and drones, in slot order

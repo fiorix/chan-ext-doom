@@ -705,24 +705,36 @@ fn removal_effect_carries_the_owed_prefix_with_metadata_and_tags() {
     assert!(h.pop_outbound(target).is_none());
 }
 
-// Addenda 3/4 (followup-lead-server-23): one timer pass emits the
-// drone's GAMEDATA while the room is lowres, then times out the room's
-// only player, and end_game resets the live width to wide in the same
+// Addenda 3/4 (followup-lead-server-23), reconstructed per addendum 2
+// of followup-lead-server-24: one timer pass emits the drone's
+// GAMEDATA while the room is lowres, then times out the room's only
+// player, and end_game resets the live width to wide in the same
 // action list. The GAMEDATA must still encode at its production width:
 // the action carries the tag, and the reducer never re-reads the live
 // role width. A mutation encoding with the live (post-reset) width
 // must fail this test.
+//
+// The producer drone is admitted LAST, into the reused slot 0: it is
+// the highest PlayerId but the first protocol slot, so the pinned
+// slot-order timer visits it before the player and the fan-out is
+// produced ahead of the reset. A mutation restoring ascending-PlayerId
+// traversal visits the player first, ends the game, and the drone
+// never pumps — failing this test by name, a two-order discriminator
+// in its own right.
 #[test]
 fn gamedata_produced_before_a_same_batch_reset_encodes_at_production_width() {
     let mut h = host(16);
-    // The drone is the lower PlayerId (the timer visits it first), the
-    // room's only player second. Both negotiate lowres.
-    let drone = join(&mut h);
+    // Slot-reuse setup: the first player takes slot 0 and leaves with
+    // the second player present, so the drone — joined last, the
+    // highest PlayerId — is handed the reused slot 0 at acceptance and
+    // becomes the first protocol slot. Everyone negotiates lowres.
+    let departing = join(&mut h);
     let player = join(&mut h);
-    // The player SYNs first: upstream rejects a drone that arrives
-    // before any player with "Game mismatch" (pinned quirk), so the
-    // drone holds the lower PlayerId but completes SYN second.
+    let drone = join(&mut h);
+    h.packet(T0, departing, plain(), syn_lowres("Departing"));
     h.packet(T0, player, plain(), syn_lowres("Player"));
+    // Slot 0 frees with a player still present: no abort, no end-game.
+    h.leave(T0, departing);
     h.packet(T0, drone, plain(), syn_drone_lowres("Observer"));
     h.packet(T0, player, reliable(0), ClientPacket::Launch);
     h.packet(
