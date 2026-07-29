@@ -4,7 +4,7 @@ This document is the living specification for doomit's component boundaries, pro
 
 ## Purpose
 
-doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer restored and a Rust crate family that separates room transport, protocol handling, and native embedding. The browser implementation is usable on its own; the crate boundaries also support a pure Rust server role, native Chocolate client interoperability, and embedding in Rust applications without making chan a dependency.
+doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer restored and a Rust crate family that separates room transport, protocol handling, and native embedding. Browser and native engines act as Chocolate clients of the Rust server role. The crate boundaries also support embedding in Rust applications without making chan a dependency.
 
 ## Design principles
 
@@ -18,28 +18,28 @@ doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer res
 
 ## Current system
 
-The engine is a rojo2/wasm-doom Crispy lineage base with the matching Chocolate network layer restored. Browser builds use `net_websockets.c`; one browser engine runs Chocolate's client and server roles, and other browser engines connect as clients.
+The engine is a rojo2/wasm-doom Crispy-lineage base with the matching Chocolate network layer restored. Browser builds use `net_websockets.c` and the loader permits only the Chocolate client role. Native builds use SDL_net UDP. Both targets run the same game simulation and client protocol behavior.
 
-`doom-server` provides a sans-I/O `Registry` for named rooms with a maximum of eight connections, bounded FIFO outboxes, payload limits, and disconnect-on-overflow behavior. Its WebSocket binding owns Cloudflare-compatible route envelopes and route identity. The `doomd serve` CLI exposes that binding at `/ws/{room}`. It relays opaque Chocolate packets and contains no Chocolate game-server state machine.
+`doom-server` provides a protocol-agnostic sans-I/O `Registry` for named rooms with a maximum of eight connections, bounded FIFO outboxes, payload limits, and disconnect-on-overflow behavior. A transport-neutral `RoomHost` combines each named room with one Rust `ServerRole`. The role owns handshake, lobby settings, personalized GAMESTART, ticcmd windows and fan-out, reliable sequencing, resend, keepalive, timeout, and disconnect behavior. It never simulates the game.
 
-The browser loader validates the pinned shareware IWAD, manages ordered PWADs, normalizes Chocolate's merge-before-file precedence, fingerprints the effective mod configuration, and replaces the engine iframe when configuration changes. It can host or join a room, record a verification demo, and compare exit digests between two cooperating same-origin pages.
+The WebSocket binding owns route envelopes and route identity. Route 1 is permanently server-owned, and the legacy destination-0 reset marker is inert. The UDP binding carries one Chocolate packet per datagram, keys peers by listener and remote socket address, and shares the same `RoomHost` as WebSocket peers. `doomd serve` exposes `/ws/{room}` and repeatable `--udp ROOM=ADDR` listeners.
 
-The fixture set contains 102 curated native UDP datagrams from five Chocolate Doom 3.1.1 sessions. `doom-proto` verifies fixture membership, lengths, headers, and hashes; it exposes no packet codec. `doom-embed` is a buildable crate scaffold without a wasmtime host.
+The browser loader validates the pinned shareware IWAD, manages ordered PWADs, normalizes Chocolate's merge-before-file precedence, fingerprints the effective mod configuration, and replaces the engine iframe when configuration changes. It launches multiplayer tabs with the same client-only network arguments and compares exit digests between two cooperating same-origin pages.
 
-The CMake and single-command engine build routes are browser-only and require Emscripten. `src/net_sdl.c` is retained source, but no native engine target or Rust UDP binding is buildable from this tree.
+The fixture set contains 113 curated native UDP datagrams from seven Chocolate Doom 3.1.1 sessions. `doom-proto` provides the directional byte-exact packet codec used by the server role and bindings, plus fixture membership, length, header, and hash checks. `doom-embed` remains a buildable crate scaffold without a wasmtime host.
 
 ## Repository shape
 
 ```text
 fiorix/doomit
-├── engine/                         # GPL-2.0 engine fork, browser loader, builds, tests
+├── engine/                         # GPL-2.0 client engine, browser loader, native target, tests
 ├── crates/
-│   ├── doom-proto/                 # fixture checks and protocol-codec boundary
-│   ├── doom-server/                # room core, WebSocket binding, doomd CLI
+│   ├── doom-proto/                 # byte-exact Chocolate packet codec and fixture checks
+│   ├── doom-server/                # room core, Rust server role, WS/UDP bindings, doomd CLI
 │   └── doom-embed/                 # native-host crate scaffold
 ├── fixtures/                       # captured Chocolate packet evidence
 ├── docs/
-│   ├── protocol.md                 # observed and source-grounded wire inventory
+│   ├── protocol.md                 # observed, source-grounded, and integration wire inventory
 │   ├── verification.md             # fixture capture and validation procedure
 │   └── mods.md                     # selected PWAD contract and provenance
 └── scripts/gate.sh                 # Rust formatting, lint, and test gate
@@ -51,21 +51,25 @@ Nothing in `crates/` depends on chan.
 
 ### Engine
 
-The engine owns game simulation, Chocolate client and server behavior, browser input/audio/video, WAD loading, demo recording, and the exit-state serializer. The WebSocket transport is a `net_module_t` implementation and carries Chocolate packets without changing their bytes.
+The engine owns game simulation, Chocolate client behavior, browser or native input/audio/video, WAD loading, demo recording, and the exit-state serializer. Its WebSocket and SDL_net transports carry Chocolate packets without changing their bytes.
+
+The browser loader refuses `-server` and `-privateserver`; route 1 belongs to the Rust server. Retained C server sources remain part of the imported engine lineage and are still referenced by client-path teardown, but they are not the browser multiplayer authority.
 
 The engine emits two exit reports at the same `ga_completed` anchor before level teardown. The input report hashes the canonical recorded ticcmd stream. The state report serializes deterministic game state in the explicit `DCS1` format and hashes it. Presentation-only state and per-instance pointers are excluded. The loader displays an aggregate match only when both report types match for a reciprocally paired launch and the same exit identity.
 
 ### Room server
 
-The room core owns portable room names, membership, stable connection identifiers, bounded queues, FIFO relay, payload limits, and slow-consumer removal. The WebSocket adapter owns route parsing, source binding, room reset semantics, and frame encoding. These layers remain protocol-agnostic.
+The `Registry` owns portable room names, membership, stable connection identifiers, bounded queues, FIFO relay, payload limits, and slow-consumer removal. It remains protocol-agnostic.
 
-The designed Chocolate server-role layer sits above packet codecs and below transport adapters. It owns handshake state, the player table, lobby settings, GAMESTART, ticcmd fan-out, resend windows, keepalive, timeout, and disconnect behavior. It never simulates the game.
+The `RoomHost` owns protocol-aware reduction around the `ServerRole`, packet-local encoding context, transport-neutral removal effects, and authoritative room settings. The `ServerRole` owns reusable protocol slots, slot-ordered timers, the player table, lobby settings, GAMESTART, cumulative ticcmd windows, reliable delivery, resend and deadlock recovery, keepalive, timeout, and disconnect state.
+
+Transport adapters own external identity and I/O. WebSocket peers use bound route identifiers and server-owned route 1. UDP peers use listener-scoped socket identity, raw datagrams, stateless QUERY, a 1500-byte ceiling, bounded newest-suffix GAMEDATA adaptation, and two-phase take/send/finish cleanup. Both adapters feed the same room clock and role.
 
 ### Protocol crate
 
-The protocol crate's intended public surface is explicit big-endian encoding and decoding for Chocolate packet fields, including packet headers, handshake messages, GAMESTART settings, ticcmd windows, reliable sequencing, resend, keepalive, and disconnect. The separate WebSocket route envelope uses little-endian route identifiers and is not part of the Chocolate packet format.
+The protocol crate exposes explicit directional big-endian encoding and decoding for Chocolate packet fields, including packet headers, handshake messages, GAMESTART settings, ticcmd windows, reliable sequencing, resend, keepalive, query, rejection, and disconnect. The separate WebSocket route envelope uses little-endian route identifiers and is not part of the Chocolate packet format.
 
-The codec must use fixed-width field operations rather than C layout, transmute, or copied GPL implementation code. Captured packets and the source-grounded inventory in `protocol.md` define the interoperability evidence.
+The codec uses fixed-width field operations rather than C layout, transmute, or copied GPL implementation code. Captured packets and the source-grounded inventory in `protocol.md` define the interoperability evidence.
 
 ### Native embedding
 
@@ -73,14 +77,19 @@ The native embedding boundary is designed as an optional wasmtime host for the e
 
 ## Protocol and transport strategy
 
-Chocolate packets remain the game protocol. Browser engines add an asymmetric route envelope around each packet:
+Chocolate packets remain the game protocol. Browser engines wrap each packet in an asymmetric route envelope: client frames name a destination and source, while server frames name only the source. Route identifiers are little-endian u32 values and Chocolate packet fields remain big-endian.
 
-- Engine to relay: destination route ID, source route ID, then the unchanged Chocolate packet.
-- Relay to engine: source route ID, then the unchanged Chocolate packet.
+Client browser frames target server route 1. A client may not bind route 1, and a frame claiming source 1 closes only that offender. The old destination-0 registration/reset marker does not reset the room. Room lifetime follows live membership plus already-owed removal traffic.
 
-The route IDs are little-endian u32 values. Chocolate packet fields remain big-endian. The current host browser runs Chocolate's server role; the relay only moves frames between route IDs.
+Native clients send raw Chocolate packets over UDP. Repeated listeners may share a named room while `(listener, remote SocketAddr)` remains the binding identity. The adapter accepts datagrams up to and including 1500 bytes and never parses a truncated oversize input. Input-reachable oversize GAMEDATA output keeps the newest complete suffix and advances the advertised start so the client requests the omitted prefix through ordinary resend.
 
-The pure Rust server role is the designed replacement for the host browser's server role. Browser clients reach it through the room/WebSocket boundary, and native Chocolate clients reach it through a UDP binding. Both transports feed the same packet and server-state interfaces.
+Both transports reach one Rust role per room. The role is the protocol authority but not a simulation authority: clients simulate locally from the same settings and ticcmd stream.
+
+## Compatibility boundary
+
+The interoperability oracle is Chocolate Doom 3.1.1 at upstream commit `410d96855b5df5410ff591a90efeafa889119224`. The current product path uses the pinned shareware Doom 1.9 IWAD.
+
+The imported engine has later Crispy-lineage mission ordinals that conflict with the pinned Chocolate table. NERVE and MASTER are not admitted by the Rust role because SYN-only acceptance would be incomplete without matching episode/map and version semantics. No claim is made for every Crispy-lineage mission.
 
 ## Mod contract
 
@@ -99,14 +108,6 @@ Changing the set restarts the engine instance. The loader does not claim hot unl
 
 ## Planned components
 
-### Rust protocol and server role
-
-Implement the byte-exact codec and the Chocolate server-role state machine behind the existing room interfaces. Verify behavior against captured native sessions and source-grounded packet layouts.
-
-### Native transport
-
-Make the engine buildable without browser-only Emscripten seams, enable the retained SDL_net transport, and add a Rust UDP adapter so native Chocolate clients and browser clients can join the same server role.
-
 ### Embedding and scale validation
 
 Implement the wasmtime host and bot client boundary, then exercise eight-room capacity, sustained lockstep, stalled-peer removal, and deterministic mod behavior without requiring eight human players.
@@ -117,11 +118,11 @@ Expose the sans-I/O room and server-role core through a chan-owned route and lob
 
 ## Verification model
 
-Implemented checks cover the Rust room relay, WebSocket route binding, fixture integrity, transport framing and ownership, ABI consistency, loader configuration, deterministic canary serialization, and multi-page verdict behavior. The browser build is pinned by exact artifact hashes under emsdk 6.0.3.
+Implemented checks cover fixture integrity, byte-exact packet round trips, malformed-input rejection, the sans-I/O server lifecycle, cumulative tic windows, reliable sequencing, shared WebSocket/UDP room behavior, route ownership, listener identity, bounded queues, CLI lifecycle, engine transport framing, loader configuration, deterministic canary serialization, and multi-page verdict convergence. Browser builds are pinned by exact artifact hashes under emsdk 6.0.3, and the native target is reproducible from the same tree.
 
-Protocol and server-role implementation must add golden decode/encode parity, malformed-input rejection, reliable-sequence and resend coverage, and replay against native Chocolate sessions. Native transport must demonstrate a real Chocolate client join. Scale work must measure bounded memory while a peer stalls and exercise the full eight-connection room capacity.
+Live integration proves that the pinned native engine reaches personalized GAMESTART and sustained UDP tic exchange against `doomd`. A mixed native UDP and browser WebSocket room reaches players 1/2 and 2/2 with authoritative deathmatch settings and sustained traffic. A separate native `-record` run proves authoritative low-resolution turn negotiation for both transports.
 
-The end-to-end browser invariant is bilateral agreement at the same exit: both pages report matching input history and matching serialized simulation state. A missing digest, stale partner, unrelated page, malformed report, or one-sided match remains incomplete.
+The end-to-end browser invariant is bilateral agreement at the same exit: both pages report matching input history and matching serialized simulation state. A missing digest, stale partner, unrelated page, malformed report, or one-sided match remains incomplete. The current client-only Rust-hosted path still lacks a completed bilateral E1M1 exit evidence run.
 
 ## Non-goals
 

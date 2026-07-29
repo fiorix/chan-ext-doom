@@ -2,6 +2,27 @@
 
 This file records notable development history and design decisions. Reference documentation describes only the repository's current behavior and contracts.
 
+## 2026-07-29
+
+### Rust protocol and server role
+
+- Implemented the directional byte-exact Chocolate packet codec and expanded the committed native corpus to 113 packets from seven sessions, including two distinct REJECTED causes.
+- Implemented the sans-I/O Rust Chocolate server role with reusable protocol slots, lobby authority, personalized GAMESTART, cumulative ticcmd windows, reliable delivery, resend and deadlock recovery, slot-ordered timers, and source-faithful timeout and disconnect lifecycles.
+- Corrected protocol fidelity at the rejection boundary, including old-magic state handling, quiet pre-SYN removal, exact mission and mode names, and the pinned Chocolate Doom 3.1.1 admission table.
+
+### Shared WebSocket and UDP hosting
+
+- Replaced the browser-hosted Chocolate server role with one Rust `RoomHost` and `ServerRole` per named room, shared by WebSocket and UDP peers.
+- Made WebSocket route 1 permanently server-owned, retired the legacy destination-0 room reset, coupled timer lifetime to service lifetime, and bounded each atomic host reduction with an exact producer invariant.
+- Added listener-scoped UDP identity, stateless QUERY, exact 1500-byte datagram handling, newest-suffix adaptation for oversized GAMEDATA, packet-local codec width, terminal-last removal, and two-phase take/send/finish cleanup.
+- Added repeatable `doomd serve --udp ROOM=ADDR` bindings and a bounded CLI process harness covering ephemeral ports, conflicts, bind failures, and child cleanup.
+
+### Client targets and interoperability
+
+- Added a reproducible native SDL_net engine target while preserving the pinned browser build, and made the browser loader client-only with fail-closed rejection of local server-role arguments.
+- Verified the pinned native engine through personalized GAMESTART and sustained UDP tic exchange against `doomd`, including deathmatch settings, acknowledgements, and resend traffic.
+- Verified a mixed native UDP and browser WebSocket room with players 1/2 and 2/2, authoritative deathmatch settings, sustained traffic, and a separate authoritative low-resolution turn run triggered by native recording.
+
 ## 2026-07-28
 
 ### Documentation

@@ -76,6 +76,6 @@ Each run reaches `D_CheckNetGame`, `HU_Init`, and `ST_Init` on a live 320 by 200
 
 The real loader passes the combined set in canonical order, includes effective DEHACKED behavior in the JSON fingerprint, sends the current configuration once per relaunch, rejects duplicate and reserved names, and removes a deleted PWAD from the rows, fingerprint, and next argv. The replacement engine instance mounts only the remaining files.
 
-The two-window browser acceptance path completes shareware E1M1 with matching input-history and simulation-state verdicts. A fresh single-player relaunch displays the combined mod order and changed assets, and a remove/relaunch cycle starts cleanly with the removed PWAD absent.
+The loader canary and verdict path has completed shareware E1M1 with matching input-history and simulation-state verdicts in a two-window browser run. The current client-only Rust-hosted path still requires the same bilateral exit run. A fresh single-player relaunch displays the combined mod order and changed assets, and a remove/relaunch cycle starts cleanly with the removed PWAD absent.
 
-The repository does not provide a native engine build or a native embedding API, so mod management is browser-only. Two-client deterministic verification with PSX's embedded DEHACKED patch enabled is outside the current evidence set.
+The repository provides a native engine target but no native embedding or mod-management API, so mod management remains browser-loader-only. Two-client deterministic verification with PSX's embedded DEHACKED patch enabled is outside the current evidence set.
