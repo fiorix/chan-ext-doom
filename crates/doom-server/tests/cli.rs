@@ -94,23 +94,42 @@ fn advertised_port(line: &str, scheme: &str) -> u16 {
         .expect("numeric port")
 }
 
-/// A concrete loopback address the kernel just reported free: bind
-/// port zero, read the assigned port, release. No fixed test port is
-/// ever used without acquiring it first.
-fn free_addr() -> SocketAddr {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("bind a probe socket")
-        .local_addr()
-        .expect("probe address")
+/// Kernel-assigned probe sockets held simultaneously while their
+/// addresses are recorded, so requested distinct addresses are
+/// distinct by construction (two sockets bound at once can never share
+/// a port). The caller drops the guard to release the ports
+/// immediately before spawning the child; no fixed test port is ever
+/// assumed free.
+struct ProbeSockets(Vec<std::net::UdpSocket>);
+
+impl ProbeSockets {
+    fn bind(count: usize) -> Self {
+        Self(
+            (0..count)
+                .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a probe socket"))
+                .collect(),
+        )
+    }
+
+    fn addrs(&self) -> Vec<SocketAddr> {
+        self.0
+            .iter()
+            .map(|socket| socket.local_addr().expect("probe address"))
+            .collect()
+    }
 }
 
 /// Bounded rejection: the command must exit on its own before the
 /// deadline with the needle in its stderr. A wrongly accepted command
 /// keeps serving; that fails fast — the child is killed and waited and
 /// the panic names the args — instead of hanging the suite. Returns
-/// the captured stderr for further assertions.
+/// the captured stderr for further assertions. The child rides in a
+/// `ChildGuard` from spawn, so a panic at the poll, the stderr read,
+/// or either assertion is still reaped; the explicit kill/wait in the
+/// wrongly-accepted branch is safely idempotent under Drop (`kill`
+/// errors are ignored and `wait` returns the cached status).
 fn run_rejects(args: &[&str], needle: &str) -> String {
-    let mut child = spawn(args);
+    let mut child = ChildGuard::spawn(args);
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
         match child.try_wait().expect("poll") {
@@ -214,13 +233,14 @@ fn one_port_zero_udp_and_port_zero_ws_listen_serves() {
 
 #[test]
 fn same_room_listeners_on_two_distinct_concrete_addresses_serve() {
-    let first = free_addr();
-    // The kernel may hand back the just-released port: acquire until
-    // the two concrete addresses genuinely differ.
-    let second = (0..10)
-        .map(|_| free_addr())
-        .find(|candidate| *candidate != first)
-        .expect("two distinct free addresses");
+    // Both probe sockets are bound at once: the two concrete addresses
+    // are distinct by construction, then released immediately before
+    // the child needs them.
+    let probes = ProbeSockets::bind(2);
+    let addrs = probes.addrs();
+    let (first, second) = (addrs[0], addrs[1]);
+    assert_ne!(first, second, "simultaneously bound probes differ");
+    drop(probes);
     let first_spec = format!("arena={first}");
     let second_spec = format!("arena={second}");
     let mut child = ChildGuard::spawn(&[
@@ -276,23 +296,38 @@ fn malformed_udp_specs_are_rejected() {
 
 #[test]
 fn duplicate_and_conflicting_binds_are_rejected() {
+    // Kernel-assigned addresses even though these reject before bind:
+    // the suite carries no fixed-port assumptions.
+    let duplicate = {
+        let probes = ProbeSockets::bind(1);
+        let addr = probes.addrs()[0];
+        drop(probes);
+        format!("arena={addr}")
+    };
     run_rejects(
         &[
             "serve",
             "--udp",
-            "arena=127.0.0.1:19999",
+            duplicate.as_str(),
             "--udp",
-            "arena=127.0.0.1:19999",
+            duplicate.as_str(),
         ],
         "duplicate UDP bind address",
     );
+    let conflict = {
+        let probes = ProbeSockets::bind(1);
+        let addr = probes.addrs()[0];
+        drop(probes);
+        addr.to_string()
+    };
+    let conflict_spec = format!("arena={conflict}");
     run_rejects(
         &[
             "serve",
             "--listen",
-            "127.0.0.1:19998",
+            conflict.as_str(),
             "--udp",
-            "arena=127.0.0.1:19998",
+            conflict_spec.as_str(),
         ],
         "conflicts with the WebSocket listen",
     );
@@ -315,8 +350,9 @@ fn websocket_only_serve_prints_line_and_stays_up() {
 fn udp_bind_failure_prints_no_websocket_startup_line() {
     // A foreign process holds the concrete port: the kernel rejects
     // what CLI validation cannot see, and no startup line may precede
-    // the failure.
-    let occupied = std::net::UdpSocket::bind(free_addr()).expect("preoccupy the port");
+    // the failure. The occupying socket is bound directly at port zero
+    // and held continuously through the child's rejection.
+    let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("preoccupy the port");
     let spec = format!("arena={}", occupied.local_addr().expect("occupied address"));
     let stderr = run_rejects(
         &["serve", "--listen", "127.0.0.1:0", "--udp", spec.as_str()],
