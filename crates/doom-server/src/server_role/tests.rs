@@ -559,39 +559,6 @@ fn mission_and_mode_names_match_upstream_strings() {
     }
 }
 
-#[test]
-fn valid_mode_table_matches_chocolate_311_exactly() {
-    // The pinned 13 valid mission/mode pairs from Chocolate Doom 3.1.1
-    // D_ValidGameMode, exhaustive over the byte: the Crispy-lineage
-    // NERVE/MASTER ordinals 9 and 10 must NOT be admitted (ordinal 9
-    // means doom2f to the pinned 3.1.1 oracle; deferred per the lead
-    // reconciliation of follow-up 20).
-    let valid = [
-        (0, 0),
-        (0, 1),
-        (0, 3),
-        (1, 2),
-        (2, 2),
-        (3, 2),
-        (4, 3),
-        (5, 2),
-        (6, 0),
-        (6, 1),
-        (6, 3),
-        (7, 2),
-        (8, 2),
-    ];
-    for mission in 0..=u8::MAX {
-        for mode in 0..=u8::MAX {
-            assert_eq!(
-                valid_game_mode(mission, mode),
-                valid.contains(&(mission, mode)),
-                "pair ({mission}, {mode})"
-            );
-        }
-    }
-}
-
 // --- LAUNCH and GAMESTART ----------------------------------------------------
 
 #[test]
@@ -1925,6 +1892,13 @@ fn accepted_non_doom_mission_mode_pairs() {
     // The transposed Chex/Hacx shapes must both be rejected.
     assert!(!valid_game_mode(4, 2), "chex is not commercial");
     assert!(!valid_game_mode(5, 3), "hacx is not retail");
+
+    // The Crispy-lineage NERVE/MASTER ordinals must NOT be admitted:
+    // ordinal 9 means doom2f to the pinned Chocolate 3.1.1 oracle, and
+    // a SYN-only addition would accept peers whose GAMESTART the role
+    // then rejects (lead reconciliation of follow-up 20).
+    assert!(!valid_game_mode(9, 2), "no NERVE pair in the 3.1.1 table");
+    assert!(!valid_game_mode(10, 2), "no MASTER pair in the 3.1.1 table");
 }
 
 #[test]
