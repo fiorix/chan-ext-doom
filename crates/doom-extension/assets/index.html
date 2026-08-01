@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Doomit</title>
+    <link rel="stylesheet" href="app.css">
+  </head>
+  <body>
+    <main>
+      <aside id="lobby">
+        <header>
+          <div>
+            <p class="eyebrow">Chan extension</p>
+            <h1>Doomit</h1>
+          </div>
+          <span id="online" class="pill offline">offline</span>
+        </header>
+
+        <section>
+          <h2>Server</h2>
+          <dl id="server-status">
+            <div><dt>Phase</dt><dd id="phase">idle</dd></div>
+            <div><dt>Controller</dt><dd id="controller">none</dd></div>
+            <div><dt>Players</dt><dd id="player-count">0</dd></div>
+            <div><dt>Spectators</dt><dd id="spectator-count">0</dd></div>
+            <div><dt>Runtime</dt><dd id="fingerprint">shareware 1.9</dd></div>
+          </dl>
+        </section>
+
+        <section>
+          <h2>Lobby</h2>
+          <label>Mode
+            <select id="mode">
+              <option value="coop">Co-op</option>
+              <option value="deathmatch">Deathmatch</option>
+            </select>
+          </label>
+          <label>Start at
+            <select id="target">
+              <option>2</option><option>3</option><option>4</option>
+            </select>
+          </label>
+          <div class="actions">
+            <button id="solo">Play solo</button>
+            <button id="join">Join session</button>
+            <button id="spectate">Spectate</button>
+            <button id="leave" class="danger" disabled>Leave</button>
+          </div>
+        </section>
+
+        <section class="roster-section">
+          <h2>Session participants</h2>
+          <ul id="roster"><li class="muted">Waiting for Chan session context</li></ul>
+        </section>
+      </aside>
+
+      <section id="stage" aria-label="Doom game">
+        <div id="empty">
+          <strong>Ready when you are.</strong>
+          <span>Play solo or join the shared Chan session.</span>
+        </div>
+        <pre id="log" aria-live="polite"></pre>
+      </section>
+    </main>
+
+    <div id="confirm" class="modal" hidden>
+      <div role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+        <h2 id="confirm-title">Replace the running game?</h2>
+        <p id="confirm-copy"></p>
+        <div class="actions"><button id="cancel-confirm">Cancel</button><button id="accept-confirm" class="danger">Continue</button></div>
+      </div>
+    </div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

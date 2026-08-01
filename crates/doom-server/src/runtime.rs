@@ -51,6 +51,78 @@ impl From<JoinError> for JoinRefusal {
 #[derive(Clone)]
 pub(crate) struct SharedState(pub(crate) Arc<Mutex<Runtime>>);
 
+/// Embeddable WebSocket server role. The owner mounts each upgrade under its
+/// own HTTP router and keeps [`Server::run`] in its task tree.
+#[derive(Clone)]
+pub struct Server {
+    state: SharedState,
+}
+
+impl Server {
+    /// Creates an empty multi-room server with a bounded per-peer outbox.
+    pub fn new(outbox_capacity: NonZeroUsize) -> Self {
+        Self {
+            state: SharedState(Arc::new(Mutex::new(Runtime {
+                rooms: HashMap::new(),
+                outbox_capacity,
+                started: Instant::now(),
+                next_listener: 0,
+                udp_notifiers: HashMap::new(),
+            }))),
+        }
+    }
+
+    /// Drives room timers until this future is cancelled.
+    pub async fn run(&self) {
+        timer_loop(self.state.clone()).await;
+    }
+
+    /// Handles one already-authorized WebSocket upgrade in `room`.
+    pub fn websocket(
+        &self,
+        websocket: axum::extract::ws::WebSocketUpgrade,
+        room: RoomName,
+    ) -> axum::response::Response {
+        crate::websocket::upgrade_room(websocket, self.state.clone(), room)
+    }
+
+    /// Returns the current protocol snapshot, or `None` when no peer retains
+    /// the room.
+    pub async fn room_snapshot(&self, room: &RoomName) -> Option<crate::server_role::RoomSnapshot> {
+        self.state
+            .0
+            .lock()
+            .await
+            .rooms
+            .get(room)
+            .map(|room| room.host.snapshot())
+    }
+
+    /// Drops one embedded WebSocket room and wakes every connection so its
+    /// upgrade task closes. This is intended for an embedding host's own
+    /// tenancy/lifetime boundary; standalone listeners retain their ordinary
+    /// protocol-driven lifecycle.
+    pub async fn close_room(&self, room: &RoomName) {
+        let waiters = self
+            .state
+            .0
+            .lock()
+            .await
+            .rooms
+            .remove(room)
+            .map(|room| {
+                room.connections
+                    .into_values()
+                    .map(|connection| connection.waiter)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for waiter in waiters {
+            waiter.notify_one();
+        }
+    }
+}
+
 /// One configured UDP listener's future: it resolves only when its
 /// socket fails or closes, which must end the shared service.
 pub(crate) type ListenerFuture =
@@ -65,16 +137,11 @@ pub async fn serve(
     udp_listeners: Vec<(RoomName, tokio::net::UdpSocket)>,
     outbox_capacity: NonZeroUsize,
 ) -> std::io::Result<()> {
-    let state = SharedState(Arc::new(Mutex::new(Runtime {
-        rooms: HashMap::new(),
-        outbox_capacity,
-        started: Instant::now(),
-        next_listener: 0,
-        udp_notifiers: HashMap::new(),
-    })));
+    let embedded = Server::new(outbox_capacity);
+    let state = embedded.state.clone();
     let router = crate::websocket::router(state.clone());
     let server = axum::serve(listener, router).into_future();
-    let timer = timer_loop(state.clone());
+    let timer = embedded.run();
     let udp = udp_supervisor(
         udp_listeners
             .into_iter()
@@ -524,5 +591,32 @@ pub(crate) fn classify_malformed(payload: &[u8]) -> MalformedClass {
     match magic {
         Some(OLD_SYN_MAGIC) => MalformedClass::Syn { old_magic: true },
         _ => MalformedClass::Syn { old_magic: false },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_room_close_drops_state_and_wakes_connections() {
+        let server = Server::new(NonZeroUsize::new(4).expect("nonzero"));
+        let room = RoomName::try_from("chan-session").expect("room name");
+        let waiter = Arc::new(Notify::new());
+        server
+            .state
+            .0
+            .lock()
+            .await
+            .join(room.clone(), Arc::clone(&waiter))
+            .expect("join room");
+        assert!(server.room_snapshot(&room).await.is_some());
+
+        server.close_room(&room).await;
+
+        assert!(server.room_snapshot(&room).await.is_none());
+        tokio::time::timeout(std::time::Duration::from_millis(50), waiter.notified())
+            .await
+            .expect("connection writer was woken");
     }
 }

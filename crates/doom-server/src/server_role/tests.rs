@@ -795,6 +795,24 @@ fn controller_handoff_to_next_oldest() {
 }
 
 #[test]
+fn status_snapshot_is_read_only_protocol_state() {
+    let mut h = Harness::new();
+    let alice = h.join("a");
+    h.syn(alice, "Alice");
+
+    let snapshot = h.role.snapshot();
+    assert_eq!(snapshot.state, ServerState::WaitingLaunch);
+    assert_eq!(snapshot.peers.len(), 1);
+    assert_eq!(snapshot.peers[0].id, alice);
+    assert_eq!(snapshot.peers[0].name, "Alice");
+    assert!(snapshot.peers[0].connected);
+    assert!(snapshot.peers[0].controller);
+    assert!(!snapshot.peers[0].drone);
+    assert_eq!(snapshot.wad_sha1, Some([7; 20]));
+    assert_eq!(snapshot.deh_sha1, Some([8; 20]));
+}
+
+#[test]
 fn disconnect_during_start_aborts_and_cleans_drones() {
     let mut h = Harness::new();
     let alice = h.join("a");

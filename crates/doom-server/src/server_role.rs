@@ -175,6 +175,29 @@ pub enum ServerState {
     InGame,
 }
 
+/// Read-only peer state for adapters and status surfaces. Names are volatile
+/// protocol labels and carry no authentication meaning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerSnapshot {
+    pub id: PlayerId,
+    pub name: String,
+    pub connected: bool,
+    pub drone: bool,
+    pub ready: bool,
+    pub controller: bool,
+}
+
+/// Read-only room state. It deliberately excludes packet queues and transport
+/// identities so embedding surfaces cannot become coupled to runtime internals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomSnapshot {
+    pub state: ServerState,
+    pub peers: Vec<PeerSnapshot>,
+    pub deathmatch: Option<bool>,
+    pub wad_sha1: Option<[u8; 20]>,
+    pub deh_sha1: Option<[u8; 20]>,
+}
+
 /// The pinned connection lifecycle for one peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Conn {
@@ -440,6 +463,37 @@ impl ServerRole {
             .filter(|(_, peer)| peer.is_player())
             .min_by_key(|(_, peer)| peer.order)
             .map(|(player, _)| *player)
+    }
+
+    /// Snapshot lobby and game state without exposing the mutable role.
+    pub fn snapshot(&self) -> RoomSnapshot {
+        let controller = self.controller();
+        let peers = self
+            .peers
+            .iter()
+            .map(|(id, peer)| PeerSnapshot {
+                id: *id,
+                name: String::from_utf8_lossy(&peer.name).into_owned(),
+                connected: peer.connected(),
+                drone: peer.drone,
+                ready: peer.ready,
+                controller: controller == Some(*id),
+            })
+            .collect();
+        let checksums = self
+            .peers
+            .values()
+            .find(|peer| peer.connected() && !peer.drone);
+        RoomSnapshot {
+            state: self.state,
+            peers,
+            deathmatch: self
+                .settings
+                .as_ref()
+                .map(|settings| settings.deathmatch != 0),
+            wad_sha1: checksums.map(|peer| peer.wad_sha1),
+            deh_sha1: checksums.map(|peer| peer.deh_sha1),
+        }
     }
 
     /// Handle one input against the caller's clock.

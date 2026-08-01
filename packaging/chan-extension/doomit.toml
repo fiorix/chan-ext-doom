@@ -1,0 +1,4 @@
+name = "Doomit"
+command = "/absolute/path/to/doomit-extension"
+args = []
+capabilities = ["session-context", "presentation"]

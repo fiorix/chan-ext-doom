@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/doom-embed",
+    "crates/doom-extension",
     "crates/doom-proto",
     "crates/doom-server",
 ]

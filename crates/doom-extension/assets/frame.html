@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <base href="./">
+    <title>Doom engine</title>
+    <style>
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; }
+      body { display: grid; place-items: center; }
+      canvas { width: 100%; height: 100%; border: 0; outline: 0; object-fit: contain; image-rendering: pixelated; }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+    <script src="doom.js"></script>
+    <script>
+      const nonce = window.name;
+      window.name = "";
+      const canvas = document.getElementById("canvas");
+      let started = false;
+      let engine = null;
+      let hostKeys = [];
+
+      function report(type, detail = {}) {
+        parent.postMessage({ type, nonce, ...detail }, "*");
+      }
+
+      function sameKey(event, key) {
+        return event.code === key.code && event.ctrlKey === key.ctrlKey &&
+          event.altKey === key.altKey && event.metaKey === key.metaKey &&
+          event.shiftKey === key.shiftKey;
+      }
+
+      window.addEventListener("keydown", (event) => {
+        if (hostKeys.some((key) => sameKey(event, key))) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          report("chan:extension-keydown:v1", {
+            key: event.key,
+            code: event.code,
+            ctrlKey: event.ctrlKey,
+            altKey: event.altKey,
+            metaKey: event.metaKey,
+            shiftKey: event.shiftKey,
+            repeat: event.repeat,
+          });
+          return;
+        }
+        if (event.key === " " || event.key.startsWith("Arrow")) event.preventDefault();
+      }, true);
+
+      function setAudioActive(active) {
+        const context = engine?.SDL2?.audioContext || globalThis.SDL2?.audioContext;
+        if (!context) return;
+        if (active && context.state === "suspended") void context.resume();
+        if (!active && context.state === "running") void context.suspend();
+      }
+
+      window.addEventListener("message", (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.nonce !== nonce) return;
+        if (message.type === "chan:extension-host-keymap:v1") {
+          hostKeys = Array.isArray(message.keys) ? message.keys : [];
+          return;
+        }
+        if (message.type === "chan:extension-view-state:v1") {
+          setAudioActive(message.active === true);
+          return;
+        }
+        if (message.type !== "doom-launch" || started) return;
+        started = true;
+        Module({
+          canvas,
+          arguments: message.argv,
+          print: (text) => report("doom-log", { stream: "out", text }),
+          printErr: (text) => report("doom-log", { stream: "err", text }),
+          preRun: [(runtime) => {
+            for (const file of message.files) {
+              runtime.FS.writeFile(file.path, new Uint8Array(file.bytes));
+            }
+          }],
+          onRuntimeInitialized: () => {
+            canvas.focus();
+            report("doom-started");
+          },
+        }).then((runtime) => { engine = runtime; }).catch((error) => {
+          report("doom-log", { stream: "err", text: `engine failed: ${error}` });
+        });
+      });
+
+      report("doom-frame-ready");
+    </script>
+  </body>
+</html>

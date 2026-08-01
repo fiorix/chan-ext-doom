@@ -31,13 +31,14 @@ All solid links are implemented. The dotted link is the cooperative same-origin 
 ## Layout
 
 - `engine/`: GPL-2.0 engine fork, client-only browser loader, native SDL_net target, restored Chocolate netcode, WebSocket transport, deterministic canaries, and build/test recipes.
+- `crates/doom-extension/`: the independently installed Chan adapter, scoped lobby, extension UI, and verified runtime-data server.
 - `crates/doom-server/`: bounded room core, Chocolate server role, shared WebSocket and UDP `RoomHost` bindings, and the `doomd` CLI.
 - `crates/doom-proto/`: byte-exact directional Chocolate packet codec plus fixture-integrity checks.
 - `crates/doom-embed/`: a buildable crate scaffold. A wasmtime host is not implemented.
 - `fixtures/`: 113 curated datagrams from seven Chocolate Doom 3.1.1 sessions, with capture/export tooling and provenance.
 - `docs/`: the living design, observed protocol inventory, mod catalog, and reproduction notes.
 
-The [design](docs/design.md) defines the current component contracts and remaining extension boundaries. The selected PWAD validation set and its provenance are in [docs/mods.md](docs/mods.md).
+The [design](docs/design.md) defines the current component contracts. The [Chan extension](docs/chan-extension.md) defines the adapter and host boundary. The selected PWAD validation set and its provenance are in [docs/mods.md](docs/mods.md).
 
 Contributor conventions are in [CONTRIBUTING.md](CONTRIBUTING.md). Development history is confined to [CHANGELOG.md](CHANGELOG.md).
 

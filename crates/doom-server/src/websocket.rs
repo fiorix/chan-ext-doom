@@ -164,9 +164,17 @@ async fn upgrade(
 ) -> Result<Response, axum::http::StatusCode> {
     let room_name =
         RoomName::try_from(room_name.as_str()).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-    Ok(websocket
+    Ok(upgrade_room(websocket, state, room_name))
+}
+
+pub(crate) fn upgrade_room(
+    websocket: WebSocketUpgrade,
+    state: ServerState,
+    room_name: RoomName,
+) -> Response {
+    websocket
         .max_message_size(MAX_INBOUND_FRAME_LEN)
-        .on_upgrade(move |socket| session(socket, state, room_name)))
+        .on_upgrade(move |socket| session(socket, state, room_name))
 }
 
 async fn session(socket: WebSocket, state: ServerState, room_name: RoomName) {

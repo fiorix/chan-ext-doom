@@ -173,6 +173,11 @@ impl<Metadata: Clone> RoomHost<Metadata> {
         self.role.query_response()
     }
 
+    /// Read-only status snapshot for an embedding adapter.
+    pub fn snapshot(&self) -> crate::server_role::RoomSnapshot {
+        self.role.snapshot()
+    }
+
     /// Admission: bounded registry membership first, then exactly one
     /// `Input::Join`; a failed admission never reaches the role. The
     /// label is volatile lobby metadata computed from the new id.
