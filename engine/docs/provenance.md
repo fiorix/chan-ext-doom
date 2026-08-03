@@ -318,8 +318,8 @@ Reproduced from this tree with emscripten 6.0.3. These are the artifacts the rec
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188773 | 692d05e8eb96d913cd3f3f66e10fd66cdaca2b947318463166847ae3cdebe84b |
-| doom.wasm | 1690108 | 814929d027480cf74c6734d3ece5b42c62c46d3d21a35fea15d79e16ee1dc009 |
+| doom.js | 188773 | 570ab64917c90d173d5c31e859b511cbf758497b482a87fdc0a3d093416f804d |
+| doom.wasm | 1690113 | 11464889f0ef793562c97336aaa1657e89a07b9f8b53bd360982fe824d346e4b |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
@@ -365,7 +365,7 @@ Serve them over `http://localhost`. Both `crypto.subtle`, used for the content h
 
 ### IWAD
 
-Shareware `DOOM1.WAD` v1.9: 4196020 bytes, sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`. Source: `https://www.doomworld.com/3ddownloads/ports/shareware_doom_iwad.zip`. The idgames `doom19s.zip` is the 1995 installer and its WAD is DEICE-packed, so it is not usable directly.
+Shareware `doom1.wad` v1.9: 4196020 bytes, sha1 `5b2e249b9c5133ec987b3ea77596381dc0d6bc1d`, sha256 `1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771`. Source: `https://www.doomworld.com/3ddownloads/ports/shareware_doom_iwad.zip`. The idgames `doom19s.zip` is the 1995 installer and its WAD is DEICE-packed, so it is not usable directly.
 
 ## Tests
 

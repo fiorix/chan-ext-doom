@@ -2,6 +2,14 @@
 
 This file records notable development history and design decisions. Reference documentation describes only the repository's current behavior and contracts.
 
+## 2026-08-03
+
+### Chan extension
+
+- Re-pinned the emsdk 6.0.3 browser artifacts after later engine changes made the previous allowlist reject reproducible builds, and tied the executable pins to the provenance record with a regression test.
+- Verified discovery, capability proxying, tenant-scoped WebSockets, command launch, session context, engine rendering, presentation, and process shutdown against Chan v0.83.0.
+- Fixed the empty-state copy remaining visible over the running game.
+
 ## 2026-07-29
 
 ### Rust protocol and server role

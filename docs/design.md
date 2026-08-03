@@ -4,7 +4,7 @@ This document is the living specification for doomit's component boundaries, pro
 
 ## Purpose
 
-doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer restored and a Rust crate family that separates room transport, protocol handling, and native embedding. Browser and native engines act as Chocolate clients of the Rust server role. The crate boundaries also support embedding in Rust applications without making chan a dependency.
+doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer restored and a Rust crate family that separates room transport, protocol handling, Chan integration, and native embedding. Browser and native engines act as Chocolate clients of the Rust server role. The crate boundaries also support embedding in Rust applications without making Chan a dependency of the protocol or server core.
 
 ## Design principles
 
@@ -14,7 +14,7 @@ doomit provides a buildable DOOM engine fork with Chocolate Doom multiplayer res
 - Size the room layer for Chocolate's `NET_MAXPLAYERS` value of eight while respecting the engine's four-player in-game limit.
 - Treat the shareware Doom 1.9 IWAD as pinned runtime data and PWAD identity as part of multiplayer agreement.
 - Make deterministic behavior observable through independent input-history and simulation-state digests.
-- Keep chan integration outside this repository and expose narrow library boundaries that a consumer can adapt.
+- Keep Chan integration in an independently installed adapter over narrow host and library boundaries.
 
 ## Current system
 
@@ -26,6 +26,8 @@ The WebSocket binding owns route envelopes and route identity. Route 1 is perman
 
 The browser loader validates the pinned shareware IWAD, manages ordered PWADs, normalizes Chocolate's merge-before-file precedence, fingerprints the effective mod configuration, and replaces the engine iframe when configuration changes. It launches multiplayer tabs with the same client-only network arguments and compares exit digests between two cooperating same-origin pages.
 
+`doom-extension` adapts the browser engine and `doom-server` to Chan extensions v1. It verifies the pinned runtime data before advertising an ephemeral loopback endpoint, isolates lobbies by Chan's private tenant scope, and keeps the engine inside the opaque extension iframe. Installation remains independent: Chan does not bundle or install Doomit.
+
 The fixture set contains 113 curated native UDP datagrams from seven Chocolate Doom 3.1.1 sessions. `doom-proto` provides the directional byte-exact packet codec used by the server role and bindings, plus fixture membership, length, header, and hash checks. `doom-embed` remains a buildable crate scaffold without a wasmtime host.
 
 ## Repository shape
@@ -34,18 +36,20 @@ The fixture set contains 113 curated native UDP datagrams from seven Chocolate D
 fiorix/doomit
 ├── engine/                         # GPL-2.0 client engine, browser loader, native target, tests
 ├── crates/
+│   ├── doom-extension/             # independently installed Chan adapter and extension UI
 │   ├── doom-proto/                 # byte-exact Chocolate packet codec and fixture checks
 │   ├── doom-server/                # room core, Rust server role, WS/UDP bindings, doomd CLI
 │   └── doom-embed/                 # native-host crate scaffold
 ├── fixtures/                       # captured Chocolate packet evidence
 ├── docs/
 │   ├── protocol.md                 # observed, source-grounded, and integration wire inventory
+│   ├── chan-extension.md           # Chan host, lobby, iframe, and distribution contract
 │   ├── verification.md             # fixture capture and validation procedure
 │   └── mods.md                     # selected PWAD contract and provenance
 └── scripts/gate.sh                 # Rust formatting, lint, and test gate
 ```
 
-Nothing in `crates/` depends on chan.
+No crate imports Chan libraries. `doom-extension` speaks the external extensions-v1 process, HTTP, WebSocket, and iframe contract.
 
 ## Component contracts
 
@@ -74,6 +78,10 @@ The codec uses fixed-width field operations rather than C layout, transmute, or 
 ### Native embedding
 
 The native embedding boundary is designed as an optional wasmtime host for the engine WebAssembly artifact. Host callbacks provide framebuffer, audio, and input, while network imports map to a transport abstraction. Bot clients use the same boundary for scale and deterministic tests. Wasmtime remains isolated in this crate so consumers that only need the room server do not take the dependency.
+
+### Chan extension
+
+The independently installed adapter owns the extensions-v1 handshake, verified runtime-data service, tenant-scoped lobby, host message bridge, and nested engine lifecycle. Chan owns discovery, supervision, capability proxying, session context, commands, presentation, and the outer sandbox. The complete boundary is defined in [`chan-extension.md`](chan-extension.md).
 
 ## Protocol and transport strategy
 
@@ -112,10 +120,6 @@ Changing the set restarts the engine instance. The loader does not claim hot unl
 
 Implement the wasmtime host and bot client boundary, then exercise eight-room capacity, sustained lockstep, stalled-peer removal, and deterministic mod behavior without requiring eight human players.
 
-### chan adapter
-
-Expose the sans-I/O room and server-role core through a chan-owned route and lobby UI. The chan SPA origin treats the browser canary as a cooperative desync aid, not as a security signal.
-
 ## Verification model
 
 Implemented checks cover fixture integrity, byte-exact packet round trips, malformed-input rejection, the sans-I/O server lifecycle, cumulative tic windows, reliable sequencing, shared WebSocket/UDP room behavior, route ownership, listener identity, bounded queues, CLI lifecycle, engine transport framing, loader configuration, deterministic canary serialization, and multi-page verdict convergence. Browser builds are pinned by exact artifact hashes under emsdk 6.0.3, and the native target is reproducible from the same tree.
@@ -136,7 +140,6 @@ The end-to-end browser invariant is bilateral agreement at the same exit: both p
 
 - [`../roadmap/doom-multiplayer.md`](../roadmap/doom-multiplayer.md): superseded grounding analysis that produced this design.
 - [`../roadmap/design-review-2026-07-27.md`](../roadmap/design-review-2026-07-27.md): accepted decision audit for this design.
-- [`../roadmap/doom-overlay-remote-protocol.md`](../roadmap/doom-overlay-remote-protocol.md): registered future chan integration item.
 - https://github.com/cloudflare/doom-wasm: browser multiplayer precedent.
 - https://blog.cloudflare.com/doom-multiplayer-workers/: room-router precedent.
 - https://github.com/rojo2/wasm-doom: engine base.
