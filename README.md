@@ -11,7 +11,7 @@ curl -fsSL https://github.com/fiorix/doomit/releases/latest/download/install.sh 
 chan devserver --restart
 ```
 
-The installer detects Linux x86_64 or arm64, Windows x86_64 under Git Bash, and macOS arm64. It verifies the selected archive against the release checksums, writes the executable and sidecars under `~/.local/lib/doomit`, and writes the declaration at `~/.chan/extensions/doomit.toml`. Pin a release with `curl -fsSL https://github.com/fiorix/doomit/releases/latest/download/install.sh | DOOMIT_VERSION=v0.1.0 bash`, or override the roots with `DOOMIT_INSTALL_ROOT` and `CHAN_HOME`.
+The installer detects Linux x86_64 or arm64, Windows x86_64 under Git Bash, and macOS arm64. It verifies the selected archive against the release checksums, writes the executable and sidecars under `~/.local/lib/doomit`, and writes the declaration at `~/.chan/extensions/doomit.toml`. Pin a release with `curl -fsSL https://github.com/fiorix/doomit/releases/latest/download/install.sh | DOOMIT_VERSION=v0.2.0 bash`, or override the roots with `DOOMIT_INSTALL_ROOT` and `CHAN_HOME`.
 
 To build the extension from a checkout instead, run `./scripts/install-chan-extension.sh`.
 
