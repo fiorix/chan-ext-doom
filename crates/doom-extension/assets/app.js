@@ -342,12 +342,28 @@ function updateSettings() {
     target: Number(el("target").value),
   }).catch((error) => log(error.message));
 }
+
+function toggleOverlay(toggle, className, label, glyphs) {
+  const collapsed = document.body.classList.toggle(className);
+  toggle.textContent = glyphs[collapsed ? 0 : 1];
+  toggle.title = `${collapsed ? "Show" : "Hide"} ${label}`;
+  toggle.setAttribute("aria-label", toggle.title);
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  // Doom only sees keys while the engine frame holds focus, and clicking a
+  // toggle took it away.
+  state.frame?.contentWindow?.focus();
+}
+
 el("mode").addEventListener("change", updateSettings);
 el("target").addEventListener("change", updateSettings);
 el("solo").addEventListener("click", () => void launch("solo").catch((error) => log(error.message)));
 el("join").addEventListener("click", () => void launch("player").catch((error) => log(error.message)));
 el("spectate").addEventListener("click", () => void launch("spectator").catch((error) => log(error.message)));
 el("leave").addEventListener("click", () => void stopGame({ confirm: true }));
+el("toggle-lobby").addEventListener("click", () =>
+  toggleOverlay(el("toggle-lobby"), "lobby-collapsed", "lobby", ["❯", "❮"]));
+el("toggle-log").addEventListener("click", () =>
+  toggleOverlay(el("toggle-log"), "log-collapsed", "console", ["▴", "▾"]));
 el("cancel-confirm").addEventListener("click", () => finishConfirm(false));
 el("accept-confirm").addEventListener("click", () => finishConfirm(true));
 

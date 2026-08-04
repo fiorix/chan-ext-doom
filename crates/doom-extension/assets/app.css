@@ -13,6 +13,8 @@ html, body, main { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { background: var(--bg); color: var(--ink); }
 main { display: grid; grid-template-columns: minmax(250px, 330px) 1fr; }
 #lobby { min-height: 0; overflow: auto; padding: 16px; border-right: 1px solid var(--line); background: var(--panel); }
+body.lobby-collapsed main { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+body.lobby-collapsed #lobby { display: none; }
 header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 h1, h2, p { margin: 0; }
 h1 { font-size: 22px; letter-spacing: .08em; text-transform: uppercase; }
@@ -37,10 +39,15 @@ button.danger { border-color: #69352f; }
 #roster small, .muted { color: var(--muted); }
 #stage { position: relative; min-width: 0; min-height: 0; margin: 0; background: #000; }
 #stage iframe { width: 100%; height: 100%; border: 0; display: block; }
+.toggle { position: absolute; top: 8px; z-index: 10; width: 24px; min-height: 24px; padding: 0; background: rgb(0 0 0 / .55); line-height: 1; opacity: .35; }
+.toggle:hover, .toggle:focus-visible { opacity: 1; }
+#toggle-lobby { left: 8px; }
+#toggle-log { left: 38px; }
 #empty { position: absolute; inset: 0; display: grid; place-content: center; gap: 5px; text-align: center; color: var(--muted); }
 #empty[hidden] { display: none; }
 #empty strong { color: var(--ink); }
 #log { position: absolute; left: 0; right: 0; bottom: 0; max-height: 25%; overflow: auto; margin: 0; padding: 7px 9px; background: rgb(0 0 0 / .78); color: #aaa; font: 11px/1.3 inherit; pointer-events: none; white-space: pre-wrap; }
+body.log-collapsed #log { display: none; }
 .modal { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / .7); }
 .modal[hidden] { display: none; }
 .modal > div { width: min(420px, 100%); padding: 18px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); }
