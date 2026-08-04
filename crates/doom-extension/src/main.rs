@@ -75,12 +75,12 @@ const ASSET_PINS: [AssetPin; 3] = [
     AssetPin {
         name: "doom.js",
         bytes: 188_773,
-        sha256: "570ab64917c90d173d5c31e859b511cbf758497b482a87fdc0a3d093416f804d",
+        sha256: "692d05e8eb96d913cd3f3f66e10fd66cdaca2b947318463166847ae3cdebe84b",
     },
     AssetPin {
         name: "doom.wasm",
-        bytes: 1_690_113,
-        sha256: "11464889f0ef793562c97336aaa1657e89a07b9f8b53bd360982fe824d346e4b",
+        bytes: 1_690_108,
+        sha256: "814929d027480cf74c6734d3ece5b42c62c46d3d21a35fea15d79e16ee1dc009",
     },
     AssetPin {
         name: "doom1.wad",
@@ -925,6 +925,23 @@ mod tests {
             assert!(
                 documented,
                 "engine provenance is missing the {} runtime pin",
+                pin.name
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_runtime_assets_match_pins() {
+        let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+        for pin in &ASSET_PINS {
+            let path = runtime.join(pin.name);
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            assert_eq!(bytes.len(), pin.bytes, "{} byte count", pin.name);
+            assert_eq!(
+                hex(&Sha256::digest(&bytes)),
+                pin.sha256,
+                "{} hash",
                 pin.name
             );
         }

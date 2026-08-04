@@ -2,6 +2,13 @@
 
 This file records notable development history and design decisions. Reference documentation describes only the repository's current behavior and contracts.
 
+## 2026-08-04
+
+### Chan extension
+
+- Added the pinned browser engine outputs, unmodified shareware IWAD, redistribution notice, and a local Chan installer so a checkout contains the complete extension runtime.
+- Corrected the executable allowlist to the byte-identical result of two fresh builds with the documented emsdk 6.0.3 release and added a regression test over the tracked sidecars.
+
 ## 2026-08-03
 
 ### Chan extension

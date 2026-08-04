@@ -238,7 +238,7 @@ The fingerprint is JSON rather than delimiter-joined fields. A filename may legi
 
 | tool | version used | source |
 |------------|--------------|-------------------------------------------|
-| emscripten | 6.0.3 | emsdk at `~/dev/emsdk` |
+| emscripten | 6.0.3 (`283e2d130132859fde6a4e4c87fd254b38127651`) | emsdk release `9074aa513b501925adb1361e208932ad32a29a5f` |
 | node | 22.16.0 | bundled in emsdk, used by emcc internally |
 
 Install the pinned version explicitly. `latest` is a moving alias and will not reproduce the hashes below.
@@ -250,7 +250,7 @@ git clone https://github.com/emscripten-core/emsdk ~/dev/emsdk
 
 ## Browser build
 
-Run from `engine/`. Outputs land in `engine/out/`, which is a build directory and is never committed.
+Run from `engine/`. Outputs land in `engine/out/`, which is a build directory and is never committed. Verified copies for the Chan extension live under `runtime/`.
 
 ```sh
 source ~/dev/emsdk/emsdk_env.sh
@@ -314,12 +314,12 @@ CMake compiles each translation unit to its own object and `wasm-ld` merges them
 
 ### Expected output
 
-Reproduced from this tree with emscripten 6.0.3. These are the artifacts the recipe is expected to produce, not artifacts published anywhere.
+Reproduced twice from this tree with the emscripten build identified in the prerequisites. The tracked copies under `runtime/` contain these exact bytes.
 
 | file | bytes | sha256 |
 |-----------|---------|------------------------------------------------------------------|
-| doom.js | 188773 | 570ab64917c90d173d5c31e859b511cbf758497b482a87fdc0a3d093416f804d |
-| doom.wasm | 1690113 | 11464889f0ef793562c97336aaa1657e89a07b9f8b53bd360982fe824d346e4b |
+| doom.js | 188773 | 692d05e8eb96d913cd3f3f66e10fd66cdaca2b947318463166847ae3cdebe84b |
+| doom.wasm | 1690108 | 814929d027480cf74c6734d3ece5b42c62c46d3d21a35fea15d79e16ee1dc009 |
 
 Hashes are pinned to emscripten 6.0.3. A toolchain bump changes them; re-record rather than assume drift is a defect.
 
