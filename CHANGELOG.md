@@ -6,6 +6,7 @@ This file records notable development history and design decisions. Reference do
 
 ### Chan extension
 
+- Added native GitHub release archives for Linux x86_64 and arm64, Windows x86_64, and macOS arm64, plus a checksum-verifying installer that writes the extension into Chan's local discovery path.
 - Added the pinned browser engine outputs, unmodified shareware IWAD, redistribution notice, and a local Chan installer so a checkout contains the complete extension runtime.
 - Corrected the executable allowlist to the byte-identical result of two fresh builds with the documented emsdk 6.0.3 release and added a regression test over the tracked sidecars.
 

@@ -1,3 +1,5 @@
 /target
 /engine/out
 **/*.rs.bk
+**/__pycache__/
+*.py[cod]

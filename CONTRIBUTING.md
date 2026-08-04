@@ -27,3 +27,7 @@ npm test
 ```
 
 Engine build and artifact verification commands are documented in [`engine/docs/provenance.md`](engine/docs/provenance.md).
+
+## Releases
+
+Release tags must match the workspace version as `vMAJOR.MINOR.PATCH`. A tag runs the native Linux x86_64, Linux arm64, Windows x86_64, and macOS arm64 builds, packages the tracked runtime and corresponding engine source, and publishes the archives with `install.sh` and `SHA256SUMS`. Run the release workflow manually to exercise the build matrix without publishing a release.

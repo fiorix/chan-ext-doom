@@ -2,6 +2,19 @@
 
 DOOM, embeddable: a merged-lineage engine fork with restored Chocolate Doom multiplayer netcode, browser and native engine targets, a byte-exact Rust protocol codec, and a Rust server role shared by WebSocket and UDP clients.
 
+## Install the Chan extension
+
+Chan v0.83.0 or newer discovers local extensions at `~/.chan/extensions`. Install the latest release with:
+
+```sh
+curl -fsSL https://github.com/fiorix/doomit/releases/latest/download/install.sh | bash
+chan devserver --restart
+```
+
+The installer detects Linux x86_64 or arm64, Windows x86_64 under Git Bash, and macOS arm64. It verifies the selected archive against the release checksums, writes the executable and sidecars under `~/.local/lib/doomit`, and writes the declaration at `~/.chan/extensions/doomit.toml`. Pin a release with `curl -fsSL https://github.com/fiorix/doomit/releases/latest/download/install.sh | DOOMIT_VERSION=v0.1.0 bash`, or override the roots with `DOOMIT_INSTALL_ROOT` and `CHAN_HOME`.
+
+To build the extension from a checkout instead, run `./scripts/install-chan-extension.sh`.
+
 Browser engines are clients only. `doomd` owns the WebSocket and UDP edge adapters, one shared `RoomHost` and Chocolate `ServerRole` per named room, protocol lifecycle, and tic fan-out. It never simulates the game.
 
 The browser loader validates a pinned shareware IWAD, manages a deterministic PWAD set, launches the client-only engine, and compares separate input-history and simulation-state exit digests between two cooperating same-origin pages. Canary exchange stays page-local over `BroadcastChannel`; `doomd` does not compute verdicts.
@@ -42,17 +55,6 @@ All solid links are implemented. The dotted link is the cooperative same-origin 
 The [design](docs/design.md) defines the current component contracts. The [Chan extension](docs/chan-extension.md) defines the adapter and host boundary. The selected PWAD validation set and its provenance are in [docs/mods.md](docs/mods.md).
 
 Contributor conventions are in [CONTRIBUTING.md](CONTRIBUTING.md). Development history is confined to [CHANGELOG.md](CHANGELOG.md).
-
-## Install the Chan extension
-
-Chan v0.83.0 or newer discovers local extensions at `~/.chan/extensions`. Build and install Doomit plus its tracked runtime data with:
-
-```sh
-./scripts/install-chan-extension.sh
-chan devserver --restart
-```
-
-The installer writes the executable under `~/.local/lib/doomit` and the declaration at `~/.chan/extensions/doomit.toml`. Override those roots with `DOOMIT_INSTALL_ROOT` and `CHAN_HOME` when running an isolated Chan instance.
 
 ## Checks
 

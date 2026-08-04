@@ -37,6 +37,6 @@ Presentation promotes the same outer iframe into the browser top layer without r
 
 ## Distribution
 
-Linux, macOS, and Windows archives contain `doomit-extension`, the pinned browser engine files, the unmodified pinned shareware IWAD, required GPL source and attribution material, original shareware notices, and an example Chan declaration. Startup verifies every runtime-data hash before serving it. The engine and IWAD remain sidecar runtime data and are never linked into the Apache-licensed Rust binary.
+GitHub releases carry native archives for Linux x86_64 and arm64, Windows x86_64, and macOS arm64. Linux binaries target musl. Each archive contains `doomit-extension`, the pinned browser engine files, the unmodified pinned shareware IWAD, required GPL source and attribution material, original shareware notices, and an example Chan declaration. `install.sh` selects the matching archive, verifies it against the release checksum file, installs it outside Chan, and writes the local discovery declaration. Startup then verifies every runtime-data hash before serving it. The engine and IWAD remain sidecar runtime data and are never linked into the Apache-licensed Rust binary.
 
 The initial extension supports only the pinned shareware data set. PWAD transfer, mid-game spectators, native UDP peers in extension rooms, authenticated Chan identities, marketplace installation, and mobile controls are outside this contract.
