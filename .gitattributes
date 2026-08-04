@@ -1,0 +1,3 @@
+/runtime/doom.js -text
+/runtime/doom.wasm binary
+/runtime/doom1.wad binary
