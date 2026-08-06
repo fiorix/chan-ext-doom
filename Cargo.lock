@@ -229,11 +229,11 @@ dependencies = [
 
 [[package]]
 name = "doom-embed"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "doom-extension"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -249,11 +249,11 @@ dependencies = [
 
 [[package]]
 name = "doom-proto"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "doom-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
