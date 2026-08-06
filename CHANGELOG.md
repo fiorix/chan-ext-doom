@@ -9,6 +9,10 @@ This file records notable development history and design decisions. Reference do
 - Renamed the repository to `chan-ext-doom` and moved the shipped install surface to match: the executable, install root, Chan declaration filename, runtime data directory, release archives, and installer environment variables all carry the new name. The `Doomit` extension display name, the Rust crate names, and the `doomit-engine` build are unchanged.
 - Broke compatibility with earlier installs, which keep the old archive names and `DOOMIT_*` environment variables. Removing `~/.local/lib/doomit` and `~/.chan/extensions/doomit.toml` is the only migration.
 
+### Rust server role
+
+- Made the three two-client WebSocket startup tests deterministic, closing the long-standing gate failure. They drove both clients fire and forget across two connections, so the controller's LAUNCH could be handled before the second SYN and the role correctly refused the late peer, and the abort test acknowledged its reliable head before the LAUNCH was enqueued, which `on_reliable_ack` drops because it pops only on an exact successor. Admission is now confirmed through the lobby roster and the LAUNCH is acknowledged by the sequence it actually carried. No server behavior changed.
+
 ## 2026-08-04
 
 ### Chan extension

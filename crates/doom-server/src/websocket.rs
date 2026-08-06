@@ -858,23 +858,70 @@ mod tests {
         let _ = server.await;
     }
 
-    /// Drive two loopback clients into the game with deathmatch 1.
-    async fn gamestart_pair(
-        address: std::net::SocketAddr,
-        lowres: u8,
-    ) -> (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) {
-        let room_url = format!("ws://{address}/ws/game");
-        let (mut alice, _) = connect_async(&room_url).await.expect("alice connects");
-        let (mut bob, _) = connect_async(&room_url).await.expect("bob connects");
+    type TestClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Read until the server reports a lobby holding `expected` players.
+    /// The waiting-data roster is the role's own admission record, so
+    /// this is a happens-before edge rather than a sleep.
+    async fn await_lobby<S>(socket: &mut S, expected: usize)
+    where
+        S: StreamExt<Item = Result<ClientMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let (_, ServerPacket::WaitingData(data)) = next_decoded(socket, false).await
+                && data.players.len() == expected
+            {
+                return;
+            }
+        }
+        panic!("a lobby of {expected} players within five seconds");
+    }
+
+    /// Read until the reliable LAUNCH arrives, then acknowledge exactly
+    /// that packet so the peer's reliable head is drained and whatever
+    /// is queued behind it can ship.
+    async fn ack_launch(socket: &mut TestClient, route: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let frame = next_binary(socket).await;
+            let (header, packet) = ServerPacket::decode(&frame[OUTBOUND_HEADER_LEN..], false)
+                .expect("server packet decodes");
+            if let ServerPacket::Launch { .. } = packet {
+                let seq = header
+                    .reliable_seq
+                    .expect("the launch carries a reliable sequence");
+                send(socket, 1, route, &ack_packet(seq.wrapping_add(1))).await;
+                return;
+            }
+        }
+        panic!("a reliable launch within five seconds");
+    }
+
+    /// Connect two loopback clients and return them only once the role
+    /// has admitted both. Each SYN is confirmed through the roster
+    /// before the next frame is written: a LAUNCH sent afterwards cannot
+    /// outrun the second SYN and refuse it as a late connection.
+    async fn admitted_pair(room_url: &str, lowres: u8) -> (TestClient, TestClient) {
+        let (mut alice, _) = connect_async(room_url).await.expect("alice connects");
         send(&mut alice, 1, 20, &syn_packet("Alice", 0, 0, lowres)).await;
+        // A roster of one proves Alice took the first slot before Bob
+        // raced her for it, which is what keeps her consoleplayer at 0.
+        await_lobby(&mut alice, 1).await;
+
+        let (mut bob, _) = connect_async(room_url).await.expect("bob connects");
         send(&mut bob, 1, 21, &syn_packet("Bob", 0, 0, lowres)).await;
+        await_lobby(&mut bob, 2).await;
+        await_lobby(&mut alice, 2).await;
+        (alice, bob)
+    }
+
+    /// Drive two loopback clients into the game with deathmatch 1.
+    async fn gamestart_pair(address: std::net::SocketAddr, lowres: u8) -> (TestClient, TestClient) {
+        let room_url = format!("ws://{address}/ws/game");
+        let (mut alice, mut bob) = admitted_pair(&room_url, lowres).await;
         send(&mut alice, 1, 20, &ack_packet(1)).await;
         send(&mut bob, 1, 21, &ack_packet(1)).await;
         send(&mut alice, 1, 20, &launch_packet(0)).await;
@@ -1120,26 +1167,19 @@ mod tests {
     async fn transport_close_aborts_startup_for_the_survivor() {
         let (address, server) = spawn_server().await;
         let room_url = format!("ws://{address}/ws/abort");
-        let (mut alice, _) = connect_async(&room_url).await.expect("alice connects");
-        let (mut bob, _) = connect_async(&room_url).await.expect("bob connects");
-        send(&mut alice, 1, 20, &syn_packet("Alice", 0, 0, 0)).await;
-        send(&mut bob, 1, 21, &syn_packet("Bob", 0, 0, 0)).await;
+        let (mut alice, mut bob) = admitted_pair(&room_url, 0).await;
         send(&mut alice, 1, 20, &ack_packet(1)).await;
         send(&mut bob, 1, 21, &ack_packet(1)).await;
         send(&mut alice, 1, 20, &launch_packet(0)).await;
         send(&mut alice, 1, 20, &ack_packet(2)).await;
         send(&mut bob, 1, 21, &ack_packet(2)).await;
 
-        // Order the leave after bob's chain is drained: receiving the
-        // LAUNCH proves his first ack landed, and the settle time lets
-        // the second be processed; an undrained chain would suppress
-        // the reliable abort message once bob is disconnecting.
-        loop {
-            if let (_, ServerPacket::Launch { .. }) = next_decoded(&mut bob, false).await {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Drain bob's reliable head before the leave, or the abort
+        // message queues behind it and never ships. The blind ack above
+        // cannot do it: `on_reliable_ack` pops only when the ack names
+        // the head's exact successor, so one sent before the LAUNCH is
+        // enqueued is dropped. Ack the LAUNCH actually received.
+        ack_launch(&mut bob, 21).await;
 
         alice.close(None).await.expect("alice closes");
 
