@@ -2,6 +2,13 @@
 
 This file records notable development history and design decisions. Reference documentation describes only the repository's current behavior and contracts.
 
+## 2026-08-06
+
+### Chan extension
+
+- Renamed the repository to `chan-ext-doom` and moved the shipped install surface to match: the executable, install root, Chan declaration filename, runtime data directory, release archives, and installer environment variables all carry the new name. The `Doomit` extension display name, the Rust crate names, and the `doomit-engine` build are unchanged.
+- Broke compatibility with earlier installs, which keep the old archive names and `DOOMIT_*` environment variables. Removing `~/.local/lib/doomit` and `~/.chan/extensions/doomit.toml` is the only migration.
+
 ## 2026-08-04
 
 ### Chan extension

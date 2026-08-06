@@ -33,7 +33,7 @@ The fixture set contains 113 curated native UDP datagrams from seven Chocolate D
 ## Repository shape
 
 ```text
-fiorix/doomit
+fiorix/chan-ext-doom
 ├── engine/                         # GPL-2.0 client engine, browser loader, native target, tests
 ├── crates/
 │   ├── doom-extension/             # independently installed Chan adapter and extension UI

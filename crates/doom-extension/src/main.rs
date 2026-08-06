@@ -35,7 +35,7 @@ const APP_JS: &str = include_str!("../assets/app.js");
 const FRAME_HTML: &str = include_str!("../assets/frame.html");
 
 #[derive(Debug, Parser)]
-#[command(name = "doomit-extension", about = "Doomit extension adapter for Chan")]
+#[command(name = "chan-ext-doom", about = "Doomit extension adapter for Chan")]
 struct Cli {
     /// IPv4 loopback address used by Chan's private extension proxy.
     #[arg(long, default_value = "127.0.0.1:0")]
@@ -278,7 +278,7 @@ fn default_assets_dir() -> Result<PathBuf> {
     let parent = executable
         .parent()
         .context("extension executable has no parent directory")?;
-    Ok(parent.join("share").join("doomit"))
+    Ok(parent.join("share").join("chan-ext-doom"))
 }
 
 fn load_assets(directory: &Path) -> Result<RuntimeAssets> {

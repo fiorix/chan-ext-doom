@@ -69,7 +69,7 @@ TODO: Engine fork base: rojo2/wasm-doom (crispy lineage, matches the shipped sin
 
 TODO: Repo name and home (e.g. github.com/fiorix/...), and whether it is public from creation (GPL effectively requires it once the bundle ships). 
 
-@@Alex: this will be fiorix/doomit
+@@Alex: this will be fiorix/chan-ext-doom
 
 ## Protocol strategy
 

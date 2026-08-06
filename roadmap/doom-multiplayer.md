@@ -1,6 +1,6 @@
 # DOOM multiplayer over chan's collaboration plane
 
-Status: SUPERSEDED 2026-07-27 by `../docs/design.md` (the accepted spec after host review). Moved from chan's `team/roadmap/v0.80.0/` to fiorix/doomit; doom work is tracked in this repo, not in chan's roadmap. Kept as the grounding analysis that produced the design (verified 2026-07-26 against `origin/doom-overlay` tip d776cbcb and a clone of rojo2/wasm-doom @ 619e697). Do not start from the shipped `doom.wasm`: it contains zero network code (see below).
+Status: SUPERSEDED 2026-07-27 by `../docs/design.md` (the accepted spec after host review). Moved from chan's `team/roadmap/v0.80.0/` to fiorix/chan-ext-doom; doom work is tracked in this repo, not in chan's roadmap. Kept as the grounding analysis that produced the design (verified 2026-07-26 against `origin/doom-overlay` tip d776cbcb and a clone of rojo2/wasm-doom @ 619e697). Do not start from the shipped `doom.wasm`: it contains zero network code (see below).
 
 ## What
 

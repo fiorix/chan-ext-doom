@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-LOG = logging.getLogger("doomit-package")
+LOG = logging.getLogger("chan-ext-doom-package")
 
 
 @dataclass(frozen=True)
@@ -29,12 +29,12 @@ class Target:
 
 
 TARGETS = {
-    "linux-x86_64": Target("doomit-linux-x86_64.tar.gz", "doomit-extension"),
-    "linux-aarch64": Target("doomit-linux-aarch64.tar.gz", "doomit-extension"),
+    "linux-x86_64": Target("chan-ext-doom-linux-x86_64.tar.gz", "chan-ext-doom"),
+    "linux-aarch64": Target("chan-ext-doom-linux-aarch64.tar.gz", "chan-ext-doom"),
     "windows-x86_64": Target(
-        "doomit-windows-x86_64.zip", "doomit-extension.exe", zip=True
+        "chan-ext-doom-windows-x86_64.zip", "chan-ext-doom.exe", zip=True
     ),
-    "macos-aarch64": Target("doomit-macos-aarch64.tar.gz", "doomit-extension"),
+    "macos-aarch64": Target("chan-ext-doom-macos-aarch64.tar.gz", "chan-ext-doom"),
 }
 
 
@@ -74,13 +74,13 @@ def build_layout(
     version: str,
     epoch: int,
 ) -> Path:
-    payload = stage / "doomit"
+    payload = stage / "chan-ext-doom"
     copy_file(binary, payload / target.executable, 0o755)
     copy_file(
-        repo_root / "packaging/chan-extension/doomit.toml", payload / "doomit.toml"
+        repo_root / "packaging/chan-extension/chan-ext-doom.toml", payload / "chan-ext-doom.toml"
     )
     for name in ("doom.js", "doom.wasm", "doom1.wad"):
-        copy_file(repo_root / "runtime" / name, payload / "share/doomit" / name)
+        copy_file(repo_root / "runtime" / name, payload / "share/chan-ext-doom" / name)
     copy_file(
         repo_root / "LICENSE-APACHE", payload / "licenses/LICENSE-APACHE"
     )
@@ -135,7 +135,7 @@ def write_tar(payload: Path, output: Path, epoch: int) -> None:
             with tarfile.open(fileobj=zipped, mode="w", format=tarfile.PAX_FORMAT) as archive:
                 archive.add(
                     payload,
-                    arcname="doomit",
+                    arcname="chan-ext-doom",
                     recursive=True,
                     filter=normalized_tar_info(epoch),
                 )
@@ -172,7 +172,7 @@ def build_package(repo_root: Path, target_name: str, binary: Path, output_dir: P
     os.close(descriptor)
     pending = Path(pending_name)
     try:
-        with tempfile.TemporaryDirectory(prefix="doomit-package-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="chan-ext-doom-package-") as temporary:
             payload = build_layout(
                 repo_root, binary, target, Path(temporary), version, epoch
             )
@@ -200,7 +200,7 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="doomit-package: %(message)s",
+        format="chan-ext-doom-package: %(message)s",
     )
     repo_root = Path(__file__).resolve().parent.parent
     output = build_package(repo_root, args.target, args.binary.resolve(), args.output_dir)

@@ -29,19 +29,19 @@ class PackageChanExtensionTests(unittest.TestCase):
         archive = self.build("linux-x86_64")
         with tarfile.open(archive, "r:gz") as bundle:
             names = set(bundle.getnames())
-            executable = bundle.getmember("doomit/doomit-extension")
+            executable = bundle.getmember("chan-ext-doom/chan-ext-doom")
             self.assertEqual(executable.mode, 0o755)
-        self.assertIn("doomit/share/doomit/doom.wasm", names)
-        self.assertIn("doomit/licenses/doom-shareware.txt", names)
-        self.assertIn("doomit/source/doom-engine-source.tar.gz", names)
+        self.assertIn("chan-ext-doom/share/chan-ext-doom/doom.wasm", names)
+        self.assertIn("chan-ext-doom/licenses/doom-shareware.txt", names)
+        self.assertIn("chan-ext-doom/source/doom-engine-source.tar.gz", names)
 
     def test_windows_archive_uses_the_exe_name(self) -> None:
         archive = self.build("windows-x86_64")
         with zipfile.ZipFile(archive) as bundle:
             names = set(bundle.namelist())
-        self.assertIn("doomit/doomit-extension.exe", names)
-        self.assertIn("doomit/share/doomit/doom1.wad", names)
-        self.assertIn("doomit/licenses/engine-GPL-2.0.txt", names)
+        self.assertIn("chan-ext-doom/chan-ext-doom.exe", names)
+        self.assertIn("chan-ext-doom/share/chan-ext-doom/doom1.wad", names)
+        self.assertIn("chan-ext-doom/licenses/engine-GPL-2.0.txt", names)
 
     def test_archive_is_reproducible(self) -> None:
         first = self.build("linux-x86_64").read_bytes()

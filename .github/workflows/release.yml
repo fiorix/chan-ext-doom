@@ -44,23 +44,23 @@ jobs:
           - runner: ubuntu-24.04
             rust_target: x86_64-unknown-linux-musl
             package_target: linux-x86_64
-            binary: target/x86_64-unknown-linux-musl/release/doomit-extension
-            archive: doomit-linux-x86_64.tar.gz
+            binary: target/x86_64-unknown-linux-musl/release/chan-ext-doom
+            archive: chan-ext-doom-linux-x86_64.tar.gz
           - runner: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-musl
             package_target: linux-aarch64
-            binary: target/aarch64-unknown-linux-musl/release/doomit-extension
-            archive: doomit-linux-aarch64.tar.gz
+            binary: target/aarch64-unknown-linux-musl/release/chan-ext-doom
+            archive: chan-ext-doom-linux-aarch64.tar.gz
           - runner: windows-2025
             rust_target: x86_64-pc-windows-msvc
             package_target: windows-x86_64
-            binary: target/x86_64-pc-windows-msvc/release/doomit-extension.exe
-            archive: doomit-windows-x86_64.zip
+            binary: target/x86_64-pc-windows-msvc/release/chan-ext-doom.exe
+            archive: chan-ext-doom-windows-x86_64.zip
           - runner: macos-14
             rust_target: aarch64-apple-darwin
             package_target: macos-aarch64
-            binary: target/aarch64-apple-darwin/release/doomit-extension
-            archive: doomit-macos-aarch64.tar.gz
+            binary: target/aarch64-apple-darwin/release/chan-ext-doom
+            archive: chan-ext-doom-macos-aarch64.tar.gz
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -120,10 +120,10 @@ jobs:
         shell: bash
         run: |
           expected=(
-            doomit-linux-x86_64.tar.gz
-            doomit-linux-aarch64.tar.gz
-            doomit-windows-x86_64.zip
-            doomit-macos-aarch64.tar.gz
+            chan-ext-doom-linux-x86_64.tar.gz
+            chan-ext-doom-linux-aarch64.tar.gz
+            chan-ext-doom-windows-x86_64.zip
+            chan-ext-doom-macos-aarch64.tar.gz
           )
           for archive in "${expected[@]}"; do
             [[ -f "dist/$archive" ]] || { printf 'missing %s\n' "$archive" >&2; exit 1; }

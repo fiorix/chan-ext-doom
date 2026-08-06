@@ -7,7 +7,7 @@ Doomit can run as an independently installed Chan extension. Chan owns process d
 ```mermaid
 flowchart LR
     C[Chan window] -->|HTTP and WebSocket| P[Chan extension proxy]
-    P -->|private token and scope| E[doomit-extension]
+    P -->|private token and scope| E[chan-ext-doom]
     E --> L[scoped lobby]
     L --> S[doom-server]
     C -->|opaque iframe bridge| U[Doomit UI]
@@ -15,7 +15,7 @@ flowchart LR
     F -->|game WebSocket| P
 ```
 
-`doomit-extension` binds an ephemeral IPv4 loopback port, mints a bearer token, and prints a `CHAN_EXTENSION_V1` handshake. It serves the extension UI, a lobby control WebSocket, and a game WebSocket backed by `doom-server`. All room lookup comes from Chan's private `X-Chan-Extension-Scope`; browser messages and query parameters cannot select another scope.
+`chan-ext-doom` binds an ephemeral IPv4 loopback port, mints a bearer token, and prints a `CHAN_EXTENSION_V1` handshake. It serves the extension UI, a lobby control WebSocket, and a game WebSocket backed by `doom-server`. All room lookup comes from Chan's private `X-Chan-Extension-Scope`; browser messages and query parameters cannot select another scope.
 
 The extension keeps one in-memory room per live Chan session. A room remains while a control connection exists and expires 30 seconds after the last control connection closes. There is no disk persistence. Standalone `doomd` and its native UDP interoperability remain separate.
 
@@ -37,6 +37,6 @@ Presentation promotes the same outer iframe into the browser top layer without r
 
 ## Distribution
 
-GitHub releases carry native archives for Linux x86_64 and arm64, Windows x86_64, and macOS arm64. Linux binaries target musl. Each archive contains `doomit-extension`, the pinned browser engine files, the unmodified pinned shareware IWAD, required GPL source and attribution material, original shareware notices, and an example Chan declaration. `install.sh` selects the matching archive, verifies it against the release checksum file, installs it outside Chan, and writes the local discovery declaration. Startup then verifies every runtime-data hash before serving it. The engine and IWAD remain sidecar runtime data and are never linked into the Apache-licensed Rust binary.
+GitHub releases carry native archives for Linux x86_64 and arm64, Windows x86_64, and macOS arm64. Linux binaries target musl. Each archive contains `chan-ext-doom`, the pinned browser engine files, the unmodified pinned shareware IWAD, required GPL source and attribution material, original shareware notices, and an example Chan declaration. `install.sh` selects the matching archive, verifies it against the release checksum file, installs it outside Chan, and writes the local discovery declaration. Startup then verifies every runtime-data hash before serving it. The engine and IWAD remain sidecar runtime data and are never linked into the Apache-licensed Rust binary.
 
 The initial extension supports only the pinned shareware data set. PWAD transfer, mid-game spectators, native UDP peers in extension rooms, authenticated Chan identities, marketplace installation, and mobile controls are outside this contract.

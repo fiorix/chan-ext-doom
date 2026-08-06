@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "doomit-extension"
+name = "chan-ext-doom"
 path = "src/main.rs"
 
 [dependencies]

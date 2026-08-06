@@ -3,9 +3,9 @@ set -euo pipefail
 
 : "${HOME:?HOME must be set}"
 
-repository="fiorix/doomit"
-release_version=${DOOMIT_VERSION:-latest}
-install_root=${DOOMIT_INSTALL_ROOT:-"${HOME}/.local/lib/doomit"}
+repository="fiorix/chan-ext-doom"
+release_version=${CHAN_EXT_DOOM_VERSION:-latest}
+install_root=${CHAN_EXT_DOOM_INSTALL_ROOT:-"${HOME}/.local/lib/chan-ext-doom"}
 chan_home=${CHAN_HOME:-"${HOME}/.chan"}
 verbose=0
 temporary_dir=""
@@ -26,21 +26,21 @@ Options:
   -h, --help           Show this help
 
 Environment:
-  DOOMIT_VERSION             Release tag, or "latest"
-  DOOMIT_INSTALL_ROOT        Doomit installation root
-  CHAN_HOME                  Chan home directory
-  DOOMIT_RELEASE_BASE_URL    Override the release download base URL
+  CHAN_EXT_DOOM_VERSION             Release tag, or "latest"
+  CHAN_EXT_DOOM_INSTALL_ROOT        Doomit installation root
+  CHAN_HOME                         Chan home directory
+  CHAN_EXT_DOOM_RELEASE_BASE_URL    Override the release download base URL
 EOF
 }
 
 log() {
     if ((verbose)); then
-        printf 'doomit-install: %s\n' "$*" >&2
+        printf 'chan-ext-doom-install: %s\n' "$*" >&2
     fi
 }
 
 die() {
-    printf 'doomit-install: %s\n' "$*" >&2
+    printf 'chan-ext-doom-install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -93,17 +93,17 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 system=$(uname -s)
 machine=$(uname -m)
 archive_type=tar
-executable_name=doomit-extension
+executable_name=chan-ext-doom
 windows=0
 
 case "$system" in
     Linux)
         case "$machine" in
             x86_64 | amd64)
-                archive_name=doomit-linux-x86_64.tar.gz
+                archive_name=chan-ext-doom-linux-x86_64.tar.gz
                 ;;
             aarch64 | arm64)
-                archive_name=doomit-linux-aarch64.tar.gz
+                archive_name=chan-ext-doom-linux-aarch64.tar.gz
                 ;;
             *)
                 die "unsupported Linux architecture: $machine"
@@ -113,7 +113,7 @@ case "$system" in
     Darwin)
         case "$machine" in
             aarch64 | arm64)
-                archive_name=doomit-macos-aarch64.tar.gz
+                archive_name=chan-ext-doom-macos-aarch64.tar.gz
                 ;;
             *)
                 die "unsupported macOS architecture: $machine"
@@ -123,9 +123,9 @@ case "$system" in
     MINGW* | MSYS* | CYGWIN*)
         case "$machine" in
             x86_64 | amd64)
-                archive_name=doomit-windows-x86_64.zip
+                archive_name=chan-ext-doom-windows-x86_64.zip
                 archive_type=zip
-                executable_name=doomit-extension.exe
+                executable_name=chan-ext-doom.exe
                 windows=1
                 ;;
             *)
@@ -138,8 +138,8 @@ case "$system" in
         ;;
 esac
 
-if [[ -n "${DOOMIT_RELEASE_BASE_URL:-}" ]]; then
-    release_base=${DOOMIT_RELEASE_BASE_URL%/}
+if [[ -n "${CHAN_EXT_DOOM_RELEASE_BASE_URL:-}" ]]; then
+    release_base=${CHAN_EXT_DOOM_RELEASE_BASE_URL%/}
 elif [[ "$release_version" == latest ]]; then
     release_base="https://github.com/${repository}/releases/latest/download"
 else
@@ -150,7 +150,7 @@ else
     release_base="https://github.com/${repository}/releases/download/v${release_tag}"
 fi
 
-temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/doomit-install.XXXXXX")
+temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/chan-ext-doom-install.XXXXXX")
 archive_path="$temporary_dir/$archive_name"
 checksums_path="$temporary_dir/SHA256SUMS"
 extract_dir="$temporary_dir/extract"
@@ -196,9 +196,9 @@ elif ((windows)) && \
     command -v cygpath >/dev/null 2>&1; then
     windows_archive_path=$(cygpath -w "$archive_path")
     # shellcheck disable=SC2016  # PowerShell expands its own environment variable.
-    powershell_hash='(Get-FileHash -Algorithm SHA256 -LiteralPath $env:DOOMIT_HASH_FILE).Hash.ToLowerInvariant()'
+    powershell_hash='(Get-FileHash -Algorithm SHA256 -LiteralPath $env:CHAN_EXT_DOOM_HASH_FILE).Hash.ToLowerInvariant()'
     actual_checksum=$(
-        DOOMIT_HASH_FILE="$windows_archive_path" \
+        CHAN_EXT_DOOM_HASH_FILE="$windows_archive_path" \
             powershell.exe -NoProfile -Command "$powershell_hash" | tr -d '\r'
     )
 else
@@ -219,20 +219,20 @@ elif command -v powershell.exe >/dev/null 2>&1 && \
     windows_archive_path=$(cygpath -w "$archive_path")
     windows_extract_dir=$(cygpath -w "$extract_dir")
     # shellcheck disable=SC2016  # PowerShell expands its own environment variables.
-    powershell_expand='Expand-Archive -LiteralPath $env:DOOMIT_ARCHIVE -DestinationPath $env:DOOMIT_DESTINATION -Force'
-    DOOMIT_ARCHIVE="$windows_archive_path" DOOMIT_DESTINATION="$windows_extract_dir" \
+    powershell_expand='Expand-Archive -LiteralPath $env:CHAN_EXT_DOOM_ARCHIVE -DestinationPath $env:CHAN_EXT_DOOM_DESTINATION -Force'
+    CHAN_EXT_DOOM_ARCHIVE="$windows_archive_path" CHAN_EXT_DOOM_DESTINATION="$windows_extract_dir" \
         powershell.exe -NoProfile -Command "$powershell_expand"
 else
     die "unzip or PowerShell is required to extract $archive_name"
 fi
 
-payload="$extract_dir/doomit"
+payload="$extract_dir/chan-ext-doom"
 for required in \
     "$payload/$executable_name" \
-    "$payload/doomit.toml" \
-    "$payload/share/doomit/doom.js" \
-    "$payload/share/doomit/doom.wasm" \
-    "$payload/share/doomit/doom1.wad" \
+    "$payload/chan-ext-doom.toml" \
+    "$payload/share/chan-ext-doom/doom.js" \
+    "$payload/share/chan-ext-doom/doom.wasm" \
+    "$payload/share/chan-ext-doom/doom1.wad" \
     "$payload/licenses/LICENSE-APACHE" \
     "$payload/licenses/engine-GPL-2.0.txt" \
     "$payload/licenses/doom-shareware.txt" \
@@ -247,7 +247,7 @@ copy_atomic() {
     local destination_dir
     destination_dir=$(dirname "$destination")
     mkdir -p "$destination_dir"
-    pending_file=$(mktemp "$destination_dir/.doomit-install.XXXXXX")
+    pending_file=$(mktemp "$destination_dir/.chan-ext-doom-install.XXXXXX")
     cp -- "$source" "$pending_file"
     chmod "$mode" "$pending_file"
     mv -f -- "$pending_file" "$destination"
@@ -257,7 +257,7 @@ copy_atomic() {
 binary_path="$install_root/$executable_name"
 copy_atomic "$payload/$executable_name" "$binary_path" 0755
 for asset in doom.js doom.wasm doom1.wad; do
-    copy_atomic "$payload/share/doomit/$asset" "$install_root/share/doomit/$asset" 0644
+    copy_atomic "$payload/share/chan-ext-doom/$asset" "$install_root/share/chan-ext-doom/$asset" 0644
 done
 for license in LICENSE-APACHE engine-GPL-2.0.txt doom-shareware.txt; do
     copy_atomic "$payload/licenses/$license" "$install_root/licenses/$license" 0644
@@ -268,7 +268,7 @@ copy_atomic \
     0644
 
 config_dir="$chan_home/extensions"
-config_path="$config_dir/doomit.toml"
+config_path="$config_dir/chan-ext-doom.toml"
 mkdir -p "$config_dir"
 command_path=$binary_path
 if ((windows)); then
@@ -277,7 +277,7 @@ if ((windows)); then
 fi
 toml_command=${command_path//\\/\\\\}
 toml_command=${toml_command//\"/\\\"}
-config_tmp=$(mktemp "$config_dir/.doomit.toml.XXXXXX")
+config_tmp=$(mktemp "$config_dir/.chan-ext-doom.toml.XXXXXX")
 {
     printf 'name = "Doomit"\n'
     printf 'command = "%s"\n' "$toml_command"

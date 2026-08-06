@@ -10,15 +10,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/fiorix/doomit.git"
+    "url": "git+https://github.com/fiorix/chan-ext-doom.git"
   },
   "keywords": [],
   "author": "ROJO2 <hola@rojo2.com>",
   "license": "GPL-2.0",
   "bugs": {
-    "url": "https://github.com/fiorix/doomit/issues"
+    "url": "https://github.com/fiorix/chan-ext-doom/issues"
   },
-  "homepage": "https://github.com/fiorix/doomit#readme",
+  "homepage": "https://github.com/fiorix/chan-ext-doom#readme",
   "devDependencies": {
     "serve": "^11.1.0"
   },

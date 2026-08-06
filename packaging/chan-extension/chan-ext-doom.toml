@@ -1,4 +1,4 @@
 name = "Doomit"
-command = "/absolute/path/to/doomit-extension"
+command = "/absolute/path/to/chan-ext-doom"
 args = []
 capabilities = ["session-context", "presentation"]

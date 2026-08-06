@@ -21,7 +21,7 @@ Never committed: the IWAD, built binaries, upstream clones, raw `packets.jsonl` 
 No build required, only coreutils and python3:
 
 ```sh
-cd doomit
+cd chan-ext-doom
 # (a) every .bin: length and sha256 must match the manifest
 python3 - <<'EOF'
 import hashlib, json
@@ -111,7 +111,7 @@ Notes:
 The rig binds UDP 127.0.0.1:2342 and forwards to `chocolate-server -port 2343 -privateserver`; run scenarios sequentially. 2342 is chocolate's `DEFAULT_PORT`, a rig choice rather than a client limitation: clients can override with `-port` or a `host:port` connect address, and the rig does not need either. Raw output lands in `/tmp/doom-capture/captures/<name>/` (`packets.jsonl`, `session.json`, per-client logs, and chocolate's own `-netlog` dumps for cross-checking).
 
 ```sh
-cd doomit
+cd chan-ext-doom
 S=/tmp/doom-capture/build/choc/src/chocolate-server
 C=/tmp/doom-capture/build/choc/src/chocolate-doom
 W=/path/to/doom1.wad   # sha1 must match section 3.1
@@ -232,7 +232,7 @@ This recipe reproduces the accepted native UDP interoperability shape against `d
 Prerequisites: the native engine artifact, built as recorded in `engine/docs/provenance.md`, and the pinned shareware IWAD of section 3.1.
 
 ```sh
-cd doomit
+cd chan-ext-doom
 cargo build --locked -p doom-server --bin doomd
 ./target/debug/doomd serve --listen 127.0.0.1:0 --udp arena=127.0.0.1:0
 # read the advertised UDP endpoint from the startup lines

@@ -1,6 +1,6 @@
 # DOOM overlay: a remote protocol tied to the cs session
 
-Status: REGISTERED, NOT specced. Moved from chan's `team/roadmap/v0.80.0/` to fiorix/doomit on 2026-07-27; doom work, including the future chan-integration spec, is tracked in this repo, not in chan's roadmap. A prototype overlay exists on chan's `doom-overlay` branch (kept as reference); **the actual ask is the remote protocol, which the branch does not implement.** Spec the protocol first.
+Status: REGISTERED, NOT specced. Moved from chan's `team/roadmap/v0.80.0/` to fiorix/chan-ext-doom on 2026-07-27; doom work, including the future chan-integration spec, is tracked in this repo, not in chan's roadmap. A prototype overlay exists on chan's `doom-overlay` branch (kept as reference); **the actual ask is the remote protocol, which the branch does not implement.** Spec the protocol first.
 
 ## The ask
 
