@@ -15,6 +15,8 @@ The installer detects Linux x86_64 or arm64, Windows x86_64 under Git Bash, and 
 
 To build the extension from a checkout instead, run `./scripts/install-chan-extension.sh`.
 
+Chan's shortcuts keep working while the game has focus through Chan's v2 keyboard relay, in Chan v0.100.0 or newer: the game frame relays the chords Chan advertises, matched by the symbol the keyboard layout types, through the extension page to Chan, and every other key stays game input. With an older Chan the game still runs, but it keeps those keystrokes.
+
 Browser engines are clients only. `doomd` owns the WebSocket and UDP edge adapters, one shared `RoomHost` and Chocolate `ServerRole` per named room, protocol lifecycle, and tic fan-out. It never simulates the game.
 
 The browser loader validates a pinned shareware IWAD, manages a deterministic PWAD set, launches the client-only engine, and compares separate input-history and simulation-state exit digests between two cooperating same-origin pages. Canary exchange stays page-local over `BroadcastChannel`; `doomd` does not compute verdicts.

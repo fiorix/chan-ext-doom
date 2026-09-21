@@ -26,6 +26,12 @@ cd engine
 npm test
 ```
 
+Run the keyboard relay test for changes to Chan's keyboard relay in `crates/doom-extension/assets/frame.html` or `app.js`. It executes the game frame's relay block and the extension page's message listener as shipped, against keydowns from published keyboard layouts and stale frames:
+
+```sh
+node --test scripts/tests/keyboard-relay.test.mjs
+```
+
 Engine build and artifact verification commands are documented in [`engine/docs/provenance.md`](engine/docs/provenance.md).
 
 ## Releases
