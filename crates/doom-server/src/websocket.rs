@@ -927,6 +927,12 @@ mod tests {
         send(&mut alice, 1, 20, &launch_packet(0)).await;
         send(&mut alice, 1, 20, &ack_packet(2)).await;
         send(&mut bob, 1, 21, &ack_packet(2)).await;
+        // The blind acks above are dropped when they reach the role before
+        // it has enqueued the LAUNCH, since `on_reliable_ack` pops only the
+        // head's exact successor; the LAUNCH then retransmits and no
+        // GAMESTART follows. Ack the LAUNCH each client actually received.
+        ack_launch(&mut alice, 20).await;
+        ack_launch(&mut bob, 21).await;
         send(&mut alice, 1, 20, &settings_packet(1, 1)).await;
         send(&mut bob, 1, 21, &settings_packet(0, 0)).await;
         (alice, bob)
