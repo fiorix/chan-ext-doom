@@ -2,6 +2,10 @@
 
 DOOM, embeddable: a merged-lineage engine fork with restored Chocolate Doom multiplayer netcode, browser and native engine targets, a byte-exact Rust protocol codec, and a Rust server role shared by WebSocket and UDP clients.
 
+![The Doomit tab open beside a terminal tab in a Chan window](docs/chan-tab.png)
+
+Installed as a Chan extension, Doomit is a tab in the Chan window. Above, the `Doomit` tab shares the tab strip with `Terminal-1`, so the game sits one tab away from a shell.
+
 ## Install the Chan extension
 
 Chan v0.83.0 or newer discovers local extensions at `~/.chan/extensions`. Install the latest release with:
